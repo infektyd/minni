@@ -49,8 +49,8 @@ after wire-era propagate + `minni sync`.
   gemini-cli. **agy** loads Minni hooks from
   `~/.gemini/config/plugins/minni/` (`propagate.py update-plugin --platform
   antigravity`). Current agy (**1.1.7+**) dispatches SessionStart /
-  PreInvocation (UPS analogue) / PreToolUse / Stop; PreToolUse is
-  deny-capable via `gemini-adapter.ts` (`allow`/`deny`/…, not `approve`).
+  PreInvocation (UPS analogue) / PreToolUse / Stop; PreToolUse is strictly
+  non-blocking (`{"decision":"allow"}` via `gemini-adapter.ts`).
   Historical agy **1.0.15** only dispatched PreToolUse/PostToolUse/Stop —
   do not treat that as current. See `docs/runtimes/gemini.md` and
   `docs/contracts/hook-platforms.md`.
@@ -76,9 +76,8 @@ after wire-era propagate + `minni sync`.
    install root (often `~/.agents/plugins/minni@minni` and/or extension paths).
 4. **Read-only auto-grants** — wire defaults are exactly
    `MINNI_READONLY_TOOLS` in `propagate.py`:
-   `minni_recall`, `minni_drill`, `minni_status`, `minni_audit_tail`,
-   `minni_audit_report`, `minni_route`, `minni_list_pending_handoffs`,
-   `minni_ping_agent_inbox`, `minni_ping_agent_status`.
+   `minni_recall`, `minni_drill`, `minni_status`, `minni_list_candidates`,
+   `minni_handoff_inbox`, `minni_thread_status`.
    Do **not** auto-grant write/learn/thread-update tools in the wire path.
    Drop any remaining `sovereign_*` grants.
 5. **(Optional pure gemini-cli)** add `minni` to `~/.gemini/settings.json`

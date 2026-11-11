@@ -231,13 +231,22 @@ def test_vault_path_is_safe_rejects_symlink(tmp_path, monkeypatch):
 
 def test_x1_readonly_grant_set_excludes_write_tools():
     # The blanket wildcard would auto-allow write/export tools; the per-tool set
-    # must contain ONLY read-only tools and never those write/export names.
+    # must contain ONLY the 6 read-only v1 tools and never write/retired names.
+    expected_readonly = (
+        "minni_recall",
+        "minni_drill",
+        "minni_status",
+        "minni_list_candidates",
+        "minni_handoff_inbox",
+        "minni_thread_status",
+    )
     forbidden = {
         "minni_learn",
         "minni_vault_write",
         "minni_export_pack",
         "minni_compile_vault",
         "minni_resolve_candidate",
+        "minni_handoff_send",
         "minni_negotiate_handoff",
         "minni_ack_handoff",
         "minni_ping_agent_request",
@@ -246,8 +255,10 @@ def test_x1_readonly_grant_set_excludes_write_tools():
         "minni_plan_update",
         "minni_plan_create",
         "minni_thread_update",
+        "minni_thread_scar",
         "minni_thread_create",
     }
+    assert propagate.MINNI_READONLY_TOOLS == expected_readonly
     assert not (set(propagate.MINNI_READONLY_TOOLS) & forbidden)
     assert propagate.MINNI_WILDCARD_GRANT not in propagate.MINNI_READONLY_GRANTS
     assert all(g.startswith("mcp(minni/minni_") for g in propagate.MINNI_READONLY_GRANTS)

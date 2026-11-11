@@ -294,20 +294,12 @@ test("both fake Team ledger doors are gone from the tree", async () => {
   assert.match(source, /readySlices/, "projection is readySlices, not a raw slices filter");
 });
 
-test("MCP team runtime accepts plan_id and keeps G11/G12 shut", async () => {
+test("MCP server retires minni_team_runtime while team.ts runtime() preserves G11/G12 library inputs", async () => {
   const source = await readFile(SERVER_SRC, "utf8");
-  const start = source.indexOf('"minni_team_runtime"');
-  assert.notEqual(start, -1);
-  const nextTool = source.indexOf("server.registerTool(", start + 1);
-  const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
-  const schemaStart = block.indexOf("inputSchema:");
-  const handlerStart = block.indexOf("async");
-  const schema = block.slice(schemaStart, handlerStart);
-  assert.match(schema, /plan_id:\s*z\.string\(\)\.min\(1\)\.optional\(\)/);
-  assert.doesNotMatch(schema, /coordinatorAgentId\s*:/);
-  assert.doesNotMatch(schema, /vaultPath\s*:/);
-  assert.match(block, /vaultPath:\s*DEFAULT_VAULT_PATH/);
-  assert.match(block, /coordinatorAgentId:\s*DEFAULT_AGENT_ID/);
+  assert.doesNotMatch(source, /"minni_team_runtime"/, "minni_team_runtime is retired from the 12-tool v1 MCP surface");
+  const teamSource = await readFile(TEAM_SRC, "utf8");
+  assert.match(teamSource, /buildTeamRuntime\b/);
+  assert.match(teamSource, /plan_id\?:\s*string/);
 });
 
 test("create while a non-terminal active Thread exists surfaces displaced_active; no incumbent leaves the field absent", async (t) => {

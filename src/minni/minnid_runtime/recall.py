@@ -12,7 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from minni.config import DEFAULT_CONFIG
+from minni.config import (
+    DEFAULT_CONFIG,
+    is_concrete_project_workspace,
+    normalize_workspace_scope,
+)
 from minni.db import MinniDB
 from minni.timestamps import parse_epoch_or_report
 from minni.principal import (
@@ -155,6 +159,7 @@ def result_identity(row: dict) -> tuple:
 
 _QTY_ENGINE_KEY = "_qty_engine"
 _DEADLINE_POISONED_KEY = "_deadline_poisoned"
+_WS_BOOSTED_KEY = "_ws_boosted"
 
 
 def _ranking_deadline_poisoned(retrieval_engine: Any) -> bool:
@@ -209,12 +214,122 @@ def _bump_merged_document_access(results: list) -> None:
             )
 
 
+def _record_returned_learning_reads(
+    results: list,
+    *,
+    reader_agent: Optional[str],
+    shared_db: Any = None,
+) -> None:
+    """Record learning_reads for canonical learning_documents returned to caller."""
+    clean_reader = str(reader_agent or "").strip()
+    if not clean_reader or not results:
+        return
+    by_db: dict[int, tuple[Any, list[int]]] = {}
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        raw_doc_id = row.get("doc_id")
+        if raw_doc_id is None:
+            continue
+        try:
+            doc_id = int(raw_doc_id)
+        except (TypeError, ValueError):
+            continue
+        engine = row.get(_QTY_ENGINE_KEY)
+        db = getattr(engine, "db", None) or shared_db
+        if db is None:
+            continue
+        bucket = by_db.get(id(db))
+        if bucket is None:
+            by_db[id(db)] = (db, [doc_id])
+        elif doc_id not in bucket[1]:
+            bucket[1].append(doc_id)
+    now = time.time()
+    for db, doc_ids in by_db.values():
+        if not doc_ids:
+            continue
+        marks = ",".join("?" * len(doc_ids))
+        try:
+            # Guard against rolling back a caller's uncommitted transaction on stub
+            # connections (e.g. sqlite3 Connection.__exit__ rolls back the whole
+            # connection when an OperationalError escapes `with conn:`).
+            raw_conn = getattr(db, "conn", None)
+            if raw_conn is None and hasattr(db, "_get_conn"):
+                raw_conn = db._get_conn()
+            if raw_conn is not None:
+                tables = {
+                    r[0]
+                    for r in raw_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name IN ('learning_reads', 'learning_documents')"
+                    ).fetchall()
+                }
+                if len(tables) < 2:
+                    continue
+                sp = f"sp_lreads_{id(raw_conn) & 0xFFFFFFFF:x}"
+                was_in_tx = bool(getattr(raw_conn, "in_transaction", False))
+                raw_conn.execute(f"SAVEPOINT {sp}")
+                try:
+                    raw_conn.execute(
+                        f"""INSERT OR IGNORE INTO learning_reads
+                            (learning_id, agent_id, read_at, source)
+                            SELECT learning_id, ?, ?, 'minnid.search'
+                            FROM learning_documents
+                            WHERE doc_id IN ({marks})""",
+                        [clean_reader, now, *doc_ids],
+                    )
+                    raw_conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except Exception:
+                    raw_conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    raw_conn.execute(f"RELEASE SAVEPOINT {sp}")
+                if not was_in_tx and getattr(raw_conn, "in_transaction", False) and hasattr(db, "_get_conn"):
+                    raw_conn.commit()
+            else:
+                with db.cursor() as c:
+                    tables = {
+                        r[0]
+                        for r in c.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' "
+                            "AND name IN ('learning_reads', 'learning_documents')"
+                        ).fetchall()
+                    }
+                    if len(tables) < 2:
+                        continue
+                    c.execute(
+                        f"""INSERT OR IGNORE INTO learning_reads
+                            (learning_id, agent_id, read_at, source)
+                            SELECT learning_id, ?, ?, 'minnid.search'
+                            FROM learning_documents
+                            WHERE doc_id IN ({marks})""",
+                        [clean_reader, now, *doc_ids],
+                    )
+        except Exception:
+            pass
+
+
+def _effective_document_gate_workspace(principal: Any) -> str:
+    """Return the workspace passed into ``can_read_document`` for multi-repo RPCs.
+
+    When a principal stamp uses ``workspace_id='default'`` (or ``'*'``/``'global'``),
+    the agent operates across repositories and Repo-First 3-tier ranking governs
+    relevance while privacy/session/vault-root ACLs remain enforced. When a narrow
+    worker stamp explicitly pins ``workspace_id='workspace-foo'``, preserve that pin.
+    """
+    if principal is None:
+        return "default"
+    p_ws = str(getattr(principal, "workspace_id", "") or "default").strip() or "default"
+    if p_ws in ("*", "default", "global"):
+        return "*"
+    return p_ws
+
+
 def _strip_private_search_keys(results: list) -> None:
     for row in results:
         if not isinstance(row, dict):
             continue
         row.pop(_QTY_ENGINE_KEY, None)
         row.pop(_DEADLINE_POISONED_KEY, None)
+        row.pop(_WS_BOOSTED_KEY, None)
 
 
 def _normalize_caller_visible_results(results: list) -> list:
@@ -279,7 +394,15 @@ def _gather_leg_results(callables: list, deadline_monotonic) -> list:
     return [fn() for fn in callables]
 
 
-def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
+def merge_document_results(
+    result_sets: list,
+    limit: int,
+    *,
+    prefer_personal: bool = False,
+    query_workspace: str = "",
+) -> list:
+    norm_qws = normalize_workspace_scope(query_workspace, default="")
+    concrete_qws = is_concrete_project_workspace(norm_qws)
     has_healthy = any(
         isinstance(row, dict) and not row.get(_DEADLINE_POISONED_KEY)
         for rows in result_sets
@@ -298,6 +421,54 @@ def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bo
             )
         else:
             merged.extend(rows)
+    if concrete_qws:
+        scoped_merged = []
+        for row in merged:
+            if not isinstance(row, dict):
+                scoped_merged.append(row)
+                continue
+            doc_ws = normalize_workspace_scope(row.get("workspace_id"), default="")
+            if (
+                is_concrete_project_workspace(doc_ws)
+                and doc_ws != norm_qws
+                and str(row.get("page_type") or "").lower() == "repo_map"
+            ):
+                continue
+            already_boosted = bool(row.get(_WS_BOOSTED_KEY))
+            if not already_boosted:
+                if is_concrete_project_workspace(doc_ws) and doc_ws != norm_qws:
+                    base_score = float(row.get("score") or 0.0)
+                    conf = row.get("confidence")
+                    has_ce = (
+                        row.get("rerank_score") is not None
+                        or (
+                            isinstance(row.get("provenance"), dict)
+                            and row["provenance"].get("cross_encoder_score") is not None
+                        )
+                        or base_score < 0.0
+                    )
+                    if has_ce and base_score < 0.0:
+                        continue
+                    if not has_ce and conf is not None and float(conf) < 0.60:
+                        continue
+                elif doc_ws == norm_qws:
+                    row = dict(row)
+                    base_score = float(row.get("score") or 0.0)
+                    has_ce = (
+                        row.get("rerank_score") is not None
+                        or (
+                            isinstance(row.get("provenance"), dict)
+                            and row["provenance"].get("cross_encoder_score") is not None
+                        )
+                        or base_score < 0.0
+                    )
+                    row["score"] = round(
+                        base_score + 1.5 if has_ce else (base_score * 1.35 + 0.005),
+                        4,
+                    )
+                    row[_WS_BOOSTED_KEY] = True
+            scoped_merged.append(row)
+        merged = scoped_merged
     if prefer_personal:
         deduped = {}
         for row in merged:
@@ -327,8 +498,16 @@ def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bo
     return sorted(
         merged,
         key=lambda row: (
-            float(row.get("score") or 0.0),
-            1 if prefer_personal and row.get("src") == "p" else 0,
+            float(row.get("score") or 0.0) if isinstance(row, dict) else 0.0,
+            (
+                1
+                if concrete_qws
+                and isinstance(row, dict)
+                and normalize_workspace_scope(row.get("workspace_id"), default="")
+                == norm_qws
+                else 0
+            ),
+            1 if prefer_personal and isinstance(row, dict) and row.get("src") == "p" else 0,
         ),
         reverse=True,
     )[:limit]
@@ -456,6 +635,7 @@ def _degradation_for(
         ("last_query_expand_degraded", "query_expand_degraded"),
         ("last_hyde_degraded", "hyde_degraded"),
         ("last_document_hydration_degraded", "document_hydration_degraded"),
+        ("last_contradiction_sidecars_degraded", "contradiction_sidecars_degraded"),
     ):
         value = getattr(retrieval_engine, flag, None)
         if value:
@@ -594,6 +774,14 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
     summarize_neighborhood = bool(params.get("summarize_neighborhood", False))
     claim = str(params.get("claim", "")).strip() or None
     mode = str(params.get("mode") or "").strip().lower() or None
+    query_workspace = normalize_workspace_scope(
+        params.get("workspace_id"), default=""
+    )
+    echo_workspace = query_workspace or (
+        principal.workspace_id
+        if principal is not None and getattr(principal, "workspace_id", None)
+        else "default"
+    )
 
     if depth == "auto":
         depth = "snippet"
@@ -718,6 +906,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
             """
             nonlocal personal_snapshot
             reused = False
+            passed_qws = bool(query_workspace)
             if (
                 not shared
                 and not personal
@@ -754,10 +943,8 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                         cross_agent=learnings_cross_agent,
                         claim=claim,
                         principal=principal_for_documents,
-                        workspace=(
-                            principal_for_documents.workspace_id
-                            if principal_for_documents is not None
-                            else "default"
+                        workspace=_effective_document_gate_workspace(
+                            principal_for_documents
                         ),
                         deadline_monotonic=deadline_monotonic,
                         update_access=False,
@@ -773,7 +960,16 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                         and "retrieve" not in getattr(retrieval_engine, "__dict__", {})
                     ):
                         retrieve_kwargs["mode"] = "fast"
-                    rows = retrieval_engine.retrieve(**retrieve_kwargs)
+                    if query_workspace:
+                        try:
+                            rows = retrieval_engine.retrieve(
+                                **retrieve_kwargs, query_workspace=query_workspace
+                            )
+                        except TypeError:
+                            passed_qws = False
+                            rows = retrieval_engine.retrieve(**retrieve_kwargs)
+                    else:
+                        rows = retrieval_engine.retrieve(**retrieve_kwargs)
                 except RequestDeadlineExceeded:
                     # A database deadline is request degradation, not an index
                     # failure. In particular, do not claim an FTS-only result
@@ -846,6 +1042,8 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 if not isinstance(row, dict):
                     continue
                 row[_QTY_ENGINE_KEY] = retrieval_engine
+                if passed_qws:
+                    row[_WS_BOOSTED_KEY] = True
                 if poisoned:
                     row[_DEADLINE_POISONED_KEY] = True
             return tagged, ops, trace_id if not reused else None
@@ -1068,7 +1266,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 ):
                     return True
                 try:
-                    ws = getattr(principal, "workspace_id", "default") or "default"
+                    ws = _effective_document_gate_workspace(principal)
                     vault_cfg = getattr(vault_engine, "config", None)
                     vault_root = getattr(vault_cfg, "vault_path", None)
                     has_explicit_roots = bool(getattr(principal, "allowed_vault_roots", None))
@@ -1104,10 +1302,10 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                             cache_map[cache_key] = (now_m, res_bool)
                             return res_bool
                         c.execute(
-                            "SELECT path, agent, sigil, page_type, privacy_level "
+                            "SELECT path, agent, sigil, page_type, privacy_level, workspace_id "
                             "FROM documents "
                             "WHERE agent = ? OR sigil = ? OR agent = 'unknown' "
-                            "OR LOWER(COALESCE(page_type, '')) IN ('wiki', 'handoff', 'synthesis', 'decision') "
+                            "OR LOWER(COALESCE(page_type, '')) IN ('wiki', 'handoff', 'synthesis', 'decision', 'repo_map') "
                             "OR LOWER(COALESCE(agent, '')) LIKE '%wiki%' "
                             "OR LOWER(COALESCE(agent, '')) LIKE '%handoff%'",
                             (principal.agent_id, principal.agent_id),
@@ -1152,7 +1350,12 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 vault_legs
             )
             _replay_leg_ops(combined_ops)
-            return merge_document_results(result_sets, limit), tail_trace
+            return (
+                merge_document_results(
+                    result_sets, limit, query_workspace=query_workspace
+                ),
+                tail_trace,
+            )
 
         # Lazy engine singletons resolve HERE, on the gathering thread, in the
         # same order and multiplicity as the serial code (personal scope never
@@ -1207,9 +1410,16 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 both_combined_vaults
             )
             _replay_leg_ops(combined_ops)
-            combined_rows = merge_document_results(combined_sets, limit)
+            combined_rows = merge_document_results(
+                combined_sets, limit, query_workspace=query_workspace
+            )
             result_sets = [personal_rows, combined_rows]
-            results = merge_document_results(result_sets, limit, prefer_personal=True)
+            results = merge_document_results(
+                result_sets,
+                limit,
+                prefer_personal=True,
+                query_workspace=query_workspace,
+            )
             # Serial last-shared-leg-wins: combined's tail ran after personal's
             # fallback, so it wins when it ran (a ran-and-failed tail is None
             # and selects None — never the handler slot); else personal's
@@ -1287,7 +1497,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         def record_scores():
             try:
                 from minni.rationale import explain
-                from minni.retrieval import _recommended_action
+                from minni.retrieval import _recommended_action, overlay_contradiction_action
                 from minni.scoring import calibrated_confidence, record_score
 
                 # grok-review round 6 (finding 1): TWO passes. Recording and
@@ -1338,16 +1548,19 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                     # old value so one payload has one meaning of confidence.
                     if "recommended_action" in r:
                         try:
-                            r["recommended_action"] = _recommended_action(
+                            action = _recommended_action(
                                 r.get("review_state"),
                                 r.get("instruction_like"),
                                 r.get("confidence"),
                             )
+                            if r.get("contradictions"):
+                                action = overlay_contradiction_action(action)
+                            r["recommended_action"] = action
                         except RequestDeadlineExceeded:
                             raise
-                        except Exception as exc:
+                        except Exception as extra:
                             context.logger.debug(
-                                "search: recommended_action refresh failed: %s", exc
+                                "search: recommended_action refresh failed: %s", extra
                             )
                     if "rationale" in r:
                         try:
@@ -1400,6 +1613,17 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 if not is_passive:
                     run_document_access()
                 run_score_calibration()
+        if not is_passive and results:
+            with allow_expired_sql():
+                _record_returned_learning_reads(
+                    results,
+                    reader_agent=(
+                        getattr(principal, "agent_id", None)
+                        if principal is not None
+                        else agent_id
+                    ),
+                    shared_db=getattr(engine, "db", None),
+                )
         results = _normalize_caller_visible_results(results)
 
         learnings: list = []
@@ -1407,14 +1631,24 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         # Skip after expiry regardless of hybrid vs poisoned ranking.
         if stage_open("learnings"):
             try:
-                learnings = engine.search_learnings(
-                    query,
+                learn_kwargs = dict(
                     agent_id=agent_id,
                     cross_agent=learnings_cross_agent,
                     limit=limit,
                     source="minnid.search",
                     update_access=not (skip_score_record or is_fast_reflex or is_passive),
                 )
+                if query_workspace:
+                    try:
+                        learnings = engine.search_learnings(
+                            query,
+                            **learn_kwargs,
+                            query_workspace=query_workspace,
+                        )
+                    except TypeError:
+                        learnings = engine.search_learnings(query, **learn_kwargs)
+                else:
+                    learnings = engine.search_learnings(query, **learn_kwargs)
             except Exception as exc:
                 context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
             finally:
@@ -1487,9 +1721,22 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
             finally:
                 stage_open("recall_trace")
 
+        if results:
+            try:
+                from minni.repo_map import annotate_repo_map_results
+
+                annotate_repo_map_results(
+                    results,
+                    db=getattr(engine, "db", None),
+                    engine=engine,
+                )
+            except Exception as exc:
+                context.logger.debug("search: repo_map staleness annotation skipped: %s", exc)
+
         response_payload = {
             "query": query,
             "agent_id": agent_id,
+            "workspace_id": echo_workspace,
             "depth": depth,
             "count": len(results),
             "backend": backend_badge(resolved_backend),
@@ -1536,6 +1783,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
             {
                 "query": query,
                 "agent_id": agent_id,
+                "workspace_id": locals().get("echo_workspace") or "default",
                 "depth": locals().get("depth") or "snippet",
                 "count": len(partial),
                 "backend": backend_badge(locals().get("resolved_backend")),
@@ -1699,7 +1947,7 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
     if context.increment_request_count is not None:
         context.increment_request_count()
 
-    result_id = params.get("result_id")
+    result_id = params.get("result_id", params.get("doc_id"))
     if result_id is None:
         return context.make_error(-32602, "result_id is required", request_id)
 
@@ -1710,6 +1958,7 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
 
     depth = str(params.get("depth", "chunk"))
     claim = str(params.get("claim", "")).strip() or None
+    id_kind = params.get("id_kind")
 
     principal, err = context.handler_principal(params, request_id)
     if err:
@@ -1717,13 +1966,16 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
 
     try:
         engine = context.lazy_retrieval()
-        result = engine.expand_result(
-            result_id=result_id,
-            depth=depth,
-            principal=principal,
-            workspace=principal.workspace_id,
-            claim=claim,
-        )
+        expand_kwargs: dict[str, Any] = {
+            "result_id": result_id,
+            "depth": depth,
+            "principal": principal,
+            "workspace": principal.workspace_id,
+            "claim": claim,
+        }
+        if id_kind is not None:
+            expand_kwargs["id_kind"] = str(id_kind)
+        result = engine.expand_result(**expand_kwargs)
         if result is None:
             return context.make_error(-32000, f"No result found for result_id={result_id}", request_id)
         trace_id = record_attribution_trace(
@@ -2138,6 +2390,18 @@ def handle_sm_drill(params: dict, request_id: Any, context: RecallContext) -> di
             for result in results:
                 if isinstance(result, dict) and result.get("attribution_score") is not None:
                     result["trace_id"] = trace_id
+        if results:
+            try:
+                from minni.repo_map import annotate_repo_map_results
+
+                annotate_repo_map_results(
+                    results,
+                    db=getattr(engine, "db", None),
+                    engine=engine,
+                )
+            except Exception as exc:
+                context.logger.debug("sm_drill: repo_map staleness annotation skipped: %s", exc)
+
         return context.make_response({
             "depth": depth,
             "count": len(results),

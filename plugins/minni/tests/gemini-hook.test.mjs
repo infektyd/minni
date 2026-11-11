@@ -105,12 +105,12 @@ test("adaptAgyPayload never clobbers canonical fields and passes unknown tools t
   assert.equal(native.cwd, "/w/second");
 });
 
-test("adaptPreToolUseOutput: allow collapses to explicit allow, deny carries the reason", () => {
-  // agy's enum is allow|deny|ask|force_ask. Claude's "approve"/"block" fail the
-  // step outright: unknown pre-tool hook decision "approve".
+test("adaptPreToolUseOutput: PreToolUse is strictly non-blocking and always emits allow", () => {
+  // agy's enum is allow|deny|ask|force_ask. Hooks never hard-block tool calls:
+  // even a legacy permissionDecision:"deny" payload collapses to { decision: "allow" }.
   assert.deepEqual(adaptPreToolUseOutput({ continue: true }), { decision: "allow" });
   assert.deepEqual(agyAllow(), { decision: "allow" });
-  const deny = adaptPreToolUseOutput({
+  const legacyDeny = adaptPreToolUseOutput({
     continue: true,
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -118,7 +118,7 @@ test("adaptPreToolUseOutput: allow collapses to explicit allow, deny carries the
       permissionDecisionReason: "consult recall first",
     },
   });
-  assert.deepEqual(deny, { decision: "deny", reason: "consult recall first" });
+  assert.deepEqual(legacyDeny, { decision: "allow" });
 });
 
 test("hooks-gemini.json template: agy's native shape, token-stamped", async () => {
@@ -195,7 +195,7 @@ test("PreToolUse never emits an empty decision, even when hooks are disabled or 
   }
 });
 
-test("PreToolUse denies-to-surface through agy's decision vocabulary and flips consumed", async () => {
+test("PreToolUse on agy never denies and flips consumed in strict mode", async () => {
   const fixture = await makeFixture();
   try {
     const runtimeDir = path.join(fixture.vault, ".runtime");
@@ -213,23 +213,21 @@ test("PreToolUse denies-to-surface through agy's decision vocabulary and flips c
         ts: new Date().toISOString(),
       }),
     );
-    // strict mode guards read/search Bash; the adapter maps run_command ->
-    // Bash and CommandLine -> command, so this exercises the whole chain.
+    // strict mode guards read/search Bash non-blockingly; the adapter maps run_command ->
+    // Bash and CommandLine -> command, consumes once, and ALWAYS returns { decision: "allow" }.
     const output = await runGeminiHook(
       "PreToolUse",
       fixture,
       agyPreToolUsePayload({
         toolCall: { name: "run_command", args: { CommandLine: "grep foo bar.txt" } },
       }),
-      { MINNI_RECALL_GUARD_MODE: "strict" },
+      { MINNI_RECALL_GUARD_MODE: "strict", MINNI_RECALL_GUARD_DELIVERY: "deny" },
     );
-    assert.equal(output.decision, "deny");
-    assert.match(output.reason, /recall guard/i);
-    assert.match(output.reason, /prior-fix/);
+    assert.deepEqual(output, { decision: "allow" });
     const state = JSON.parse(await readFile(statePath, "utf8"));
     assert.equal(state.consumed, true);
 
-    // Idempotent re-issue: the same call now allows.
+    // Idempotent re-issue: the same call stays allow.
     const rerun = await runGeminiHook(
       "PreToolUse",
       fixture,
@@ -306,13 +304,14 @@ test("enrichAgyPromptPayload surfaces transcript text as prompt for PreInvocatio
   }
 });
 
-test("guard defaults to strict on agy: read/search run_command is denied without an env override", async () => {
+test("guard defaults to strict on agy while remaining non-blocking: read/search run_command consumes state without denying", async () => {
   const fixture = await makeFixture();
   try {
     const runtimeDir = path.join(fixture.vault, ".runtime");
     await mkdir(runtimeDir, { recursive: true });
+    const statePath = path.join(runtimeDir, "recall-state.json");
     await writeFile(
-      path.join(runtimeDir, "recall-state.json"),
+      statePath,
       JSON.stringify({
         session_id: "cfcd2d03-9775-4ff2-8667-ba461998307f",
         task_signature: "t-default-mode",
@@ -323,8 +322,7 @@ test("guard defaults to strict on agy: read/search run_command is denied without
         ts: new Date().toISOString(),
       }),
     );
-    // Empty string behaves as unset for the gemini default (and shields the
-    // test from any MINNI_RECALL_GUARD_MODE in the runner's environment).
+    // Empty string behaves as unset for the gemini default (strict), consuming state non-blockingly.
     const output = await runGeminiHook(
       "PreToolUse",
       fixture,
@@ -333,11 +331,12 @@ test("guard defaults to strict on agy: read/search run_command is denied without
       }),
       { MINNI_RECALL_GUARD_MODE: "" },
     );
-    assert.equal(output.decision, "deny");
+    assert.deepEqual(output, { decision: "allow" });
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).consumed, true);
 
-    // An explicit soft override is honored: Bash stays unguarded there.
+    // An explicit soft override is honored: Bash stays unguarded there (consumed remains false).
     await writeFile(
-      path.join(runtimeDir, "recall-state.json"),
+      statePath,
       JSON.stringify({
         session_id: "cfcd2d03-9775-4ff2-8667-ba461998307f",
         task_signature: "t-soft-mode",
@@ -357,6 +356,7 @@ test("guard defaults to strict on agy: read/search run_command is denied without
       { MINNI_RECALL_GUARD_MODE: "soft" },
     );
     assert.deepEqual(soft, { decision: "allow" });
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).consumed, false);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

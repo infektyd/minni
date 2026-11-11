@@ -89,6 +89,7 @@ export type EnvelopeEvent =
   | "PreCompact"
   | "PostCompact"
   | "CompactSummary"
+  | "SubagentStart"
   | "Stop"
   | "Handoff";
 
@@ -99,6 +100,7 @@ export interface EnvelopeBody {
   identity?: unknown;
   identity_body?: unknown;
   layer1_shelf?: unknown;
+  project_shelf?: unknown;
   corrections_reassert?: unknown;
   active_thread?: unknown;
   active_thread_ref?: unknown;
@@ -146,6 +148,9 @@ export const ENVELOPE_PRIORITY_ORDER = [
   "identity",
   "degraded",
   "corrections_reassert",
+  "layer1_shelf",
+  "project_shelf",
+  "layer1_source",
   "lifecycle",
   "lifecycle_focus",
   "pending_learnings",
@@ -160,8 +165,6 @@ export const ENVELOPE_PRIORITY_ORDER = [
   "handoff_context",
   "pending_attention",
   "identity_body",
-  "layer1_shelf",
-  "layer1_source",
   "fallback_commands",
   "audit_tail",
 ] as const;
@@ -428,10 +431,12 @@ export function fitEnvelope<T extends EnvelopeBody>(
     return false;
   };
 
-  // A reader-truncated shelf (core.md > 8,192 bytes, truncated: true) is
-  // unconditionally converted to its <= 4,000-char boot form (§6.2.4 / §8.3)
-  // before evaluating whether Steps 1–5 need to trim other sections.
-  ensureTruncatedShelfBootForm();
+  // Reader-truncated shelves (> LAYER1_SHELF_MAX_BYTES = 24 KB, truncated: true)
+  // convert to boot form ONLY when the envelope actually exceeds budget, never
+  // unconditionally crushing shelves up to 24 KB when budget permits (BUG-13).
+  if (needsTrim()) {
+    ensureTruncatedShelfBootForm();
+  }
 
   // Pre-pass: recent_learnings -> 3 (durable first; candidate lines dropped unconditionally)
   if (working.recent_learnings !== undefined) {
@@ -666,17 +671,7 @@ export function fitEnvelope<T extends EnvelopeBody>(
     if (!needsTrim()) return working as T;
   }
 
-  // Step 6: layer1_shelf -> <= 4,000-char boot form + marker (inline_trim: true)
-  if (needsTrim()) {
-    const shelf =
-      working.layer1_shelf && typeof working.layer1_shelf === "object"
-        ? (working.layer1_shelf as Record<string, unknown>)
-        : undefined;
-    convertShelfToBootForm(shelf?.truncated === true);
-    if (!needsTrim()) return working as T;
-  }
-
-  // Step 7: identity_body -> 2,000 chars + marker
+  // Step 6: identity_body -> 2,000 chars + marker (trimmed BEFORE Permanent Shelf)
   if (needsTrim()) {
     const marker = "\n...[identity_body trimmed to 2000 chars]";
     if (typeof working.identity_body === "string" && working.identity_body.length > 2000) {
@@ -706,6 +701,16 @@ export function fitEnvelope<T extends EnvelopeBody>(
       limits.onNativeLayer1Trimmed?.(currentNativeLayer1);
       recordTrim("identity_body", fromChars, currentNativeLayer1.length);
     }
+    if (!needsTrim()) return working as T;
+  }
+
+  // Step 7: layer1_shelf -> <= 4,000-char boot form ONLY if explicit tight budget still exceeded
+  if (needsTrim()) {
+    const shelf =
+      working.layer1_shelf && typeof working.layer1_shelf === "object"
+        ? (working.layer1_shelf as Record<string, unknown>)
+        : undefined;
+    convertShelfToBootForm(shelf?.truncated === true);
     if (!needsTrim()) return working as T;
   }
 
@@ -802,17 +807,12 @@ export function fitEnvelope<T extends EnvelopeBody>(
       }
       if (!needsTrim()) return working as T;
 
-      // 9b. Scale layer1_shelf (string content or entries array)
+      // 9b. Permanent Shelf (string layer1_shelf.content and project_shelf) is
+      // EXEMPT from Step 9b proportional crushing (BUG-13). Legacy array-shaped
+      // entries remain scalable for backwards compatibility.
       if (working.layer1_shelf && typeof working.layer1_shelf === "object") {
         const shelf = working.layer1_shelf as Record<string, unknown>;
-        const maxShelfChars = Math.max(400, Math.floor(LAYER1_BOOT_FORM_MAX_CHARS * scale));
-        if (typeof shelf.content === "string" && shelf.content.length > maxShelfChars) {
-          const fromChars = shelf.content.length;
-          const bootShelf = applyLayer1BootForm(shelf, limits.vaultPath, maxShelfChars);
-          const toChars = typeof bootShelf.content === "string" ? bootShelf.content.length : fromChars;
-          working.layer1_shelf = bootShelf;
-          recordTrim("layer1_shelf", fromChars, toChars);
-        } else if (Array.isArray(shelf.entries) && shelf.entries.length > 0) {
+        if (Array.isArray(shelf.entries) && shelf.entries.length > 0) {
           const fromEntries = shelf.entries.length;
           const maxEntries = Math.max(1, Math.ceil(shelf.entries.length * scale));
           const maxEntryChars = Math.max(120, Math.floor(700 * scale));

@@ -194,9 +194,54 @@ def _afm_distill_section(chain, title: str, content: str) -> Optional[str]:
     return text
 
 
+_FALLBACK_WRAPPER_BLOCK_RE = re.compile(
+    r"(?is)(?<!`)<(SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b[^>]*>.*?</\1>"
+)
+_FALLBACK_WRAPPER_LINE_RE = re.compile(
+    r"(?i)^\s*(?:"
+    r"Created At:\s*\d{4}-\d{2}-\d{2}T"
+    r"|Completed At:\s*\d{4}-\d{2}-\d{2}T"
+    r"|\[Message\]\s+timestamp="
+    r"|Compaction summary\s*[—–-]"
+    r"|The following is a <SYSTEM_MESSAGE>"
+    r"|</?(?:SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b"
+    r")"
+)
+_FALLBACK_BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*+•>]|\d+[.)])\s*")
+
+
 def _fallback_candidate(title: str, content: str) -> str:
-    flattened = re.sub(r"\s+", " ", f"Compaction summary — {title}: {content}").strip()
-    return flattened[:FALLBACK_CANDIDATE_MAX_CHARS]
+    """Extract concise factual lines from `content` without wrapper prefixes.
+
+    Never emits `'Compaction summary — ...'` (which trips `_BOOT_CHATTER_LEAK_RE`
+    downstream). Returns empty string when no substantive factual lines exist so
+    `_distill_file` drops and counts it under `_below_substance_floor`.
+    """
+    from minni.afm_passes.consolidation import is_low_signal_boot_learning
+    from minni.afm_passes.inbox_ingest import is_audit_echo
+    from minni.minnid_runtime.governance import _SPRINT_CHATTER_RE
+
+    cleaned = _FALLBACK_WRAPPER_BLOCK_RE.sub("\n", content or "")
+    factual_lines: List[str] = []
+    for raw_line in cleaned.splitlines():
+        line = re.sub(r"^\s*Compaction summary\s*[—–-]\s*[^:\n]*:\s*", "", raw_line, flags=re.IGNORECASE)
+        if _FALLBACK_WRAPPER_LINE_RE.search(line):
+            continue
+        line = _FALLBACK_BULLET_PREFIX_RE.sub("", line).strip()
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        if is_audit_echo(line) or is_low_signal_boot_learning(line) or _SPRINT_CHATTER_RE.search(line):
+            continue
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_./:-]*", line)
+        if len(words) < 3 or sum(1 for ch in line if ch.isalnum()) < 12:
+            continue
+        factual_lines.append(line)
+
+    if not factual_lines:
+        return ""
+    joined = "; ".join(factual_lines)
+    return joined[:FALLBACK_CANDIDATE_MAX_CHARS]
 
 
 def _distill_file(

@@ -562,6 +562,7 @@ export async function recallMemory(
   const noiseLast = isRecallNoiseLastEnabled(effectiveVaultPath ?? DEFAULT_VAULT_PATH);
   const timeoutMs =
     input.timeoutMs ?? config?.recallTimeoutMs ?? config?.daemonTimeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
+  const effectiveWorkspaceId = (input.workspaceId ?? config?.workspaceId ?? "").trim();
 
   const res = (await jsonRpcSocketRequestWithFallbackRequester(
     "search",
@@ -574,6 +575,7 @@ export async function recallMemory(
       cross_agent: input.crossAgent ?? input.cross_agent,
       depth: "snippet",
       timeout_ms: timeoutMs,
+      ...(effectiveWorkspaceId ? { workspace_id: effectiveWorkspaceId } : {}),
       ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
       ...(input.passive !== undefined ? { passive: input.passive } : {}),
       ...(input.updateAccess !== undefined ? { update_access: input.updateAccess } : {}),
@@ -935,12 +937,30 @@ function xmlAttrEscapeDrill(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+function stripLeadingFrontmatterDrill(text: string): string {
+  if (!text) return "";
+  let body = text.startsWith("\uFEFF") ? text.slice(1) : text;
+  body = body.replace(/^(?:\r?\n)+/, "");
+  if (!body.startsWith("---")) return text;
+  const lines = body.split(/\r?\n/);
+  if ((lines[0] ?? "").trim() !== "---") return text;
+  for (let i = 1; i < lines.length; i++) {
+    const trimmed = (lines[i] ?? "").trim();
+    if (trimmed === "---" || trimmed === "...") {
+      return lines.slice(i + 1).join("\n").replace(/^(?:\r?\n)+/, "");
+    }
+  }
+  return text;
+}
+
 function formatLocalDrillBody(body: string, depth: DrillMemoryInput["depth"]): string {
+  const cleaned = stripLeadingFrontmatterDrill(body);
+  if (!cleaned.trim()) return "";
   const effectiveDepth = depth ?? "snippet";
-  if (effectiveDepth === "document") return body;
+  if (effectiveDepth === "document") return cleaned;
   const maxChars = effectiveDepth === "chunk" ? 1600 : 500;
-  if (body.length <= maxChars) return body;
-  return `${body.slice(0, maxChars)}…`;
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, maxChars)}…`;
 }
 
 async function resolveSqliteHandleNote(
@@ -1099,7 +1119,14 @@ async function resolveSqliteHandleNote(
               const rowId = String(row.doc_id ?? row.id ?? targetDocId);
               const source = String(row.path ?? row.source ?? row.uri ?? rowId ?? "documents");
               const title = String(row.title ?? source);
-              const content = readDocContent(row, rowId);
+              let content = readDocContent(row, rowId);
+              if (String(row.page_type ?? "").toLowerCase() === "repo_map" || source.includes("/vault/maps/")) {
+                const { computeRepoMapCardStalenessNote } = await import("./project_shelf.js");
+                const note = computeRepoMapCardStalenessNote(source);
+                if (note && !content.includes(note)) {
+                  content = content ? `${note}\n${content}` : note;
+                }
+              }
               return { source, title, content: content || title };
             }
           }
@@ -1111,7 +1138,7 @@ async function resolveSqliteHandleNote(
             const rowId = String(row.doc_id ?? row.id ?? "");
             const source = String(row.path ?? row.source ?? row.uri ?? rowId ?? "documents");
             const title = String(row.title ?? source);
-            const content = readDocContent(row, rowId);
+            let content = readDocContent(row, rowId);
             if (
               matchesHandle(source) ||
               matchesHandle(title) ||
@@ -1123,6 +1150,13 @@ async function resolveSqliteHandleNote(
                   matchesHandle(`d:personal:${rowId}`) ||
                   matchesHandle(`d:shared:${rowId}`)))
             ) {
+              if (String(row.page_type ?? "").toLowerCase() === "repo_map" || source.includes("/vault/maps/")) {
+                const { computeRepoMapCardStalenessNote } = await import("./project_shelf.js");
+                const note = computeRepoMapCardStalenessNote(source);
+                if (note && !content.includes(note)) {
+                  content = content ? `${note}\n${content}` : note;
+                }
+              }
               return {
                 source,
                 title,
@@ -1260,7 +1294,9 @@ export async function drillMemory(
             );
             if (sqliteResolved) {
               const clipped = formatLocalDrillBody(sqliteResolved.content, input.depth);
-              const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqliteResolved.source)}">\n${clipped}\n</EVIDENCE>`;
+              const wrapped = clipped.trim()
+                ? `<EVIDENCE source="${xmlAttrEscapeDrill(sqliteResolved.source)}">\n${clipped}\n</EVIDENCE>`
+                : "";
               localResults.push({
                 handle: normalizedHandle,
                 status: "resolved",
@@ -1282,7 +1318,9 @@ export async function drillMemory(
           continue;
         }
         const clipped = formatLocalDrillBody(resolved.content, input.depth);
-        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${clipped}\n</EVIDENCE>`;
+        const wrapped = clipped.trim()
+          ? `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${clipped}\n</EVIDENCE>`
+          : "";
         localResults.push({
           handle: normalizedHandle,
           status: "resolved",
@@ -1398,6 +1436,8 @@ export async function drillMemory(
       });
       const combinedResults = [...localResults, ...mergedDaemonItems];
       const firstMeta = daemonMeta[0] ?? {};
+      const firstMemoryLinks =
+        (combinedResults[0] as Record<string, unknown> | undefined)?.memory_links;
       return {
         ok: true,
         data: {
@@ -1410,6 +1450,7 @@ export async function drillMemory(
           ...(firstMeta.source_unverified !== undefined
             ? { source_unverified: firstMeta.source_unverified }
             : {}),
+          ...(firstMemoryLinks !== undefined ? { memory_links: firstMemoryLinks } : {}),
           results: combinedResults,
         },
       };
@@ -1432,7 +1473,9 @@ export async function drillMemory(
           break;
         }
         const clipped = formatLocalDrillBody(sqlHit.content, input.depth);
-        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqlHit.source)}">\n${clipped}\n</EVIDENCE>`;
+        const wrapped = clipped.trim()
+          ? `<EVIDENCE source="${xmlAttrEscapeDrill(sqlHit.source)}">\n${clipped}\n</EVIDENCE>`
+          : "";
         localResults.push({
           handle: meta.handle,
           status: "resolved",
@@ -1500,7 +1543,9 @@ export async function drillMemory(
         input.sessionId,
       );
       if (resolved.status === "resolved") {
-        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${resolved.content}\n</EVIDENCE>`;
+        const clipped = formatLocalDrillBody(resolved.content, input.depth);
+        if (!clipped.trim()) continue;
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${clipped}\n</EVIDENCE>`;
         fallbackResults.push({
           wikilink: resolved.wikilink,
           relativePath: resolved.relativePath,
@@ -1929,9 +1974,13 @@ function formatDaemonCard(r: Record<string, unknown>, index: number): string {
       ? Number(r.score.toFixed(2))
       : (typeof r.score === "string" && r.score.trim() ? r.score.trim() : undefined);
   const rawSnippet = r.snippet ?? r.content ?? r.text ?? r.headline;
+  const cleanedRawSnippet =
+    typeof rawSnippet === "string"
+      ? rawSnippet.replace(/<EVIDENCE\b[^>]*>\s*<\/EVIDENCE>/gi, "")
+      : undefined;
   const snippet =
-    typeof rawSnippet === "string" && rawSnippet.trim()
-      ? rawSnippet.replace(/\s+/g, " ").trim()
+    typeof cleanedRawSnippet === "string" && cleanedRawSnippet.trim()
+      ? cleanedRawSnippet.replace(/\s+/g, " ").trim()
       : undefined;
 
   let card = `${index + 1}. ${wikilink}`;

@@ -625,6 +625,7 @@ def backfill_learning_projections(
         ACTIVE_LEARNING_SQL, durable_doc_path, durable_metadata,
         projection_row_closed,
     )
+    from minni.graph_commit import ensure_canonical_learning_node, graph_node_schema_present
     from minni.retrieval import RetrievalEngine
 
     stats = {"examined": 0, "missing": 0, "repaired": 0, "skipped": 0, "failed": 0}
@@ -635,8 +636,14 @@ def backfill_learning_projections(
         raise ValueError("projection repair config must match source database")
     key = (str(config.db_path), "learning_projections")
     with db.cursor() as c:
+        l_cols = {
+            r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+            for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+        }
+        has_l_ws = "workspace_id" in l_cols
+        ws_sel = ", workspace_id" if has_l_ws else ""
         rows = _cursor_batch(c, f"""
-            SELECT learning_id, agent_id, content FROM learnings
+            SELECT learning_id, agent_id, content, created_at{ws_sel} FROM learnings
             WHERE {ACTIVE_LEARNING_SQL} AND content IS NOT NULL
               AND TRIM(content) != '' AND learning_id > ?
             ORDER BY learning_id LIMIT ?
@@ -650,7 +657,10 @@ def backfill_learning_projections(
             if not isinstance(agent, str) or not agent.strip():
                 stats["skipped"] += 1
                 continue
+            row_ws = str(row["workspace_id"] or "").strip() if has_l_ws else ""
+            row_ts = float(row["created_at"] or time.time())
             path = durable_doc_path(agent, "", config.vault_path, content)
+            need_join_heal = False
             with db.cursor() as c:
                 doc = c.execute(
                     "SELECT doc_id, page_status, privacy_level FROM documents"
@@ -661,22 +671,31 @@ def backfill_learning_projections(
                         "SELECT 1 FROM vault_fts WHERE doc_id=?", (doc["doc_id"],)
                     ).fetchone()
                     if fts is not None:
+                        if graph_node_schema_present(c):
+                            mapped = c.execute(
+                                "SELECT 1 FROM learning_documents"
+                                " WHERE learning_id=? AND doc_id=?",
+                                (int(row["learning_id"]), int(doc["doc_id"])),
+                            ).fetchone()
+                            need_join_heal = mapped is None
+                        if need_join_heal:
+                            with db.transaction() as cw:
+                                ensure_canonical_learning_node(
+                                    cw,
+                                    learning_id=int(row["learning_id"]),
+                                    agent_id=agent,
+                                    content=content,
+                                    vault_path=config.vault_path,
+                                    created_at=row_ts,
+                                    workspace_id=row_ws,
+                                )
                         continue
-                    # Incomplete projection (canonical placeholder): a documents
-                    # row was committed without its FTS/chunk rows — e.g. a
-                    # governed promotion whose semantic indexing failed. Fall
-                    # through and fill the SAME node below; never mint a
-                    # duplicate. A doc WITH an FTS row but no chunks stays
-                    # skipped here — backfill_document_vectors owns that case.
-                    # The STORED row is authoritative: a lifecycle-closed or
-                    # restricted row (rejected/blocked since commit) must stay
-                    # untouched — repair never resurrects it from content
-                    # defaults. The engine re-checks this inside its write
-                    # transaction; this pre-check only avoids wasted encodes.
                     if projection_row_closed(doc["page_status"], doc["privacy_level"]):
                         stats["skipped"] += 1
                         continue
             metadata = durable_metadata(content)
+            if row_ws:
+                metadata["workspace_id"] = row_ws
             if (metadata["privacy_level"] == "blocked" or metadata["page_status"] in
                     {"draft", "expired", "rejected", "superseded"}):
                 stats["skipped"] += 1
@@ -689,6 +708,24 @@ def backfill_learning_projections(
                 repair_projection=True, on_vectors=on_vectors,
             )
             if result.get("status") == "ok":
+                try:
+                    with db.transaction() as cw:
+                        if graph_node_schema_present(cw):
+                            ensure_canonical_learning_node(
+                                cw,
+                                learning_id=int(row["learning_id"]),
+                                agent_id=agent,
+                                content=content,
+                                vault_path=config.vault_path,
+                                created_at=row_ts,
+                                workspace_id=row_ws,
+                            )
+                except Exception:
+                    logger.debug(
+                        "Canonical learning_documents stamp skipped for learning %s",
+                        row["learning_id"],
+                        exc_info=True,
+                    )
                 stats["repaired"] += 1
             elif result.get("status") == "skipped":
                 stats["skipped"] += 1

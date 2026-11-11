@@ -87,9 +87,25 @@ _RAW_TEST_OUTPUT_RE = re.compile(
     r"(?:^\s*=+\s*\d+\s+(?:passed|failed|skipped|error|errors|deselected)\b.*=+\s*$|^\s*(?:ran\s+\d+\s+tests?\s+in\s+[\d.]+s|test\s+suites?:\s+\d+\s+passed(?:\b.*)?|\d+\s+passed(?:,\s+\d+\s+\w+)*\s+in\s+[\d.]+s)\s*$)",
     re.IGNORECASE | re.MULTILINE,
 )
+_INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]+`")
 _BOOT_CHATTER_LEAK_RE = re.compile(
-    r"(?im)(?:^\s*Compaction summary\s*[—–-]|Test failure recovered after edit:\s*Created At:\s*\d{4}-\d{2}-\d{2})"
+    r"(?im)(?:"
+    r"^\s*Compaction summary\s*[—–-]"
+    r"|Test failure recovered after edit:\s*Created At:\s*\d{4}-\d{2}-\d{2}"
+    r"|^\s*Created At:\s*\d{4}-\d{2}-\d{2}T"
+    r"|^\s*Completed At:\s*\d{4}-\d{2}-\d{2}T"
+    r"|^\s*The following is a <SYSTEM_MESSAGE>"
+    r"|^\s*</?(?:SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b"
+    r"|<(SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b[^>]*>[\s\S]*?</\1>"
+    r"|^\s*\[Message\]\s+timestamp="
+    r")"
 )
+
+
+def _has_boot_chatter_leak(content: str) -> bool:
+    if not isinstance(content, str) or not content:
+        return False
+    return bool(_BOOT_CHATTER_LEAK_RE.search(_INLINE_CODE_SPAN_RE.sub(" ", content)))
 
 
 def is_low_signal_boot_learning(content: str) -> bool:
@@ -101,7 +117,7 @@ def is_low_signal_boot_learning(content: str) -> bool:
     if (
         _RAW_PROMPT_ECHO_RE.search(content)
         or _RAW_TEST_OUTPUT_RE.search(content)
-        or _BOOT_CHATTER_LEAK_RE.search(content)
+        or _has_boot_chatter_leak(content)
     ):
         return True
     from minni.afm_passes.inbox_ingest import is_audit_echo
@@ -125,6 +141,8 @@ def _quality_blockers(content: str) -> List[str]:
         reasons.append("raw prompt echo")
     if _RAW_TEST_OUTPUT_RE.search(text):
         reasons.append("raw test output telemetry")
+    if _has_boot_chatter_leak(text):
+        reasons.append("wrapper or system envelope leak")
     alnum_chars = {ch.lower() for ch in text if ch.isalnum()}
     if len(text) > 10 and len(alnum_chars) <= 2:
         reasons.append("low character diversity (filler)")
@@ -236,6 +254,81 @@ def find_active_learning_by_hash(
             if content_hash(rd["content"] or "") == h:
                 return rd
     return None
+
+
+def find_active_learning_ids_by_hash(
+    cursor, h: str, agent_id: str
+) -> List[int]:
+    """Return all active un-superseded learning IDs matching (agent_id, h) without mutating rows."""
+    pragma = cursor.execute("PRAGMA table_info(learnings)").fetchall()
+    cols = {
+        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+        for r in pragma
+    }
+    status_where = (
+        "AND COALESCE(status, 'active') = 'active'" if "status" in cols else ""
+    )
+    sup_where = "AND superseded_by IS NULL" if "superseded_by" in cols else ""
+    out: List[int] = []
+    seen: set[int] = set()
+
+    if "content_hash" in cols:
+        cursor.execute(
+            f"""
+            SELECT learning_id
+            FROM learnings
+            WHERE content_hash = ? AND agent_id = ?
+              {status_where}
+              {sup_where}
+            ORDER BY created_at DESC, learning_id DESC
+            """,
+            (h, agent_id),
+        )
+        for r in cursor.fetchall():
+            lid = int(r["learning_id"] if isinstance(r, dict) or hasattr(r, "keys") else r[0])
+            if lid not in seen:
+                seen.add(lid)
+                out.append(lid)
+        cursor.execute(
+            f"""
+            SELECT learning_id, content
+            FROM learnings
+            WHERE content_hash IS NULL AND agent_id = ?
+              {status_where}
+              {sup_where}
+            ORDER BY created_at DESC, learning_id DESC
+            """,
+            (agent_id,),
+        )
+        for r in cursor.fetchall():
+            if isinstance(r, dict) or hasattr(r, "keys"):
+                lid, ctext = int(r["learning_id"]), r["content"]
+            else:
+                lid, ctext = int(r[0]), r[1]
+            if lid not in seen and content_hash(ctext or "") == h:
+                seen.add(lid)
+                out.append(lid)
+    else:
+        cursor.execute(
+            f"""
+            SELECT learning_id, content
+            FROM learnings
+            WHERE agent_id = ?
+              {status_where}
+              {sup_where}
+            ORDER BY created_at DESC, learning_id DESC
+            """,
+            (agent_id,),
+        )
+        for r in cursor.fetchall():
+            if isinstance(r, dict) or hasattr(r, "keys"):
+                lid, ctext = int(r["learning_id"]), r["content"]
+            else:
+                lid, ctext = int(r[0]), r[1]
+            if lid not in seen and content_hash(ctext or "") == h:
+                seen.add(lid)
+                out.append(lid)
+    return out
 
 
 def has_active_learning_hash(cursor, h: str, agent_id: str) -> bool:
@@ -764,12 +857,24 @@ def run(db, config, vault_path: Optional[str] = None,
         review_candidate_ids.append(cand["candidate_id"])
         drafts.append(_review_draft(cand, reason, trace_id))
 
+    def _auto_reject(cand, reason):
+        from minni.afm_passes.judge import Verdict
+
+        cid = cand["candidate_id"]
+        reject_candidate_ids.append(cid)
+        judge_verdicts[cid] = Verdict(
+            decision="reject",
+            reason=reason[:500],
+            model="deterministic-consolidation",
+            confidence=1.0,
+        )
+
     for cand in candidates:
         content = cand.get("content") or ""
         norm = _normalize(content)
 
         if not norm or len(norm) < _MIN_CONTENT_LEN:
-            _review(cand, "too short / trivial")
+            _auto_reject(cand, "too short / trivial")
             continue
 
         h = content_hash(content)
@@ -794,7 +899,7 @@ def run(db, config, vault_path: Optional[str] = None,
 
         blockers = _quality_blockers(content)
         if blockers:
-            _review(cand, "low quality: " + "; ".join(blockers))
+            _auto_reject(cand, "low quality: " + "; ".join(blockers))
             continue
 
         cat, source, origin = _extract_candidate_provenance(cand)
@@ -805,7 +910,7 @@ def run(db, config, vault_path: Optional[str] = None,
             origin=origin,
         )
         if dur_blocker is not None:
-            reject_candidate_ids.append(cand["candidate_id"])
+            _auto_reject(cand, dur_blocker)
             continue
 
         # If privacy is review, evaluate via authoritative model judge if eligible

@@ -272,26 +272,23 @@ def test_wet_quality_fail_review_does_not_livelock_or_remint_drafts(
     first = consolidate(db, cfg, dry_run=False, trace_id="wet-live-1")
     assert first["summary"]["examined"] == _DEFAULT_MAX_PER_RUN
     assert first["summary"]["deferred"] == 2
-    assert set(first["review_candidate_ids"]) == set(filler_ids[:_DEFAULT_MAX_PER_RUN])
+    assert set(first["reject_candidate_ids"]) == set(filler_ids[:_DEFAULT_MAX_PER_RUN])
+    assert first["review_candidate_ids"] == []
     assert first["promote_candidate_ids"] == []
-    first_pages = {d["page_id"] for d in first["drafts"]}
-    assert len(first_pages) == _DEFAULT_MAX_PER_RUN
-    assert all(pid.startswith("consolidation-review-") for pid in first_pages)
+    assert first["drafts"] == []
     apply_consolidation_result(first, ctx)
 
     second = consolidate(db, cfg, dry_run=False, trace_id="wet-live-2")
     assert second["summary"]["examined"] == 2
-    assert second["summary"]["deferred"] == _DEFAULT_MAX_PER_RUN
+    assert second["summary"]["deferred"] == 0
     assert second["promote_candidate_ids"] == [good_id]
-    assert second["review_candidate_ids"] == [filler_ids[-1]]
-    second_pages = {d["page_id"] for d in second["drafts"]}
-    assert first_pages.isdisjoint(second_pages)
-    assert all("wet-live-1" not in pid for pid in second_pages)
+    assert second["reject_candidate_ids"] == [filler_ids[-1]]
+    assert second["review_candidate_ids"] == []
     apply_consolidation_result(second, ctx)
 
     third = consolidate(db, cfg, dry_run=False, trace_id="wet-live-3")
     assert third["summary"]["examined"] == 0
-    assert third["summary"]["deferred"] == n
+    assert third["summary"]["deferred"] == 0
     assert third["promote_candidate_ids"] == []
     assert third["review_candidate_ids"] == []
     assert third["drafts"] == []
@@ -302,18 +299,10 @@ def test_wet_quality_fail_review_does_not_livelock_or_remint_drafts(
             "SELECT candidate_id, status FROM candidate_packets "
             "ORDER BY candidate_id"
         ).fetchall()
-        fences = cursor.execute(
-            """
-            SELECT COUNT(*) AS n FROM consolidation_actions
-            WHERE action_type = 'afm_review'
-              AND COALESCE(status, '') != 'superseded'
-            """
-        ).fetchone()["n"]
         learnings = cursor.execute("SELECT COUNT(*) AS n FROM learnings").fetchone()["n"]
     by_id = {row["candidate_id"]: row["status"] for row in proposed}
     assert by_id[good_id] == "accepted"
-    assert all(by_id[cid] == "proposed" for cid in filler_ids)
-    assert fences == n
+    assert all(by_id[cid] == "rejected" for cid in filler_ids)
     assert learnings == 1
 
 
@@ -348,7 +337,7 @@ def test_unfenced_review_good_writes_shared_review_draft_not_safe_learning(
     result = consolidate(db, cfg, dry_run=False, trace_id="review-shared")
     assert result["promote_candidate_ids"] == []
     assert good_id in result["review_candidate_ids"]
-    assert filler_id in result["review_candidate_ids"]
+    assert filler_id in result["reject_candidate_ids"]
     assert result["drafts"]
     assert all(draft.get("agent") == "afm-loop" for draft in result["drafts"])
 

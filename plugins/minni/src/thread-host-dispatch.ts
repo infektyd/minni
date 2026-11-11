@@ -19,7 +19,7 @@ import type { WorkerPacket } from "./thread-worker-packet.js";
 export const FIRST_WET_SET = ["grok", "agy", "codex"] as const;
 export type FirstWetSetHost = (typeof FIRST_WET_SET)[number];
 
-export const WORKER_COMPLETION_TOOL = "minni_thread_worker_update";
+export const WORKER_COMPLETION_TOOL = "minni_thread_update";
 
 /** grok worker-start is missing. Do not fill this with a hook or handoff. */
 export const GROK_WORKER_START: null = null;
@@ -28,27 +28,26 @@ export const GROK_WORKER_START: null = null;
  * agy / Antigravity default auto-grants. Copied from
  * `MINNI_READONLY_TOOLS` in `src/minni/wire/writers.py` and
  * `plugins/minni/skills/minni-install/scripts/propagate.py`.
- * Still no `minni_thread_*`.
+ * Read-only tools from the 12-tool v1 surface only; no mutating thread tools.
  */
 export const AGY_DEFAULT_ALLOWLIST = [
   "minni_recall",
   "minni_drill",
   "minni_status",
-  "minni_audit_tail",
-  "minni_audit_report",
-  "minni_route",
-  "minni_list_pending_handoffs",
-  "minni_ping_agent_inbox",
-  "minni_ping_agent_status",
+  "minni_list_candidates",
+  "minni_handoff_inbox",
+  "minni_thread_status",
 ] as const;
 
 /**
  * Named agy worker allowlist. Copied from `MINNI_WORKER_TOOLS` in
- * `src/minni/wire/writers.py`. One tool; scar is a worker_update action.
+ * `src/minni/wire/writers.py`. Scoped to the 12-tool v1 surface.
  * Default dispatch still uses `AGY_DEFAULT_ALLOWLIST` and stays CANNOT.
  */
 export const AGY_WORKER_ALLOWLIST = [
-  "minni_thread_worker_update",
+  "minni_thread_update",
+  "minni_thread_scar",
+  "minni_learn",
 ] as const;
 
 export interface AgyWorkerAllowlistReport {

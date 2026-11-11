@@ -46,7 +46,7 @@
     "defaultPrompt": [
       "Recall Minni for this task",
       "Learn this in the KiloCode vault",
-      "Show recent Minni audit logs"
+      "Check Minni system status and active threads"
     ],
     "brandColor": "#2563EB",
     "screenshots": []

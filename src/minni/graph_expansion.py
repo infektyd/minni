@@ -73,7 +73,7 @@ _SORTED_TYPES = tuple(sorted(ALLOWED_LINK_TYPES))
 _SORTED_TWO_HOP = tuple(sorted(TWO_HOP_TYPES))
 
 _SEED_META_SQL = """
-SELECT doc_id, path, agent, sigil, privacy_level, page_status, page_type, memory_kind
+SELECT doc_id, path, agent, sigil, privacy_level, page_status, page_type, memory_kind{ws_col}
 FROM documents
 WHERE doc_id = ?
 """
@@ -98,7 +98,7 @@ SELECT
     d.privacy_level,
     d.page_status,
     d.page_type,
-    d.memory_kind,
+    d.memory_kind{doc_ws_col},
     {direction!r} AS direction
 FROM memory_links ml
 JOIN documents d ON d.doc_id = ml.{neighbor_col}
@@ -114,6 +114,25 @@ WHERE ml.{seed_col} = ?
 ORDER BY d.doc_id, ml.link_type
 LIMIT ?
 """
+
+
+def _documents_has_workspace_col(cursor: Any) -> bool:
+    cached = getattr(cursor, "_minni_has_doc_ws_col", None)
+    if cached is not None:
+        return bool(cached)
+    try:
+        cols = {
+            r["name"] if isinstance(r, Mapping) or hasattr(r, "keys") else r[1]
+            for r in cursor.execute("PRAGMA table_info(documents)").fetchall()
+        }
+        has_ws = "workspace_id" in cols
+    except Exception:
+        has_ws = False
+    try:
+        setattr(cursor, "_minni_has_doc_ws_col", has_ws)
+    except Exception:
+        pass
+    return has_ws
 
 
 @dataclass(frozen=True)
@@ -418,9 +437,11 @@ def _authorize_seeds(
 ) -> List[Tuple[int, float]]:
     """Re-check seed metadata in this DB snapshot before any traversal/text."""
     allowed: List[Tuple[int, float]] = []
+    has_ws = _documents_has_workspace_col(cursor)
+    seed_sql = _SEED_META_SQL.format(ws_col=", workspace_id" if has_ws else "")
     for doc_id, score in ranked_seeds:
         check_deadline()
-        cursor.execute(_SEED_META_SQL, (doc_id,))
+        cursor.execute(seed_sql, (doc_id,))
         row = cursor.fetchone()
         if row is None:
             continue
@@ -433,9 +454,22 @@ def _authorize_seeds(
     return allowed
 
 
+def _optional_row_workspace(row: Any) -> Optional[str]:
+    try:
+        if isinstance(row, Mapping):
+            if "workspace_id" in row:
+                return row["workspace_id"]
+            return None
+        if hasattr(row, "keys") and "workspace_id" in row.keys():
+            return row["workspace_id"]
+    except Exception:
+        return None
+    return None
+
+
 def _document_metadata(row: Any, store_id: str) -> Dict[str, Any]:
     doc_id = _row_value(row, "doc_id")
-    return {
+    meta = {
         "doc_id": doc_id,
         "store_id": store_id,
         "path": _row_value(row, "path"),
@@ -446,6 +480,10 @@ def _document_metadata(row: Any, store_id: str) -> Dict[str, Any]:
         "page_type": _row_value(row, "page_type"),
         "memory_kind": _row_value(row, "memory_kind"),
     }
+    ws_val = _optional_row_workspace(row)
+    if ws_val is not None:
+        meta["workspace_id"] = ws_val
+    return meta
 
 
 def _eligible_neighbors_for_seed(
@@ -537,7 +575,9 @@ def _fetch_edge_page(
     after_type: str,
     link_types: Sequence[str] = _SORTED_TYPES,
 ) -> List[Any]:
+    has_ws = _documents_has_workspace_col(cursor)
     sql = _EDGE_PAGE_SQL.format(
+        doc_ws_col=", d.workspace_id" if has_ws else "",
         direction=direction,
         seed_col=seed_col,
         neighbor_col=neighbor_col,
@@ -726,6 +766,9 @@ def _consider_second_hop(
         "page_type": _row_value(row, "page_type"),
         "memory_kind": _row_value(row, "memory_kind"),
     }
+    ws_val = _optional_row_workspace(row)
+    if ws_val is not None:
+        metadata["workspace_id"] = ws_val
     if not _authorized(principal, workspace, metadata):
         return None
     if not _neighbor_eligible(metadata):
@@ -744,7 +787,7 @@ def _consider_second_hop(
         "inference_method": _row_value(row, "inference_method"),
         "store_id": store_id,
     }
-    return {
+    out = {
         "doc_id": neighbor_id,
         "store_id": store_id,
         "path": metadata["path"],
@@ -763,6 +806,9 @@ def _consider_second_hop(
         "graph_depth": 2,
         "link_type": link_type,
     }
+    if ws_val is not None:
+        out["workspace_id"] = ws_val
+    return out
 
 
 def _row_value(row: Any, key: str, index: int = None):
@@ -810,6 +856,9 @@ def _consider_edge(
         "page_type": _row_value(row, "page_type"),
         "memory_kind": _row_value(row, "memory_kind"),
     }
+    ws_val = _optional_row_workspace(row)
+    if ws_val is not None:
+        metadata["workspace_id"] = ws_val
     if not _authorized(principal, workspace, metadata):
         return None
     if not _neighbor_eligible(metadata):
@@ -828,7 +877,7 @@ def _consider_edge(
         "inference_method": _row_value(row, "inference_method"),
         "store_id": store_id,
     }
-    return {
+    out = {
         "doc_id": neighbor_id,
         "store_id": store_id,
         "path": metadata["path"],
@@ -847,6 +896,9 @@ def _consider_edge(
         "graph_depth": 1,
         "link_type": link_type,
     }
+    if ws_val is not None:
+        out["workspace_id"] = ws_val
+    return out
 
 
 def _authorized(principal: EffectivePrincipal, workspace: str, metadata: Dict[str, Any]) -> bool:

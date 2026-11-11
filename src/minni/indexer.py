@@ -9,6 +9,7 @@ V3.1 changes over V3:
 5. Chunk text stored in full (V3 truncated to 500 chars)
 """
 
+import json
 import os
 import re
 import time
@@ -238,13 +239,71 @@ class VaultIndexer:
         from minni.models import get_embedder
         return get_embedder()
 
+    def _chunks_for_indexing(self, content: str, meta: Dict[str, str]):
+        """Chunk *content*, preserving concise repo_map cards whole without YAML noise."""
+        if str(meta.get("page_type") or "").lower() == "repo_map":
+            body = self.FRONTMATTER_BLOCK_RE.sub("", content or "", count=1).strip() or (content or "").strip()
+            if body and len(body.split()) <= self.chunker.chunk_size:
+                from minni.chunker import Chunk
+
+                first_line = body.splitlines()[0].lstrip("#").strip()
+                return [
+                    Chunk(
+                        text=body,
+                        heading=first_line,
+                        heading_path=first_line,
+                        chunk_index=0,
+                    )
+                ]
+            chunks = self.chunker.chunk_document(body)
+            if chunks:
+                return chunks
+            if body:
+                from minni.chunker import Chunk
+
+                return [Chunk(text=body, heading="", heading_path="", chunk_index=0)]
+        return self.chunker.chunk_document(content)
+
     # ── Metadata extraction ────────────────────────────────────
 
     # G21: shared frontmatter block regex (same pattern as wiki_indexer for consistency)
     FRONTMATTER_BLOCK_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL | re.MULTILINE)
+    _REPO_MAP_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
     @staticmethod
-    def _extract_frontmatter(content: str) -> Dict[str, str]:
+    def _candidate_minni_homes_for_config(config: Optional[MinniConfig] = None) -> List[Path]:
+        from minni.config import CANONICAL_SOVEREIGN_HOME
+
+        homes: List[Path] = []
+        env_home = (os.environ.get("MINNI_HOME") or "").strip()
+        if env_home:
+            homes.append(Path(env_home).expanduser())
+        if config is not None:
+            db_p = getattr(config, "db_path", "") or ""
+            if db_p:
+                homes.append(Path(db_p).expanduser().parent)
+            vp_str = getattr(config, "vault_path", "") or ""
+            if vp_str:
+                vp = Path(vp_str).expanduser()
+                if vp.name == "vault" or vp.name.endswith("-vault"):
+                    homes.append(vp.parent)
+        homes.append(Path(CANONICAL_SOVEREIGN_HOME).expanduser())
+        deduped: List[Path] = []
+        seen: set[str] = set()
+        for h in homes:
+            key = str(h)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(h)
+        return deduped
+
+    @staticmethod
+    def _extract_frontmatter(
+        content: str,
+        *,
+        path: Optional[str] = None,
+        candidate_homes: Optional[List[Path]] = None,
+    ) -> Dict[str, str]:
         """
         G21: Extract via YAML frontmatter block + yaml.safe_load (SEC-011/SEC-018).
 
@@ -264,6 +323,7 @@ class VaultIndexer:
                 "privacy_level": "safe",
                 "page_type": None,
                 "layer": "knowledge",
+                "workspace_id": "",
             }
 
         yaml_block = match.group(1)
@@ -299,6 +359,34 @@ class VaultIndexer:
         privacy = _str(data.get("privacy"), "safe").lower()
         page_type = _str(data.get("type") or data.get("page_type"), None) or None
 
+        # BUG-38: `page_type: repo_map` grants cross-agent read visibility and
+        # populates `repo_map_cards`. Never allow markdown outside
+        # `<minni_home>/vault/maps/<ws_slug>/<slug>.md` (zero symlinks) to
+        # self-assign `page_type: repo_map` or `agent: repo-map`.
+        if (page_type and page_type.lower() == "repo_map") or agent.lower() == "repo-map":
+            from minni.principal import is_trusted_repo_map_card_path
+
+            homes = (
+                candidate_homes
+                if candidate_homes is not None
+                else VaultIndexer._candidate_minni_homes_for_config(None)
+            )
+            trusted_map_card = bool(path) and is_trusted_repo_map_card_path(str(path), homes)
+            if page_type and page_type.lower() == "repo_map":
+                if trusted_map_card:
+                    page_type = "repo_map"
+                    agent = "repo-map"
+                else:
+                    logger.warning(
+                        "indexer: stripping untrusted page_type=%r from %r "
+                        "(repo_map is reserved for <minni_home>/vault/maps/)",
+                        page_type,
+                        path,
+                    )
+                    page_type = None
+            if not trusted_map_card and agent.lower() == "repo-map":
+                agent = "unknown"
+
         # Clamp
         valid_statuses = {
             "draft",
@@ -332,7 +420,11 @@ class VaultIndexer:
             order = ["safe", "local-only", "private", "blocked"]
             privacy = max(recognized, key=order.index)
 
+        from minni.config import normalize_workspace_scope
+
         layer = VaultIndexer._infer_layer(agent=agent, page_type=page_type)
+        raw_ws = _str(data.get("workspace_id") or data.get("workspace"), "")
+        workspace_id = normalize_workspace_scope(raw_ws, default="") if raw_ws else ""
 
         return {
             "agent": agent,
@@ -341,7 +433,87 @@ class VaultIndexer:
             "privacy_level": privacy,
             "page_type": page_type,
             "layer": layer,
+            "workspace_id": workspace_id,
         }
+
+    @staticmethod
+    def _upsert_repo_map_card_from_frontmatter(
+        c,
+        doc_id: int,
+        path: str,
+        content: str,
+        meta: Dict[str, str],
+        now: float,
+        *,
+        candidate_homes: Optional[List[Path]] = None,
+    ) -> None:
+        """Upsert ``repo_map_cards`` metadata when indexing a trusted ``page_type == 'repo_map'`` card."""
+        if (meta.get("page_type") or "").lower() != "repo_map":
+            return
+        if meta.get("agent") != "repo-map":
+            return
+        from minni.principal import is_trusted_repo_map_card_path
+
+        homes = (
+            candidate_homes
+            if candidate_homes is not None
+            else VaultIndexer._candidate_minni_homes_for_config(None)
+        )
+        if not is_trusted_repo_map_card_path(path, homes):
+            return
+        row = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='repo_map_cards'"
+        ).fetchone()
+        if row is None:
+            return
+        match = VaultIndexer.FRONTMATTER_BLOCK_RE.match(content or "")
+        if not match:
+            return
+        try:
+            data = yaml.safe_load(match.group(1)) or {}
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        ws_id = str(meta.get("workspace_id") or "").strip()
+        slug = str(data.get("subsystem_slug") or Path(path).stem).strip()
+        if not ws_id or not slug:
+            return
+        repo_root = str(data.get("repo_root") or "").strip()
+        if not repo_root or repo_root.startswith("-") or not os.path.isabs(repo_root):
+            return
+        title = str(data.get("title") or slug).strip()
+        summary_line = str(data.get("summary_line") or "").strip()
+        git_sha = str(data.get("git_sha") or "").strip()
+        if git_sha and not VaultIndexer._REPO_MAP_GIT_SHA_RE.fullmatch(git_sha):
+            return
+        raw_owned = data.get("owned_files")
+        if isinstance(raw_owned, list):
+            owned_files = [str(item) for item in raw_owned if item is not None]
+        else:
+            owned_files = []
+        owned_json = json.dumps(owned_files, separators=(",", ":"))
+        c.execute(
+            """DELETE FROM repo_map_cards
+               WHERE workspace_id = ? AND subsystem_slug = ? AND doc_id != ?""",
+            (ws_id, slug, doc_id),
+        )
+        c.execute(
+            """INSERT INTO repo_map_cards
+               (doc_id, workspace_id, repo_root, subsystem_slug, title,
+                summary_line, owned_files_json, git_sha, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(doc_id) DO UPDATE SET
+                   workspace_id = excluded.workspace_id,
+                   repo_root = CASE WHEN excluded.repo_root != '' THEN excluded.repo_root ELSE repo_map_cards.repo_root END,
+                   subsystem_slug = excluded.subsystem_slug,
+                   title = excluded.title,
+                   summary_line = CASE WHEN excluded.summary_line != '' THEN excluded.summary_line ELSE repo_map_cards.summary_line END,
+                   owned_files_json = CASE WHEN excluded.owned_files_json != '[]' THEN excluded.owned_files_json ELSE repo_map_cards.owned_files_json END,
+                   git_sha = CASE WHEN excluded.git_sha != '' THEN excluded.git_sha ELSE repo_map_cards.git_sha END,
+                   updated_at = excluded.updated_at""",
+            (doc_id, ws_id, repo_root, slug, title, summary_line, owned_json, git_sha, now),
+        )
 
     @staticmethod
     def _infer_layer(agent: str, page_type: Optional[str], whole_document: int = 1) -> str:
@@ -591,7 +763,12 @@ class VaultIndexer:
                         stats["skipped"] += 1
                     continue
 
-                meta = self._extract_frontmatter(content)
+                candidate_homes = self._candidate_minni_homes_for_config(self.config)
+                meta = self._extract_frontmatter(
+                    content,
+                    path=path,
+                    candidate_homes=candidate_homes,
+                )
                 now = time.time()
 
                 # PR-2: Skip pages with privacy: blocked — purge any stale index rows
@@ -642,30 +819,53 @@ class VaultIndexer:
                 if self.embed and self.model and not unendorsed:
                     from minni.models import get_embedder_lock
 
-                    for chunk in self.chunker.chunk_document(content):
+                    doc_chunks = self._chunks_for_indexing(content, meta)
+                    for chunk in doc_chunks:
                         with get_embedder_lock():
                             emb = self.model.encode(chunk.text, show_progress_bar=False)
                         prepared.append((chunk, emb.astype(np.float32).tobytes()))
 
                 layer = meta.get("layer", "knowledge")
+                doc_ws = meta.get("workspace_id", "")
                 stale_chunk_ids: List[int] = []
                 with self.db.transaction() as c:
+                    doc_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in c.execute("PRAGMA table_info(documents)").fetchall()
+                    }
+                    has_doc_ws = "workspace_id" in doc_cols
                     if row:
                         doc_id = row["doc_id"]
                         # path=? normalizes a row adopted under a non-canonical
                         # spelling, so the next pass matches it exactly.
-                        c.execute(
-                            """UPDATE documents
-                               SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
-                                   page_status=?, privacy_level=?, page_type=?, layer=?
-                               WHERE doc_id=?""",
-                            (path, meta["agent"], meta["sigil"], mtime, now,
-                             meta.get("page_status", "candidate"),
-                             meta.get("privacy_level", "safe"),
-                             meta.get("page_type"),
-                             layer,
-                             doc_id),
-                        )
+                        if has_doc_ws:
+                            c.execute(
+                                """UPDATE documents
+                                   SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                       page_status=?, privacy_level=?, page_type=?, layer=?,
+                                       workspace_id=?
+                                   WHERE doc_id=?""",
+                                (path, meta["agent"], meta["sigil"], mtime, now,
+                                 meta.get("page_status", "candidate"),
+                                 meta.get("privacy_level", "safe"),
+                                 meta.get("page_type"),
+                                 layer,
+                                 doc_ws,
+                                 doc_id),
+                            )
+                        else:
+                            c.execute(
+                                """UPDATE documents
+                                   SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                       page_status=?, privacy_level=?, page_type=?, layer=?
+                                   WHERE doc_id=?""",
+                                (path, meta["agent"], meta["sigil"], mtime, now,
+                                 meta.get("page_status", "candidate"),
+                                 meta.get("privacy_level", "safe"),
+                                 meta.get("page_type"),
+                                 layer,
+                                 doc_id),
+                            )
                         c.execute(
                             "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
                             (doc_id,),
@@ -674,16 +874,29 @@ class VaultIndexer:
                         c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                         c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
                     else:
-                        c.execute(
-                            """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
-                                   page_status, privacy_level, page_type, layer)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (path, meta["agent"], meta["sigil"], mtime, now,
-                             meta.get("page_status", "candidate"),
-                             meta.get("privacy_level", "safe"),
-                             meta.get("page_type"),
-                             layer),
-                        )
+                        if has_doc_ws:
+                            c.execute(
+                                """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
+                                       page_status, privacy_level, page_type, layer, workspace_id)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (path, meta["agent"], meta["sigil"], mtime, now,
+                                 meta.get("page_status", "candidate"),
+                                 meta.get("privacy_level", "safe"),
+                                 meta.get("page_type"),
+                                 layer,
+                                 doc_ws),
+                            )
+                        else:
+                            c.execute(
+                                """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
+                                       page_status, privacy_level, page_type, layer)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (path, meta["agent"], meta["sigil"], mtime, now,
+                                 meta.get("page_status", "candidate"),
+                                 meta.get("privacy_level", "safe"),
+                                 meta.get("page_type"),
+                                 layer),
+                            )
                         doc_id = c.lastrowid
 
                     # FTS5 insert (full content for keyword search)
@@ -692,6 +905,16 @@ class VaultIndexer:
                            VALUES (?, ?, ?, ?, ?)""",
                         (doc_id, path, content, meta["agent"], meta["sigil"]),
                     )
+                    if (meta.get("page_type") or "").lower() == "repo_map":
+                        self._upsert_repo_map_card_from_frontmatter(
+                            c,
+                            doc_id,
+                            path,
+                            content,
+                            meta,
+                            now,
+                            candidate_homes=candidate_homes,
+                        )
 
                     for chunk, emb_bytes in prepared:
                         c.execute(
@@ -799,6 +1022,186 @@ class VaultIndexer:
             self._sync_vector_backends()
 
         return {"status": "success", **stats}
+
+    def index_file(self, file_path: str, force: bool = True) -> Dict:
+        """Index a single markdown file into ``documents``, ``vault_fts``, ``chunk_embeddings``,
+        and (for ``page_type == 'repo_map'``) ``repo_map_cards``."""
+        raw_input_path = Path(file_path).expanduser()
+        raw_abs_str = (
+            str(raw_input_path)
+            if raw_input_path.is_absolute()
+            else str(Path.cwd() / raw_input_path)
+        )
+        p = raw_input_path.resolve()
+        if not p.is_file():
+            return {"status": "error", "reason": "not_found", "path": str(p)}
+        content = p.read_text(encoding="utf-8", errors="ignore")
+        if not content.strip():
+            return {"status": "skipped", "reason": "empty", "path": str(p)}
+        candidate_homes = self._candidate_minni_homes_for_config(self.config)
+        from minni.principal import is_trusted_repo_map_card_path
+
+        check_path = (
+            str(p)
+            if is_trusted_repo_map_card_path(raw_abs_str, candidate_homes)
+            and is_trusted_repo_map_card_path(str(p), candidate_homes)
+            else None
+        )
+        meta = self._extract_frontmatter(
+            content,
+            path=check_path,
+            candidate_homes=candidate_homes,
+        )
+        if meta.get("privacy_level") == "blocked":
+            return {"status": "skipped", "reason": "blocked", "path": str(p)}
+        mtime = p.stat().st_mtime
+        now = time.time()
+        page_status = meta.get("page_status", "candidate")
+        unendorsed = page_status in UNEMBEDDED_STATUSES
+        prepared = []
+        if self.embed and self.model and not unendorsed:
+            from minni.models import get_embedder_lock
+
+            for chunk in self._chunks_for_indexing(content, meta):
+                with get_embedder_lock():
+                    emb = self.model.encode(chunk.text, show_progress_bar=False)
+                prepared.append((chunk, emb.astype(np.float32).tobytes()))
+
+        layer = meta.get("layer", "knowledge")
+        doc_ws = meta.get("workspace_id", "")
+        path_str = str(p)
+        stale_chunk_ids: List[int] = []
+        with self.db.transaction() as c:
+            doc_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            has_doc_ws = "workspace_id" in doc_cols
+            row = c.execute(
+                "SELECT doc_id, last_modified FROM documents WHERE path = ?",
+                (path_str,),
+            ).fetchone()
+            if row and not force and row["last_modified"] and mtime <= row["last_modified"]:
+                return {"status": "unchanged", "doc_id": row["doc_id"], "path": path_str}
+            if row:
+                doc_id = row["doc_id"]
+                if has_doc_ws:
+                    c.execute(
+                        """UPDATE documents
+                           SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
+                               page_status=?, privacy_level=?, page_type=?, layer=?, workspace_id=?
+                           WHERE doc_id=?""",
+                        (
+                            path_str,
+                            meta["agent"],
+                            meta["sigil"],
+                            mtime,
+                            now,
+                            page_status,
+                            meta.get("privacy_level", "safe"),
+                            meta.get("page_type"),
+                            layer,
+                            doc_ws,
+                            doc_id,
+                        ),
+                    )
+                else:
+                    c.execute(
+                        """UPDATE documents
+                           SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
+                               page_status=?, privacy_level=?, page_type=?, layer=?
+                           WHERE doc_id=?""",
+                        (
+                            path_str,
+                            meta["agent"],
+                            meta["sigil"],
+                            mtime,
+                            now,
+                            page_status,
+                            meta.get("privacy_level", "safe"),
+                            meta.get("page_type"),
+                            layer,
+                            doc_id,
+                        ),
+                    )
+                c.execute("SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                stale_chunk_ids = [r["chunk_id"] for r in c.fetchall()]
+                c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+            else:
+                if has_doc_ws:
+                    c.execute(
+                        """INSERT INTO documents
+                           (path, agent, sigil, last_modified, indexed_at,
+                            page_status, privacy_level, page_type, layer, workspace_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            path_str,
+                            meta["agent"],
+                            meta["sigil"],
+                            mtime,
+                            now,
+                            page_status,
+                            meta.get("privacy_level", "safe"),
+                            meta.get("page_type"),
+                            layer,
+                            doc_ws,
+                        ),
+                    )
+                else:
+                    c.execute(
+                        """INSERT INTO documents
+                           (path, agent, sigil, last_modified, indexed_at,
+                            page_status, privacy_level, page_type, layer)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            path_str,
+                            meta["agent"],
+                            meta["sigil"],
+                            mtime,
+                            now,
+                            page_status,
+                            meta.get("privacy_level", "safe"),
+                            meta.get("page_type"),
+                            layer,
+                        ),
+                    )
+                doc_id = c.lastrowid
+
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) VALUES (?, ?, ?, ?, ?)",
+                (doc_id, path_str, content, meta["agent"], meta["sigil"]),
+            )
+            if (meta.get("page_type") or "").lower() == "repo_map" and check_path is not None:
+                self._upsert_repo_map_card_from_frontmatter(
+                    c,
+                    doc_id,
+                    path_str,
+                    content,
+                    meta,
+                    now,
+                    candidate_homes=candidate_homes,
+                )
+            for chunk, emb_bytes in prepared:
+                c.execute(
+                    """INSERT INTO chunk_embeddings
+                       (doc_id, chunk_index, chunk_text, embedding,
+                        heading_context, model_name, computed_at, layer)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        doc_id,
+                        chunk.chunk_index,
+                        chunk.text,
+                        emb_bytes,
+                        chunk.heading_path,
+                        self.config.embedding_model,
+                        now,
+                        layer,
+                    ),
+                )
+        if stale_chunk_ids:
+            self._invalidate_rerank_chunks(stale_chunk_ids)
+        return {"status": "indexed", "doc_id": doc_id, "chunks": len(prepared), "path": path_str}
 
     def _rebuild_faiss_index(self) -> None:
         """Rebuild the FAISS index from all chunk embeddings in the DB."""

@@ -129,3 +129,110 @@ def test_endorse_handler_denies_bad_vault(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert "error" in resp
     # Guard runs before endorse_draft; for bad vault we get -32003 (the page-not-found would only happen after a passing guard)
     assert resp["error"]["code"] == -32003, "bad vault must be rejected by G12 guard with structured denial"
+
+
+def test_cross_agent_handoff_allows_canonical_recipient_and_denies_symlink_escape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import minni.minnid as minnid_mod
+    import minni.principal as principal_mod
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
+    from minni.tools.author_principals import author_principals
+    from minni.writeback import WriteBackMemory
+
+    minni_home = tmp_path / "minni-home"
+    minni_home.mkdir()
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+    principals_dir = minni_home / "principals"
+    author_principals(minni_home=minni_home, apply=True)
+    monkeypatch.setattr(principal_mod, "PRINCIPALS_DIR", principals_dir)
+
+    cfg = MinniConfig(
+        db_path=minni_home / "minni.db",
+        vault_path=minni_home / "vault",
+    )
+    test_db = MinniDB(cfg)
+    monkeypatch.setattr(minnid_mod, "_writeback", WriteBackMemory(test_db, cfg))
+    try:
+        # 1. Cross-agent handoff claude-code -> codex succeeds under canonical principals
+        packet = {
+            "kind": "handoff",
+            "from_agent": "claude-code",
+            "to_agent": "codex",
+            "task": "Verify cross-agent handoff delivery",
+            "envelope": '<MINNI_ENVELOPE event="Handoff">Canonical cross-agent check</MINNI_ENVELOPE>',
+            "wikilink_refs": [],
+            "summary": "Canonical principal_templates cross-agent delivery check",
+            "next_steps": ["Read inbox"],
+        }
+        send_obj = minnid_mod._dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "daemon.handoff",
+                "params": {
+                    "from_agent": "claude-code",
+                    "to_agent": "codex",
+                    "packet": packet,
+                },
+            }
+        )
+        assert "result" in send_obj, f"expected success, got {send_obj}"
+        assert send_obj["result"]["status"] == "ok"
+        assert send_obj["result"]["delivered"] is True
+        lease_id = send_obj["result"]["lease_id"]
+
+        # 2. Recipient codex lists and acknowledges the handoff
+        list_resp = minnid_mod._dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "minni_list_pending_handoffs",
+                "params": {"agent_id": "codex"},
+            }
+        )
+        assert len(list_resp["result"]["handoffs"]) == 1
+        assert list_resp["result"]["handoffs"][0]["lease_id"] == lease_id
+
+        ack_resp = minnid_mod._dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "minni_ack_handoff",
+                "params": {
+                    "agent_id": "codex",
+                    "lease_id": lease_id,
+                    "status": "accepted",
+                },
+            }
+        )
+        assert ack_resp["result"]["status"] == "accepted"
+
+        # 3. Symlink escape on recipient vault is still rejected with -32003
+        outside = tmp_path / "outside-evil"
+        outside.mkdir()
+        gemini_vault = minni_home / "gemini-vault"
+        if gemini_vault.exists():
+            gemini_vault.rmdir()
+        gemini_vault.symlink_to(outside, target_is_directory=True)
+        escape_resp = minnid_mod._dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "daemon.handoff",
+                "params": {
+                    "from_agent": "claude-code",
+                    "to_agent": "gemini",
+                    "packet": {
+                        **packet,
+                        "to_agent": "gemini",
+                    },
+                },
+            }
+        )
+        assert "error" in escape_resp
+        assert escape_resp["error"]["code"] == -32003
+        assert "vault_root_denied" in escape_resp["error"]["message"]
+    finally:
+        test_db.close()

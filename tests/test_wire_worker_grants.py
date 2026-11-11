@@ -1,68 +1,85 @@
-"""Wave 5: agy worker allowlist is a separate grant path, not the default nine.
+"""Wave 1: agy default readonly and worker allowlists use ONLY the 12-tool v1 surface.
 
-Default readonly grants stay CANNOT. Worker grants are exactly
-mcp(minni/minni_thread_worker_update). The global mcp(minni/*) strip stays.
-The named worker grant survives that strip on the worker path.
+Default readonly grants are the 6 read-only v1 MCP tools. Worker grants are the
+3 bounded worker write tools (`minni_thread_update`, `minni_thread_scar`, `minni_learn`).
+The global `mcp(minni/*)` strip stays, and named worker grants survive that strip.
 """
 
 from __future__ import annotations
 
 import inspect
 import json
-from pathlib import Path
 
 from minni.wire import writers
 
 
-READONLY_NINE = (
+V1_TWELVE_TOOLS = {
+    "minni_recall",
+    "minni_drill",
+    "minni_learn",
+    "minni_list_candidates",
+    "minni_resolve_candidate",
+    "minni_status",
+    "minni_handoff_send",
+    "minni_handoff_inbox",
+    "minni_thread_create",
+    "minni_thread_status",
+    "minni_thread_update",
+    "minni_thread_scar",
+}
+READONLY_SIX = (
     "minni_recall",
     "minni_drill",
     "minni_status",
-    "minni_audit_tail",
-    "minni_audit_report",
-    "minni_route",
-    "minni_list_pending_handoffs",
-    "minni_ping_agent_inbox",
-    "minni_ping_agent_status",
-)
-WORKER_TOOL = "minni_thread_worker_update"
-WORKER_GRANT = f"mcp(minni/{WORKER_TOOL})"
-FORBIDDEN_THREAD_TOOLS = (
-    "minni_thread_claim",
-    "minni_thread_update",
+    "minni_list_candidates",
+    "minni_handoff_inbox",
     "minni_thread_status",
+)
+WORKER_TOOLS = (
+    "minni_thread_update",
+    "minni_thread_scar",
+    "minni_learn",
+)
+WORKER_GRANTS = tuple(f"mcp(minni/{tool})" for tool in WORKER_TOOLS)
+FORBIDDEN_COORDINATOR_OR_RETIRED_TOOLS = (
+    "minni_thread_create",
+    "minni_resolve_candidate",
+    "minni_handoff_send",
+    "minni_thread_worker_update",
+    "minni_thread_claim",
     "minni_thread_history",
     "minni_thread_diff",
     "minni_thread_revision",
-    "minni_thread_create",
     "minni_thread_replan",
     "minni_thread_assign",
     "minni_thread_activate",
     "minni_thread_deactivate",
     "minni_thread_restore",
-    "minni_thread_scar",
     "minni_thread_ready",
     "minni_thread_events",
 )
 
 
-def test_default_readonly_list_is_still_the_nine():
-    assert writers.MINNI_READONLY_TOOLS == READONLY_NINE
+def test_default_readonly_list_uses_only_v1_readonly_tools():
+    assert writers.MINNI_READONLY_TOOLS == READONLY_SIX
+    assert set(writers.MINNI_READONLY_TOOLS) <= V1_TWELVE_TOOLS
     assert writers.MINNI_READONLY_GRANTS == tuple(
-        f"mcp(minni/{tool})" for tool in READONLY_NINE
+        f"mcp(minni/{tool})" for tool in READONLY_SIX
     )
-    assert WORKER_TOOL not in writers.MINNI_READONLY_TOOLS
-    assert WORKER_GRANT not in writers.MINNI_READONLY_GRANTS
+    for tool in WORKER_TOOLS:
+        assert tool not in writers.MINNI_READONLY_TOOLS
+        assert f"mcp(minni/{tool})" not in writers.MINNI_READONLY_GRANTS
     assert writers.MINNI_WILDCARD_GRANT not in writers.MINNI_READONLY_GRANTS
     assert writers.MINNI_WILDCARD_GRANT == "mcp(minni/*)"
 
 
-def test_worker_grants_are_exactly_worker_update():
-    assert writers.MINNI_WORKER_TOOLS == (WORKER_TOOL,)
-    assert writers.MINNI_WORKER_GRANTS == (WORKER_GRANT,)
+def test_worker_grants_use_only_v1_worker_tools():
+    assert writers.MINNI_WORKER_TOOLS == WORKER_TOOLS
+    assert set(writers.MINNI_WORKER_TOOLS) <= V1_TWELVE_TOOLS
+    assert writers.MINNI_WORKER_GRANTS == WORKER_GRANTS
     assert writers.MINNI_WORKER_GRANTS != writers.MINNI_READONLY_GRANTS
     assert not (set(writers.MINNI_WORKER_TOOLS) & set(writers.MINNI_READONLY_TOOLS))
-    for name in FORBIDDEN_THREAD_TOOLS:
+    for name in FORBIDDEN_COORDINATOR_OR_RETIRED_TOOLS:
         assert name not in writers.MINNI_WORKER_TOOLS
         assert f"mcp(minni/{name})" not in writers.MINNI_WORKER_GRANTS
 
@@ -79,8 +96,9 @@ def test_default_grant_path_still_strips_wildcard_and_never_writes_worker(tmp_pa
     assert "command(ls)" in allow
     for grant in writers.MINNI_READONLY_GRANTS:
         assert grant in allow
-    assert WORKER_GRANT not in allow
-    assert not any(str(g).startswith("mcp(minni/minni_thread_") for g in allow)
+    for grant in WORKER_GRANTS:
+        assert grant not in allow
+    assert "mcp(minni/minni_thread_create)" not in allow
 
 
 def test_worker_path_writes_only_worker_grant_and_keeps_wildcard_strip(tmp_path):
@@ -91,7 +109,7 @@ def test_worker_path_writes_only_worker_grant_and_keeps_wildcard_strip(tmp_path)
     )
     assert writers.ensure_worker_permission_grant(path, ["permissions", "allow"]) is True
     allow = json.loads(path.read_text(encoding="utf-8"))["permissions"]["allow"]
-    assert allow == ["command(ls)", WORKER_GRANT]
+    assert allow == ["command(ls)", *WORKER_GRANTS]
     assert "mcp(minni/*)" not in allow
     for grant in writers.MINNI_READONLY_GRANTS:
         assert grant not in allow
@@ -100,12 +118,13 @@ def test_worker_path_writes_only_worker_grant_and_keeps_wildcard_strip(tmp_path)
 def test_worker_strip_does_not_wipe_named_worker_grant(tmp_path):
     path = tmp_path / "keep-worker.json"
     path.write_text(
-        json.dumps({"permissions": {"allow": [WORKER_GRANT, "mcp(minni/*)"]}}),
+        json.dumps({"permissions": {"allow": [WORKER_GRANTS[0], "mcp(minni/*)"]}}),
         encoding="utf-8",
     )
     assert writers.ensure_worker_permission_grant(path, ["permissions", "allow"]) is True
     allow = json.loads(path.read_text(encoding="utf-8"))["permissions"]["allow"]
-    assert allow.count(WORKER_GRANT) == 1
+    for grant in WORKER_GRANTS:
+        assert allow.count(grant) == 1
     assert "mcp(minni/*)" not in allow
     before = path.read_text(encoding="utf-8")
     assert writers.ensure_worker_permission_grant(path, ["permissions", "allow"]) is True

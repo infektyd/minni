@@ -21,38 +21,61 @@ import propagate  # noqa: E402
 # --- version resolution -----------------------------------------------------
 
 
-def test_max_present_version_compares_numerically_not_lexically(tmp_path):
-    """A two-digit minor outranks a one-digit one; lexical sorting gets this wrong."""
-    for name in ("0.2.0", "0.10.0", "0.9.0"):
-        (tmp_path / name).mkdir()
+def test_newest_built_version_dir_uses_manifest_built_at_not_hex_sha(tmp_path):
+    """D3 (§4.1 #6): never sort +git.<sha> lexicographically; prefer payload-manifest built_at."""
+    import json
 
-    assert propagate.max_present_version(tmp_path) == "0.10.0"
+    older = tmp_path / "0.6.0+git.ffff999"
+    newer = tmp_path / "0.6.0+git.1111000"
+    older.mkdir()
+    newer.mkdir()
+    (older / "payload-manifest.json").write_text(
+        json.dumps({"built_at": "2026-11-10T01:00:00Z"}), encoding="utf-8"
+    )
+    (newer / "payload-manifest.json").write_text(
+        json.dumps({"built_at": "2026-11-11T02:00:00Z"}), encoding="utf-8"
+    )
 
-
-def test_max_present_version_takes_the_newest_not_the_oldest(tmp_path):
-    for name in ("0.3.0", "0.4.0"):
-        (tmp_path / name).mkdir()
-
-    assert propagate.max_present_version(tmp_path) == "0.4.0"
-
-
-def test_max_present_version_sorts_local_segments_after_the_release(tmp_path):
-    (tmp_path / "0.4.0").mkdir()
-    (tmp_path / "0.4.0+git.abc1234").mkdir()
-
-    assert propagate.max_present_version(tmp_path) == "0.4.0+git.abc1234"
+    assert propagate._newest_built_version_dir(tmp_path) == "0.6.0+git.1111000"
 
 
-def test_max_present_version_ignores_non_version_dirs(tmp_path):
+def test_newest_built_version_dir_falls_back_to_mtime_when_manifest_absent(tmp_path):
+    import os
+
+    older = tmp_path / "0.3.0"
+    newer = tmp_path / "0.4.0"
+    older.mkdir()
+    newer.mkdir()
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    os.utime(newer, (1_700_000_100, 1_700_000_100))
+
+    assert propagate._newest_built_version_dir(tmp_path) == "0.4.0"
+
+
+def test_newest_built_version_dir_prefers_manifest_built_at_over_release_without_manifest(tmp_path):
+    import json
+
+    plain = tmp_path / "0.4.0"
+    built = tmp_path / "0.4.0+git.abc1234"
+    plain.mkdir()
+    built.mkdir()
+    (built / "payload-manifest.json").write_text(
+        json.dumps({"built_at": "2026-11-11T00:00:00Z"}), encoding="utf-8"
+    )
+
+    assert propagate._newest_built_version_dir(tmp_path) == "0.4.0+git.abc1234"
+
+
+def test_newest_built_version_dir_ignores_non_version_dirs(tmp_path):
     (tmp_path / "0.4.0").mkdir()
     (tmp_path / "current").mkdir()
     (tmp_path / ".staging-x").mkdir()
 
-    assert propagate.max_present_version(tmp_path) == "0.4.0"
+    assert propagate._newest_built_version_dir(tmp_path) == "0.4.0"
 
 
-def test_max_present_version_is_none_for_a_missing_base(tmp_path):
-    assert propagate.max_present_version(tmp_path / "nope") is None
+def test_newest_built_version_dir_is_none_for_a_missing_base(tmp_path):
+    assert propagate._newest_built_version_dir(tmp_path / "nope") is None
 
 
 def test_plugin_version_segment_prefers_on_disk_over_pip_metadata(tmp_path, monkeypatch):

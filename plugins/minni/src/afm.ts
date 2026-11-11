@@ -32,12 +32,15 @@ const VALID_AFM_MODES = new Set<AfmProviderMode>(["auto", "bridge", "native", "o
  * an explicit value wins, otherwise MINNI_AFM_PROVIDER_MODE then MINNI_AFM_MODE,
  * defaulting to "bridge". Unknown values fall back to "bridge".
  */
+const OFF_MODE_ALIASES = new Set(["off", "disabled", "none", "false", "0"]);
+
 export function resolveAfmMode(value?: string | null): AfmProviderMode {
   const raw = (
     value ?? process.env.MINNI_AFM_PROVIDER_MODE ?? process.env.MINNI_AFM_MODE ?? "bridge"
   )
     .trim()
     .toLowerCase();
+  if (OFF_MODE_ALIASES.has(raw)) return "off";
   return VALID_AFM_MODES.has(raw as AfmProviderMode) ? (raw as AfmProviderMode) : "bridge";
 }
 

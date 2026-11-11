@@ -49,7 +49,7 @@ def _seed_full_9_host_fleet(home: Path) -> tuple[str, str, str]:
     v2 = "0.6.0+git.22222222"
     v2_sha = "2" * 40
 
-    tools_json = json.dumps([{"name": f"minni_tool_{i}"} for i in range(44)])
+    tools_json = json.dumps([{"name": f"minni_tool_{i}"} for i in range(12)])
     server_code = (
         "import readline from 'node:readline';\n"
         f"const TOOLS = {tools_json};\n"

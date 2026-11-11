@@ -238,7 +238,7 @@ test("Slice S2 (H4, Q1 = Option A): concurrent MCP sessions maintain independent
     slice_id: "s1",
     status: "in_progress",
   });
-  assert.equal(updatedA.plan?.plan_id, planA);
+  assert.equal(updatedA.plan_id, planA);
 
   // Assert 2: serverB id-less minni_thread_status resolves to planB
   const statusB = await serverB.callToolJson("minni_thread_status", {});
@@ -260,9 +260,9 @@ test("Slice S2 (H4, Q1 = Option A): concurrent MCP sessions maintain independent
   const upsBBody = extractEnvelopeBody(upsB);
   assert.equal(upsBBody.active_thread_ref?.plan_id, planB);
 
-  // Assert 4: serverB calling minni_thread_deactivate deactivates planB for sessionB while planA stays active for sessionA
-  const deactB = await serverB.callToolJson("minni_thread_deactivate", {});
-  assert.equal(deactB.active, null);
+  // Assert 4: serverB calling minni_thread_update({ activate: false }) deactivates planB for sessionB while planA stays active for sessionA
+  const deactB = await serverB.callToolJson("minni_thread_update", { activate: false });
+  assert.equal(deactB.active, false);
 
   const statusBAfterDeact = await serverB.callToolJson("minni_thread_status", {});
   assert.ok(statusBAfterDeact.error, "serverB id-less status after deactivate must fail closed");
@@ -415,7 +415,7 @@ test("Sibling terminal minni_thread_update preserves sibling _active_plan.json w
     status: "done",
     evidence: "Slice B1 completed",
   });
-  assert.equal(updatedB.plan?.status, "complete");
+  assert.match(updatedB.headline, /PLAN COMPLETE/);
 
   // Assert Bug A fixes:
   // - <sessionB>.json is removed

@@ -12,7 +12,34 @@ import minni.obs as obs
 from minni.afm_review_markers import supersede_afm_review
 from minni.config import DEFAULT_CONFIG
 from minni.db import MinniDB
+from minni.durable_projection import projection_row_closed
+from minni.today_digest import refresh_today_digest_safe
 from minni.graph_commit import ensure_canonical_learning_node
+from minni.graph_coordinator import (
+    GraphCommitAborted,
+    LearningFields,
+    commit_prepared_learning,
+)
+from minni.minnid_runtime.graph_adapters import (
+    apply_fallback_graph_edges,
+    collect_superseded_purge_targets,
+    finalize_governed_promotion,
+    prepare_governed_promotion,
+)
+
+_ORIG_ENSURE_CANONICAL_LEARNING_NODE = ensure_canonical_learning_node
+_HARD_AFM_GRAPH_ABORT_CODES = frozenset(
+    {
+        "principal_mismatch",
+        "store_binding_mismatch",
+        "store_binding_invalid",
+        "payload_tampered",
+        "bad_payload",
+        "bad_principal",
+        "learning_field_invalid",
+        "learning_field_unavailable",
+    }
+)
 from minni.principal import (
     OPERATOR_RESERVED_AGENT_IDS,
     EffectivePrincipal,
@@ -40,6 +67,9 @@ class AFMContext:
     # promotion: already-committed memory is never reported failed for an
     # index hiccup.
     index_durable_learning: Callable[..., bool | None] | None = None
+    purge_durable_learning: Callable[..., None] = lambda *a, **k: None
+    resolve_retrieval_engine: Optional[Callable[[Any], Any]] = None
+    on_refresh_retry: Optional[Callable[[Any], None]] = None
     increment_request_count: Callable[[], None] | None = None
     writeback_ref: Callable[[], Any] = lambda: None
     sovereign_db: Callable[..., Any] = MinniDB
@@ -362,8 +392,15 @@ def promote_candidate_durable(
         return None
 
     from minni.afm_passes.consolidation import _ensure_dedup_index
+    from minni.writeback import CATEGORIES
+
     _ensure_dedup_index(wb.db)
     chash = _content_hash(content)
+    raw_cat = str(cand.get("category") or "general").strip().lower()
+    cand_category = raw_cat if raw_cat in CATEGORIES else "general"
+    cand_ws = str(cand.get("workspace_id") or "default").strip() or "default"
+    wb_config = getattr(wb, "config", None) or getattr(wb.db, "config", None)
+    vault_path = getattr(wb_config, "vault_path", None)
 
     emb_bytes = None
     if getattr(wb, "model", None):
@@ -376,7 +413,50 @@ def promote_candidate_durable(
         except Exception as exc:
             context.logger.warning("consolidation: embedding failed (%s) - storing without", exc)
 
+    has_ws_col = False
+    try:
+        with wb.db.cursor() as c_pre:
+            pre_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c_pre.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            has_ws_col = "workspace_id" in pre_cols
+    except Exception:
+        has_ws_col = False
+
+    plan = None
+    if vault_path is not None:
+        plan = prepare_governed_promotion(
+            wb.db,
+            author_agent=agent_id,
+            workspace_id=cand_ws,
+            caller_principal=loop_principal(),
+            content=content,
+            category=cand_category,
+            learning_fields=LearningFields(
+                source_query="afm-consolidation",
+                evidence_doc_ids=cand.get("evidence_refs"),
+                confidence=0.9,
+                content_hash=chash,
+                status="active",
+                workspace_id=cand_ws if has_ws_col else None,
+            ),
+            vault_path=vault_path,
+            resolve_retrieval_engine=getattr(context, "resolve_retrieval_engine", None),
+            on_refresh_retry=getattr(context, "on_refresh_retry", None),
+            allow_adapter=(
+                ensure_canonical_learning_node is _ORIG_ENSURE_CANONICAL_LEARNING_NODE
+            ),
+        )
+        if emb_bytes is None and plan.prepared is not None and plan.prepared.learning_vector is not None:
+            emb_bytes = plan.prepared.learning_vector
+
     now = time.time()
+    commit_res = None
+    lid: Optional[int] = None
+    canonical_doc_id: Optional[int] = None
+    restricted_reason: Optional[str] = None
+    superseded_docs: list[tuple[str, str]] = []
     try:
         with wb.db.transaction() as c:
             # Re-match the full prepared snapshot inside the txn — status
@@ -386,72 +466,199 @@ def promote_candidate_durable(
             # effects, and the review fence stays pending.
             if not _row_matches_snapshot(c, candidate_id, prepared):
                 return None
-            from minni.writeback import CATEGORIES
+            l_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            graph_superseded_lids: list[int] = []
+            if (
+                plan is not None
+                and plan.prepared is not None
+                and vault_path is not None
+                and ensure_canonical_learning_node is _ORIG_ENSURE_CANONICAL_LEARNING_NODE
+            ):
+                c.execute("SAVEPOINT minni_graph_commit")
+                try:
+                    commit_res = commit_prepared_learning(
+                        c, plan.prepared, db=wb.db, principal=plan.graph_principal
+                    )
+                    c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                except GraphCommitAborted as abort:
+                    c.execute("ROLLBACK TO SAVEPOINT minni_graph_commit")
+                    c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                    if abort.code == "canonical_restricted":
+                        restricted_reason = f"{abort.code}: {abort}"
+                        commit_res = None
+                    elif abort.code in _HARD_AFM_GRAPH_ABORT_CODES:
+                        raise
+                    else:
+                        context.logger.warning(
+                            "AFM consolidation: graph commit aborted for candidate #%d (%s: %s); "
+                            "falling back to direct canonical commit",
+                            candidate_id,
+                            abort.code,
+                            abort,
+                        )
+                        commit_res = None
 
-            raw_cat = str(cand.get("category") or "general").strip().lower()
-            cand_category = raw_cat if raw_cat in CATEGORIES else "general"
-            c.execute(
-                """
-                INSERT INTO learnings
-                (agent_id, category, content, source_doc_ids, source_query,
-                 confidence, embedding, created_at,
-                 assertion, applies_when, evidence_doc_ids, contradicts_id, status,
-                 content_hash)
-                VALUES (?, ?, ?, NULL, 'afm-consolidation',
-                        ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
-                """,
-                (agent_id, cand_category, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
-            )
-            lid = c.lastrowid
-            # Atomic canonical identity: the node + join share this cursor.
-            # Owner is the candidate's existing owner (agent_id), matching the
-            # learning row — AFM never reassigns ownership. A None return
-            # (absent schema) tolerates the pre-graph baseline; a raise rolls
-            # back to zero partial writes and the proposal stays staged. A
-            # caller without its own config uses the committed store's config,
-            # never a separately resolved default/live store.
-            wb_config = getattr(wb, "config", None) or getattr(wb.db, "config", None)
-            vault_path = getattr(wb_config, "vault_path", None)
-            if vault_path is None:
-                context.logger.info(
-                    "AFM consolidation promote of candidate #%d proceeds "
-                    "without canonical node (no vault path configured)",
-                    candidate_id,
+            if restricted_reason is None:
+                if commit_res is not None:
+                    lid = commit_res.learning_id
+                    canonical_doc_id = commit_res.doc_id
+                    graph_superseded_lids.extend(commit_res.superseded_learning_ids)
+                    if plan is not None and plan.fallback_edges is not None and not commit_res.edges:
+                        _, fb_sup = apply_fallback_graph_edges(
+                            c,
+                            plan.fallback_edges,
+                            graph_principal=plan.graph_principal,
+                            workspace_id=cand_ws,
+                            new_learning_id=lid,
+                            new_doc_id=canonical_doc_id,
+                            now=now,
+                        )
+                        graph_superseded_lids.extend(fb_sup)
+                else:
+                    c.execute("SAVEPOINT minni_fallback_commit")
+                    if "workspace_id" in l_cols:
+                        c.execute(
+                            """
+                            INSERT INTO learnings
+                            (agent_id, category, content, source_doc_ids, source_query,
+                             confidence, embedding, created_at,
+                             assertion, applies_when, evidence_doc_ids, contradicts_id, status,
+                             content_hash, workspace_id)
+                            VALUES (?, ?, ?, NULL, 'afm-consolidation',
+                                    ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?, ?)
+                            """,
+                            (
+                                agent_id,
+                                cand_category,
+                                content,
+                                0.9,
+                                emb_bytes,
+                                now,
+                                cand.get("evidence_refs"),
+                                chash,
+                                cand_ws,
+                            ),
+                        )
+                    else:
+                        c.execute(
+                            """
+                            INSERT INTO learnings
+                            (agent_id, category, content, source_doc_ids, source_query,
+                             confidence, embedding, created_at,
+                             assertion, applies_when, evidence_doc_ids, contradicts_id, status,
+                             content_hash)
+                            VALUES (?, ?, ?, NULL, 'afm-consolidation',
+                                    ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
+                            """,
+                            (
+                                agent_id,
+                                cand_category,
+                                content,
+                                0.9,
+                                emb_bytes,
+                                now,
+                                cand.get("evidence_refs"),
+                                chash,
+                            ),
+                        )
+                    lid = c.lastrowid
+                    if vault_path is None:
+                        context.logger.info(
+                            "AFM consolidation promote of candidate #%d proceeds "
+                            "without canonical node (no vault path configured)",
+                            candidate_id,
+                        )
+                        canonical_doc_id = None
+                    else:
+                        canonical_doc_id = ensure_canonical_learning_node(
+                            c,
+                            learning_id=lid,
+                            agent_id=agent_id,
+                            content=content,
+                            vault_path=vault_path,
+                            created_at=now,
+                            workspace_id=cand_ws,
+                        )
+                        if canonical_doc_id is not None:
+                            post_doc = c.execute(
+                                "SELECT page_status, privacy_level FROM documents WHERE doc_id = ?",
+                                (canonical_doc_id,),
+                            ).fetchone()
+                            if post_doc is not None and projection_row_closed(
+                                post_doc["page_status"], post_doc["privacy_level"]
+                            ):
+                                c.execute("ROLLBACK TO SAVEPOINT minni_fallback_commit")
+                                c.execute("RELEASE SAVEPOINT minni_fallback_commit")
+                                restricted_reason = (
+                                    "canonical_restricted: canonical node is lifecycle-closed/restricted"
+                                )
+                                lid = None
+                                canonical_doc_id = None
+                    if restricted_reason is None:
+                        c.execute("RELEASE SAVEPOINT minni_fallback_commit")
+                        if plan is not None and plan.fallback_edges is not None:
+                            _, fb_sup = apply_fallback_graph_edges(
+                                c,
+                                plan.fallback_edges,
+                                graph_principal=plan.graph_principal,
+                                workspace_id=cand_ws,
+                                new_learning_id=lid,
+                                new_doc_id=canonical_doc_id,
+                                now=now,
+                            )
+                            graph_superseded_lids.extend(fb_sup)
+
+            if restricted_reason is not None:
+                c.execute(
+                    """
+                    UPDATE candidate_packets
+                    SET status='rejected', resolved_at=?, resolved_by=?,
+                        resolution_reason=?
+                    WHERE candidate_id=?
+                    """,
+                    (now, "afm-consolidation", restricted_reason[:500], candidate_id),
+                )
+                supersede_afm_review(c, candidate_id)
+                c.execute(
+                    """
+                    INSERT INTO consolidation_actions
+                    (action_type, claim, category, status, detail, created_at)
+                    VALUES ('afm_reject_restricted', ?, 'general', 'applied', ?, ?)
+                    """,
+                    (str(candidate_id), restricted_reason[:500], now),
                 )
             else:
-                ensure_canonical_learning_node(
-                    c,
-                    learning_id=lid,
-                    agent_id=agent_id,
-                    content=content,
-                    vault_path=vault_path,
-                    created_at=now,
+                superseded_docs.extend(
+                    collect_superseded_purge_targets(c, graph_superseded_lids, agent_id)
                 )
-            resolved_by = (
-                f"afm-judge({getattr(judge_verdict, 'model', 'native')})"
-                if judge_verdict is not None
-                else "afm-consolidation"
-            )
-            c.execute(
-                """
-                UPDATE candidate_packets
-                SET status='accepted', resolved_at=?, resolved_by=?,
-                    resolution_reason=?
-                WHERE candidate_id=?
-                """,
-                (now, resolved_by, reason[:500], candidate_id),
-            )
-            # M5: retire the review fence with the candidate it fenced.
-            supersede_afm_review(c, candidate_id)
-            c.execute(
-                """
-                INSERT INTO consolidation_actions
-                (action_type, target_learning_id, claim, category, confidence,
-                 status, detail, created_at)
-                VALUES ('afm_promote', ?, ?, 'general', ?, 'applied', ?, ?)
-                """,
-                (lid, content[:200], 0.9, reason[:500], now),
-            )
+                resolved_by = (
+                    f"afm-judge({getattr(judge_verdict, 'model', 'native')})"
+                    if judge_verdict is not None
+                    else "afm-consolidation"
+                )
+                c.execute(
+                    """
+                    UPDATE candidate_packets
+                    SET status='accepted', resolved_at=?, resolved_by=?,
+                        resolution_reason=?
+                    WHERE candidate_id=?
+                    """,
+                    (now, resolved_by, reason[:500], candidate_id),
+                )
+                # M5: retire the review fence with the candidate it fenced.
+                supersede_afm_review(c, candidate_id)
+                c.execute(
+                    """
+                    INSERT INTO consolidation_actions
+                    (action_type, target_learning_id, claim, category, confidence,
+                     status, detail, created_at)
+                    VALUES ('afm_promote', ?, ?, 'general', ?, 'applied', ?, ?)
+                    """,
+                    (lid, content[:200], 0.9, reason[:500], now),
+                )
     except Exception as exc:
         # The transaction rolled back: learning, accept mark, effects, and
         # canonical rows are all gone, so the candidate is still proposed for
@@ -462,12 +669,39 @@ def promote_candidate_durable(
         )
         return None
 
+    if restricted_reason is not None:
+        context.logger.warning(
+            "AFM consolidation rejected permanently restricted candidate #%d (%s)",
+            candidate_id,
+            restricted_reason,
+        )
+        context.maybe_archive_inbox_source(wb.db, candidate_id)
+        return None
+
+    purge_fn = getattr(context, "purge_durable_learning", None)
+    if callable(purge_fn):
+        for sup_agent, sup_content in superseded_docs:
+            if sup_content:
+                try:
+                    purge_fn(sup_agent, sup_content, db=wb.db)
+                except Exception:
+                    pass
+
     # Post-commit index delivery (explicit db-bound mechanism). Fail-open by
     # contract: the learning is already durable, so an index hiccup only
     # degrades recall until repair — it never fails the promotion and never
     # duplicates the write.
+    if commit_res is not None and plan is not None:
+        finalized = finalize_governed_promotion(
+            plan, commit_res, content=content, workspace_id=cand_ws
+        )
+    else:
+        finalized = False
+
     deliver = getattr(context, "index_durable_learning", None)
-    if deliver is None:
+    if finalized:
+        pass
+    elif deliver is None:
         context.logger.debug(
             "AFM consolidation promoted candidate #%d -> learning #%d "
             "without index delivery (no callback; repair covers projection)",
@@ -475,7 +709,16 @@ def promote_candidate_durable(
         )
     else:
         try:
-            indexed = deliver(agent_id, content, key=f"learning:{lid}", db=wb.db)
+            try:
+                indexed = deliver(
+                    agent_id,
+                    content,
+                    key=f"learning:{lid}",
+                    db=wb.db,
+                    workspace_id=cand_ws,
+                )
+            except TypeError:
+                indexed = deliver(agent_id, content, key=f"learning:{lid}", db=wb.db)
             if indexed is not True and indexed is not None:
                 context.logger.warning(
                     "AFM consolidation promoted candidate #%d -> learning #%d "
@@ -491,12 +734,19 @@ def promote_candidate_durable(
 
     try:
         if wb_config is not None and wb_config.writeback_enabled:
-            wb._write_to_disk(lid, agent_id, "general", content, now)
+            wb._write_to_disk(lid, agent_id, cand_category, content, now, workspace_id=cand_ws)
     except Exception as exc:
         context.logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
 
     context.logger.info("AFM consolidation promoted candidate #%d -> learning #%d", candidate_id, lid)
     context.maybe_archive_inbox_source(wb.db, candidate_id)
+    refresh_today_digest_safe(
+        daemon_running=True,
+        db_path=(
+            getattr(wb_config, "db_path", None) if wb_config is not None else None
+        )
+        or getattr(getattr(wb.db, "config", None), "db_path", None),
+    )
     return lid
 
 
@@ -707,7 +957,31 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
                                 exclude_learning_id=int(new_lid),
                                 embedding=l_row["embedding"],
                             )
+                            linked_lids: set[int] = set()
+                            try:
+                                linked_rows = c.execute(
+                                    """
+                                    SELECT jd_peer.learning_id AS peer_lid
+                                    FROM learning_documents jd_self
+                                    JOIN memory_links ml
+                                      ON ml.source_doc_id = jd_self.doc_id
+                                      OR ml.target_doc_id = jd_self.doc_id
+                                    JOIN learning_documents jd_peer
+                                      ON jd_peer.doc_id = CASE
+                                          WHEN ml.source_doc_id = jd_self.doc_id THEN ml.target_doc_id
+                                          ELSE ml.source_doc_id
+                                      END
+                                    WHERE jd_self.learning_id = ?
+                                      AND ml.relation_type IN ('updates', 'contradicts')
+                                    """,
+                                    (int(new_lid),),
+                                ).fetchall()
+                                linked_lids = {int(r["peer_lid"]) for r in linked_rows}
+                            except Exception:
+                                linked_lids = set()
                             for dup_lid in near_dups:
+                                if int(dup_lid) in linked_lids:
+                                    continue
                                 evict_learning_to_cold_archive(
                                     c,
                                     None,

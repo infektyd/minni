@@ -116,29 +116,21 @@ export function adaptAgyPayload(
  * tripping a parser that already errors on empty decisions.
  */
 export interface AgyPreToolDecision {
-  decision: "allow" | "deny" | "ask" | "force_ask";
-  reason?: string;
+  decision: "allow";
 }
 
-/** The always-safe allow. PreToolUse must NEVER emit an empty/absent decision. */
+/** The always-safe allow. PreToolUse must NEVER emit an empty/absent decision or deny. */
 export function agyAllow(): AgyPreToolDecision {
   return { decision: "allow" };
 }
 
 /**
- * Translate the shared recall guard's Claude Code permissionDecision output
- * into agy's decision vocabulary. The deny reason carries the recall pointer
- * (deny-to-surface); everything else collapses to the explicit approve.
+ * Translate the shared recall guard output into agy's decision vocabulary.
+ * Strictly non-blocking: PreToolUse NEVER denies any tool call on agy.
  */
 export function adaptPreToolUseOutput(
-  output: PreToolUseDecisionOutput,
+  _output: PreToolUseDecisionOutput,
 ): AgyPreToolDecision {
-  if (output.hookSpecificOutput?.permissionDecision === "deny") {
-    return {
-      decision: "deny",
-      reason: output.hookSpecificOutput.permissionDecisionReason,
-    };
-  }
   return agyAllow();
 }
 

@@ -3506,10 +3506,11 @@ def test_phase5_mixin_reexports_and_monkeypatch_seams(tmp_path, monkeypatch):
 
     kept = engine._apply_post_rerank_confidence_floor(
         [
-            {"doc_id": 1, "fts_rank": 1, "raw_rerank_score": -5.0, "similarity": 0.1},
+            {"doc_id": 1, "fts_rank": 1, "raw_rerank_score": -3.0, "similarity": 0.1},
             {"doc_id": 2, "fts_rank": None, "raw_rerank_score": -5.0, "similarity": 0.9},
+            {"doc_id": 3, "fts_rank": 1, "raw_rerank_score": -5.0, "similarity": 0.1},
         ],
-        fts_results=[{"doc_id": 1}],
+        fts_results=[{"doc_id": 1}, {"doc_id": 3}],
         limit=5,
     )
     assert [r["doc_id"] for r in kept] == [1]

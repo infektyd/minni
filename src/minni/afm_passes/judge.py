@@ -15,8 +15,16 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
+from minni.afm_chunking import (
+    DEFAULT_CHUNK_TOKENS,
+    DEFAULT_OVERLAP_TOKENS,
+    MIN_CHUNK_TOKENS,
+    estimate_native_payload_tokens,
+    resolve_afm_input_budget_tokens,
+    split_text,
+)
 from minni.afm_provider import invoke_native_afm, resolve_afm_mode
 from minni.safety import is_instruction_like
 
@@ -177,6 +185,147 @@ def evaluate_deterministic_shield(text: str) -> Optional[Verdict]:
     return None
 
 
+_CONTENT_ERROR_KINDS = frozenset({"context_overflow", "guardrail", "refusal"})
+_INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]+`")
+_WRAPPER_LEAK_RE = re.compile(
+    r"(?im)(?:"
+    r"^\s*Created At:\s*\d{4}-\d{2}-\d{2}T"
+    r"|^\s*Completed At:\s*\d{4}-\d{2}-\d{2}T"
+    r"|^\s*The following is a <SYSTEM_MESSAGE>"
+    r"|^\s*</?(?:SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b"
+    r"|<(SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b[^>]*>[\s\S]*?</\1>"
+    r"|^\s*\[Message\]\s+timestamp="
+    r"|^\s*Compaction summary\s*[—–-]"
+    r")"
+)
+_TRANSIENT_CHATTER_RE = re.compile(
+    r"(?i)^\s*(?:ok(?:ay)?|done|fixed?|lgtm|wip|ack|thanks|hello|test(?:ing)?)\W*$"
+    r"|\b(?:temporary\s+intermediate\s+message|saying\s+hello\s+to\s+the\s+team)\b"
+)
+
+
+def _content_level_error_kind(res: Any) -> Optional[str]:
+    """Return content-level AFM status/error_kind that must NOT trip CircuitBreaker."""
+    status = str(getattr(res, "status", "") or "").strip().lower()
+    if status in _CONTENT_ERROR_KINDS:
+        return status
+    data = getattr(res, "data", None)
+    if isinstance(data, dict):
+        kind = str(data.get("error_kind") or "").strip().lower()
+        if kind in _CONTENT_ERROR_KINDS:
+            return kind
+    return None
+
+
+def evaluate_deterministic_quality_fallback(text: str) -> Verdict:
+    """Deterministic quality/verdict evaluator for content-level AFM trips and Jev fallback.
+
+    Valid technical notes (e.g., security, concurrency, or process-kill scars that trip
+    Apple Foundation Models safety guardrails, or long notes exceeding chunk limits) get
+    judged cleanly instead of stranding in inconclusive forever.
+    """
+    shield = evaluate_deterministic_shield(text)
+    if shield is not None:
+        return shield
+
+    stripped = (text or "").strip()
+    if _WRAPPER_LEAK_RE.search(_INLINE_CODE_SPAN_RE.sub(" ", stripped)):
+        return Verdict(
+            decision="reject",
+            reason="wrapper or system envelope leak rejected",
+            model="deterministic-quality-fallback",
+            confidence=0.95,
+        )
+    if _TRANSIENT_CHATTER_RE.search(stripped):
+        return Verdict(
+            decision="reject",
+            reason="transient conversational chatter rejected",
+            model="deterministic-quality-fallback",
+            confidence=0.95,
+        )
+
+    from minni.afm_passes.consolidation import (
+        _quality_blockers,
+        is_low_signal_boot_learning,
+    )
+    from minni.durability import durability_of
+    from minni.minnid_runtime.governance import _SPRINT_CHATTER_RE
+
+    if is_low_signal_boot_learning(stripped) or _SPRINT_CHATTER_RE.search(stripped):
+        return Verdict(
+            decision="reject",
+            reason="low-signal telemetry or sprint chatter rejected",
+            model="deterministic-quality-fallback",
+            confidence=0.95,
+        )
+
+    blockers = _quality_blockers(stripped)
+    if blockers:
+        return Verdict(
+            decision="reject",
+            reason="quality blocker: " + "; ".join(blockers),
+            model="deterministic-quality-fallback",
+            confidence=0.95,
+        )
+
+    if durability_of({"content": stripped, "category": "general"}) == "noise":
+        return Verdict(
+            decision="reject",
+            reason="non-durable noise rejected",
+            model="deterministic-quality-fallback",
+            confidence=0.9,
+        )
+
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_./:-]*", stripped)
+    meaningful = [t for t in tokens if any(ch.isalpha() for ch in t) and len(t) >= 2]
+    if len(meaningful) < 4 or len(re.sub(r"\s+", "", stripped)) < 15:
+        return Verdict(
+            decision="reject",
+            reason="insufficient meaningful content (< 4 tokens or < 15 chars)",
+            model="deterministic-quality-fallback",
+            confidence=0.9,
+        )
+
+    return Verdict(
+        decision="accept",
+        reason="deterministic quality fallback accepted technical note",
+        model="deterministic-quality-fallback",
+        confidence=0.85,
+    )
+
+
+def _judge_chunk_recursive(
+    piece: str,
+    *,
+    timeout: float,
+    chunk_tokens: int,
+    overlap_tokens: int,
+) -> List[tuple[str, Any]]:
+    """Invoke native AFM judge on one piece, recursively splitting on context_overflow."""
+    res = invoke_native_afm("judge", {"candidate": piece}, timeout=timeout)
+    if (
+        not getattr(res, "ok", False)
+        and _content_level_error_kind(res) == "context_overflow"
+        and chunk_tokens > MIN_CHUNK_TOKENS
+    ):
+        next_tokens = max(chunk_tokens // 2, MIN_CHUNK_TOKENS)
+        eff_overlap = max(min(overlap_tokens, next_tokens // 4), 0)
+        sub_pieces = split_text(piece, chunk_tokens=next_tokens, overlap_tokens=eff_overlap)
+        if len(sub_pieces) > 1:
+            out: List[tuple[str, Any]] = []
+            for sub in sub_pieces:
+                out.extend(
+                    _judge_chunk_recursive(
+                        sub,
+                        timeout=timeout,
+                        chunk_tokens=next_tokens,
+                        overlap_tokens=overlap_tokens,
+                    )
+                )
+            return out
+    return [(piece, res)]
+
+
 def judge_candidate(
     content: str,
     trace_id: str = "",
@@ -211,55 +360,138 @@ def judge_candidate(
             model="circuit-breaker",
         )
 
-    # Step 4: Model Evaluation via Native AFM
+    # Step 4: Model Evaluation via Native AFM (with proactive & reactive chunking)
     mode = resolve_afm_mode()
     if mode in ("native", "auto"):
         try:
             start_time = time.monotonic()
-            res = invoke_native_afm("judge", {"candidate": content}, timeout=timeout)
+            budget = resolve_afm_input_budget_tokens()
+            chunk_size = max(min(DEFAULT_CHUNK_TOKENS, budget), MIN_CHUNK_TOKENS)
+            eff_overlap = max(min(DEFAULT_OVERLAP_TOKENS, chunk_size // 4), 0)
+
+            payload = {"candidate": content}
+            if estimate_native_payload_tokens(payload) > budget:
+                pieces = split_text(content, chunk_tokens=chunk_size, overlap_tokens=eff_overlap)
+                chunk_evals: List[tuple[str, Any]] = []
+                for piece in pieces:
+                    chunk_evals.extend(
+                        _judge_chunk_recursive(
+                            piece,
+                            timeout=timeout,
+                            chunk_tokens=chunk_size,
+                            overlap_tokens=DEFAULT_OVERLAP_TOKENS,
+                        )
+                    )
+            else:
+                res = invoke_native_afm("judge", payload, timeout=timeout)
+                if (
+                    not getattr(res, "ok", False)
+                    and _content_level_error_kind(res) == "context_overflow"
+                ):
+                    next_size = max(chunk_size // 2, MIN_CHUNK_TOKENS)
+                    next_overlap = max(min(DEFAULT_OVERLAP_TOKENS, next_size // 4), 0)
+                    pieces = split_text(content, chunk_tokens=next_size, overlap_tokens=next_overlap)
+                    if len(pieces) > 1:
+                        chunk_evals = []
+                        for piece in pieces:
+                            chunk_evals.extend(
+                                _judge_chunk_recursive(
+                                    piece,
+                                    timeout=timeout,
+                                    chunk_tokens=next_size,
+                                    overlap_tokens=DEFAULT_OVERLAP_TOKENS,
+                                )
+                            )
+                    else:
+                        chunk_evals = [(content, res)]
+                else:
+                    chunk_evals = [(content, res)]
+
             elapsed = time.monotonic() - start_time
 
-            if res.ok and isinstance(res.data, dict):
-                raw_decision = str(res.data.get("decision", "")).strip().lower()
-                reason = str(res.data.get("reason", "model evaluation")).strip()
+            provider_failed = False
+            native_succeeded = False
+            chunk_verdicts: List[Verdict] = []
 
-                if raw_decision in ("accept", "reject", "redact"):
-                    circuit_breaker.record_success()
-                    verdict = Verdict(
-                        decision=raw_decision,  # type: ignore[arg-type]
-                        reason=reason[:500],
-                        model="afm-native-judge",
-                        confidence=1.0,
-                    )
-                    verdict_cache.put(chash, verdict)
+            for piece, res in chunk_evals:
+                if getattr(res, "ok", False) and isinstance(getattr(res, "data", None), dict):
+                    raw_decision = str(res.data.get("decision", "")).strip().lower()
+                    reason = str(res.data.get("reason", "model evaluation")).strip()
+                    if raw_decision in ("accept", "reject", "redact"):
+                        native_succeeded = True
+                        chunk_verdicts.append(
+                            Verdict(
+                                decision=raw_decision,  # type: ignore[arg-type]
+                                reason=reason[:500],
+                                model="afm-native-judge",
+                                confidence=1.0,
+                            )
+                        )
+                        continue
+
+                content_err = _content_level_error_kind(res)
+                if content_err is not None:
+                    # Content-level overflow/guardrail/refusal is NOT a provider crash:
+                    # never poison the global circuit breaker, and evaluate deterministically.
                     logger.info(
-                        "AFM judge evaluated candidate in %.2fs: decision=%s reason=%s",
-                        elapsed,
-                        verdict.decision,
-                        verdict.reason,
+                        "AFM native judge returned content-level %s; applying deterministic fallback",
+                        content_err,
                     )
-                    return verdict
+                    chunk_verdicts.append(evaluate_deterministic_quality_fallback(piece))
+                    continue
 
-            # Non-ok or unrecognized decision from AFM helper
-            circuit_breaker.record_failure()
-            logger.warning(
-                "AFM native judge returned non-ok: status=%s error=%s",
-                res.status,
-                res.error,
-            )
+                provider_failed = True
+                logger.warning(
+                    "AFM native judge returned non-ok: status=%s error=%s",
+                    getattr(res, "status", None),
+                    getattr(res, "error", None),
+                )
+                break
+
+            if provider_failed:
+                circuit_breaker.record_failure()
+            elif chunk_verdicts:
+                if native_succeeded:
+                    circuit_breaker.record_success()
+                # Fold chunk verdicts conservatively: redact > reject > accept
+                redact_v = next((v for v in chunk_verdicts if v.decision == "redact"), None)
+                reject_v = next((v for v in chunk_verdicts if v.decision == "reject"), None)
+                if redact_v is not None:
+                    final_verdict = redact_v
+                elif reject_v is not None:
+                    final_verdict = reject_v
+                else:
+                    all_native = all(v.model == "afm-native-judge" for v in chunk_verdicts)
+                    reasons = "; ".join(dict.fromkeys(v.reason for v in chunk_verdicts if v.reason))
+                    final_verdict = Verdict(
+                        decision="accept",
+                        reason=(reasons or "model evaluation")[:500],
+                        model="afm-native-judge" if all_native else "deterministic-quality-fallback",
+                        confidence=min(v.confidence for v in chunk_verdicts),
+                    )
+                verdict_cache.put(chash, final_verdict)
+                logger.info(
+                    "AFM judge evaluated candidate in %.2fs: decision=%s model=%s reason=%s",
+                    elapsed,
+                    final_verdict.decision,
+                    final_verdict.model,
+                    final_verdict.reason,
+                )
+                return final_verdict
         except Exception as exc:
             circuit_breaker.record_failure()
             logger.warning("AFM native judge invocation failed: %s", exc)
 
-    # Step 5: Jev Fallback (if explicitly enabled)
+    # Step 5: Deterministic quality evaluator fallback when egress/fallback is enabled
     if allow_jev_egress:
         try:
-            # Jev/Typesafe AI integration hook
-            # Kept strictly opt-in per privacy governance
-            logger.info("Attempting Jev fallback classification")
-            # Fallback path if configured
+            logger.info("Evaluating candidate via deterministic quality fallback (allow_jev_egress=True)")
+            fallback_verdict = evaluate_deterministic_quality_fallback(content)
+            if fallback_verdict.decision in ("accept", "reject", "redact"):
+                verdict_cache.put(chash, fallback_verdict)
+                return fallback_verdict
         except Exception as exc:
-            logger.warning("Jev fallback failed: %s", exc)
+            logger.warning("Deterministic fallback evaluation failed: %s", exc)
 
     # Fail soft: stay staged in proposed for operator review
     return Verdict(

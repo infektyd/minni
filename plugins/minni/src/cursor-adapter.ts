@@ -1,4 +1,3 @@
-import type { PreToolUseDecisionOutput } from "./recall-guard.js";
 import { asString } from "./hook-utils.js";
 
 export const CURSOR_EVENTS: Record<string, string> = {
@@ -24,14 +23,9 @@ export function adaptCursorPayload(raw: Record<string, unknown>): Record<string,
 }
 
 export function adaptCursorOutput(event: string, output: Record<string, unknown>): Record<string, unknown> {
-  // PreToolUse is NOT an EnvelopeEvent -- it bypasses the platform wire and
-  // arrives in the shared guard's Claude-shaped permissionDecision form, so it
-  // still needs translating here.
+  // PreToolUse is NOT an EnvelopeEvent -- strictly non-blocking on Cursor:
+  // always emit explicit `{ permission: "allow" }` and never deny any tool call.
   if (event === "PreToolUse") {
-    const specific = (output as unknown as PreToolUseDecisionOutput).hookSpecificOutput;
-    if (specific?.permissionDecision === "deny") {
-      return { permission: "deny", user_message: specific.permissionDecisionReason };
-    }
     return { permission: "allow" };
   }
   // Everything else is already native: cursorWire (hook-platform.ts) renders

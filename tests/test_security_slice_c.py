@@ -139,32 +139,48 @@ def test_search_learnings_excludes_rejected_and_expired(tmp_path):
     assert "quantum tunneling notes expired" not in contents
 
 
-def test_detect_contradictions_excludes_rejected(tmp_path):
-    """M5/parity: detect_contradictions / semantic search must not surface a
-    rejected learning either."""
-    from minni.writeback import WriteBackMemory
+def test_graph_contradiction_shortlist_excludes_rejected(tmp_path):
+    """M5/parity: typed graph edge preparation must not surface or link against
+    a rejected learning."""
+    from minni.graph_commit import ensure_canonical_learning_node
+    from minni.minnid_runtime.graph_adapters import prepare_governed_promotion
+    from minni.principal import EffectivePrincipal
 
     db_obj, cfg = _make_db(tmp_path)
-    wb = WriteBackMemory(db_obj, cfg)
-
     emb = np.ones(384, dtype=np.float32)
     emb = emb / np.linalg.norm(emb)
-    _seed_learning(db_obj, "codex", "the sky is green", status="rejected", emb=emb.tobytes())
-
-    class _FakeModel:
-        def encode(self, text, **kwargs):
-            return emb
-
-    wb_model_backup = type(wb).model
-    try:
-        type(wb).model = property(lambda self: _FakeModel())
-        candidates = wb.detect_contradictions(
-            content_or_assertion="the sky is green", agent_id="codex"
+    rej_lid = _seed_learning(
+        db_obj,
+        "codex",
+        "Always route internal daemon traffic through port 8080.",
+        status="rejected",
+        emb=emb.tobytes(),
+    )
+    with db_obj.transaction() as c:
+        doc_id = ensure_canonical_learning_node(
+            c,
+            learning_id=rej_lid,
+            agent_id="codex",
+            content="Always route internal daemon traffic through port 8080.",
+            vault_path=cfg.vault_path,
+            created_at=time.time(),
+            workspace_id="default",
         )
-    finally:
-        type(wb).model = wb_model_backup
+        c.execute("UPDATE documents SET page_status = 'rejected' WHERE doc_id = ?", (doc_id,))
 
-    assert all("green" not in (c.get("content") or "") for c in candidates), candidates
+    principal = EffectivePrincipal(
+        agent_id="codex", workspace_id="default", capabilities=["read", "learn"]
+    )
+    plan = prepare_governed_promotion(
+        db_obj,
+        author_agent="codex",
+        workspace_id="default",
+        caller_principal=principal,
+        content="Never route internal daemon traffic through port 8080.",
+        category="correction",
+        vault_path=cfg.vault_path,
+    )
+    assert plan.fallback_edges is None
 
 
 # ── M6: vault frontmatter cannot self-assign the identity layer ─────────────

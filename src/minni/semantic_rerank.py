@@ -66,6 +66,13 @@ class SemanticRerankMixin:
         agent_scope = self._normalize_agent_filter(agent_filter)
 
         with self.db.cursor() as c:
+            from minni.fts_search import _strip_leading_frontmatter
+
+            doc_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            ws_sel = "d.workspace_id" if "workspace_id" in doc_cols else "'' AS workspace_id"
             placeholders = ",".join("?" * len(chunk_ids))
             agent_clause = ""
             params: list = list(chunk_ids)
@@ -77,7 +84,7 @@ class SemanticRerankMixin:
                 SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
                        d.path, d.agent, d.sigil, d.decay_score,
                        d.page_status, d.privacy_level, d.page_type,
-                       d.evidence_refs, d.indexed_at,
+                       d.evidence_refs, d.indexed_at, {ws_sel},
                        COALESCE(ce.layer, d.layer, 'knowledge') AS layer
                 FROM chunk_embeddings ce
                 JOIN documents d ON d.doc_id = ce.doc_id
@@ -88,6 +95,9 @@ class SemanticRerankMixin:
             )
 
             for row in c.fetchall():
+                clean_chunk = _strip_leading_frontmatter(row["chunk_text"] or "")
+                if not clean_chunk.strip():
+                    continue
                 cid = row["chunk_id"]
                 did = row["doc_id"]
                 sim = score_map.get(cid, 0.0)
@@ -100,7 +110,7 @@ class SemanticRerankMixin:
                         "agent": row["agent"],
                         "sigil": row["sigil"],
                         "similarity": sim,
-                        "chunk_text": row["chunk_text"],
+                        "chunk_text": clean_chunk,
                         "heading_context": row["heading_context"] or "",
                         "decay_score": row["decay_score"] or 1.0,
                         "page_status": row["page_status"] or "candidate",
@@ -109,6 +119,7 @@ class SemanticRerankMixin:
                         "evidence_refs": row["evidence_refs"],
                         "indexed_at": row["indexed_at"],
                         "layer": row["layer"] or "knowledge",
+                        "workspace_id": str(row["workspace_id"] or ""),
                     }
 
         results = sorted(doc_best.values(), key=lambda x: x["similarity"], reverse=True)
@@ -286,12 +297,23 @@ class SemanticRerankMixin:
             else:
                 c["rerank_score"] = decay - 1.0
 
-    def _apply_rerank_score_adjustments(self, candidates: List[Dict]) -> None:
-        """Preserve model-pure raw_rerank_score, then apply correction boost and decay."""
+    def _apply_rerank_score_adjustments(
+        self, candidates: List[Dict], query_workspace: str = ""
+    ) -> None:
+        """Preserve model-pure raw_rerank_score, then apply correction boost, decay, and repo boost."""
+        from minni.config import is_concrete_project_workspace, normalize_workspace_scope
+
         for c in candidates:
             c["raw_rerank_score"] = float(c.get("rerank_score") or 0.0)
         self._apply_correction_rerank_boost(candidates)
         self._apply_decay_rerank_attenuation(candidates)
+        norm_qws = normalize_workspace_scope(query_workspace, default="")
+        if is_concrete_project_workspace(norm_qws):
+            for c in candidates:
+                doc_ws = normalize_workspace_scope(c.get("workspace_id"), default="")
+                if doc_ws == norm_qws:
+                    c["rerank_score"] = float(c.get("rerank_score") or 0.0) + 1.5
+                    c["workspace_boost"] = 1.5
 
     def _pinned_cpu_cross_encoder_predict_kwargs(self) -> dict:
         """Kwargs for CrossEncoder.predict on the verified pinned-CPU path."""
@@ -315,13 +337,22 @@ class SemanticRerankMixin:
         except Exception:
             pass
 
-    def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
+    def _rerank(
+        self, query: str, candidates: List[Dict], query_workspace: str = ""
+    ) -> List[Dict]:
         """Re-rank candidates using the cross-encoder with generation-scoped caching."""
         import minni.retrieval as _ret
 
         reranker = self.reranker
         if not reranker or not candidates:
             return candidates
+
+        passaged_indices = [
+            i for i, c in enumerate(candidates) if not c.get("_no_chunk_text")
+        ]
+        if not passaged_indices:
+            return candidates
+        scored_candidates = [candidates[i] for i in passaged_indices]
 
         model_name, model_version = self._reranker_identity(reranker)
         try:
@@ -333,11 +364,12 @@ class SemanticRerankMixin:
 
         missing = []
         missing_indexes = []
-        all_scores = [None] * len(candidates)
+        all_scores: List[Optional[float]] = [None] * len(candidates)
         corpus = self._rerank_corpus()
         generation = cache.generation if cache is not None else None
         if cache is not None:
-            for i, c in enumerate(candidates):
+            for i in passaged_indices:
+                c = candidates[i]
                 chunk_id = c.get("chunk_id")
                 if chunk_id is None:
                     missing.append(c)
@@ -357,14 +389,28 @@ class SemanticRerankMixin:
                 else:
                     all_scores[i] = cached
         else:
-            missing = candidates
-            missing_indexes = list(range(len(candidates)))
+            missing = list(scored_candidates)
+            missing_indexes = list(passaged_indices)
+
+        def _effective_sort_score(item: Dict) -> float:
+            rs = item.get("rerank_score")
+            if rs is not None:
+                return float(rs)
+            return float(item.get("final_score", 0.0) or 0.0)
 
         if not missing:
-            for i, c in enumerate(candidates):
-                c["rerank_score"] = float(all_scores[i])
-            self._apply_rerank_score_adjustments(candidates)
-            candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+            for i in passaged_indices:
+                candidates[i]["rerank_score"] = float(all_scores[i] or 0.0)
+            if query_workspace:
+                try:
+                    self._apply_rerank_score_adjustments(
+                        scored_candidates, query_workspace=query_workspace
+                    )
+                except TypeError:
+                    self._apply_rerank_score_adjustments(scored_candidates)
+            else:
+                self._apply_rerank_score_adjustments(scored_candidates)
+            candidates.sort(key=_effective_sort_score, reverse=True)
             return candidates
 
         pairs = [[query, self._rerank_passage(c)] for c in missing]
@@ -425,11 +471,19 @@ class SemanticRerankMixin:
                         expected_generation=generation,
                     )
 
-            for i, c in enumerate(candidates):
-                c["rerank_score"] = float(all_scores[i] or 0.0)
+            for i in passaged_indices:
+                candidates[i]["rerank_score"] = float(all_scores[i] or 0.0)
 
-            self._apply_rerank_score_adjustments(candidates)
-            candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+            if query_workspace:
+                try:
+                    self._apply_rerank_score_adjustments(
+                        scored_candidates, query_workspace=query_workspace
+                    )
+                except TypeError:
+                    self._apply_rerank_score_adjustments(scored_candidates)
+            else:
+                self._apply_rerank_score_adjustments(scored_candidates)
+            candidates.sort(key=_effective_sort_score, reverse=True)
         except Exception as e:
             logger.warning("Re-ranking failed: %s — falling back to RRF scores", e)
             self._current_state().rerank_degraded = str(e)
@@ -441,24 +495,41 @@ class SemanticRerankMixin:
         merged: List[Dict],
         fts_results: List[Dict],
         limit: int,
+        query_workspace: str = "",
     ) -> List[Dict]:
-        """Drop low-logit semantic-only noise before truncating to reranker_final_k."""
-        ce_floor = -1.0 if not fts_results else -4.0
-        filtered = [
-            r
-            for r in merged
-            if not (
-                r.get("fts_rank") is None
-                and r.get("raw_rerank_score") is not None
-                and (
-                    float(r["raw_rerank_score"]) < -4.0
-                    or (
-                        float(r["raw_rerank_score"]) < ce_floor
-                        and float(r.get("similarity") or 0.0) < 0.35
-                    )
-                )
-            )
-        ]
+        """Drop low-logit noise (including FTS single-word overlap) and weak cross-repo hits."""
+        from minni.config import is_concrete_project_workspace, normalize_workspace_scope
+
+        norm_qws = normalize_workspace_scope(query_workspace, default="")
+        concrete_qws = is_concrete_project_workspace(norm_qws)
+        filtered: List[Dict] = []
+        for r in merged:
+            if concrete_qws:
+                doc_ws = normalize_workspace_scope(r.get("workspace_id"), default="")
+                if (
+                    str(r.get("page_type") or "").lower() == "repo_map"
+                    and doc_ws != norm_qws
+                ):
+                    continue
+            raw_ce = r.get("raw_rerank_score")
+            if raw_ce is not None:
+                ce_val = float(raw_ce)
+                # BUG-01: unconditional floor across BOTH semantic-only and FTS hits
+                # so single-word lexical overlap (-9.5, -16.65) never bypasses CE rejection.
+                if ce_val < -4.0:
+                    continue
+                if r.get("fts_rank") is None:
+                    sim = float(r.get("similarity") or 0.0)
+                    if ce_val < -2.5 and sim < 0.40:
+                        continue
+                    if not fts_results and ce_val < -1.0 and sim < 0.35:
+                        continue
+                if concrete_qws:
+                    doc_ws = normalize_workspace_scope(r.get("workspace_id"), default="")
+                    if is_concrete_project_workspace(doc_ws) and doc_ws != norm_qws:
+                        if ce_val < 0.0:
+                            continue
+            filtered.append(r)
         return filtered[: max(self.config.reranker_final_k, limit)]
 
     def _rerank_corpus(self) -> str:
@@ -489,8 +560,10 @@ class SemanticRerankMixin:
                 break
         return model_name, model_version
 
-    def _score_merged_doc(self, d: Dict) -> None:
-        """Compute final_score for one RRF-merged doc with correction salience and decay floor."""
+    def _score_merged_doc(self, d: Dict, query_workspace: str = "") -> None:
+        """Compute final_score for one RRF-merged doc with correction salience, decay, and repo boost."""
+        from minni.config import is_concrete_project_workspace, normalize_workspace_scope
+
         boost = 0.0
         decay = d.get("decay_score")
         if decay is None:
@@ -503,13 +576,21 @@ class SemanticRerankMixin:
         d["salience_boost"] = boost
         decay = max(0.0, min(1.0, float(decay)))
         d["decay_applied"] = decay
-        d["final_score"] = d["rrf_score"] * decay * (1.0 + boost)
+        ws_multiplier = 1.0
+        norm_qws = normalize_workspace_scope(query_workspace, default="")
+        if is_concrete_project_workspace(norm_qws):
+            doc_ws = normalize_workspace_scope(d.get("workspace_id"), default="")
+            if doc_ws == norm_qws:
+                ws_multiplier = 1.35
+                d["workspace_boost"] = 0.35
+        d["final_score"] = d["rrf_score"] * decay * (1.0 + boost) * ws_multiplier
 
     def _rrf_merge(
         self,
         fts_results: List[Dict],
         semantic_results: List[Dict],
         limit: int,
+        query_workspace: str = "",
     ) -> List[Dict]:
         """Reciprocal Rank Fusion of FTS5 and semantic results with FTS slot reservation."""
         k = self.config.rrf_k
@@ -528,6 +609,7 @@ class SemanticRerankMixin:
                     "fts_rank": rank,
                     "sem_rank": None,
                     "chunk_text": r.get("chunk_text", ""),
+                    "_no_chunk_text": "chunk_text" not in r,
                     "heading_context": r.get("heading_context", ""),
                     "page_status": r.get("page_status", "candidate"),
                     "privacy_level": r.get("privacy_level", "safe"),
@@ -535,6 +617,8 @@ class SemanticRerankMixin:
                     "evidence_refs": r.get("evidence_refs"),
                     "indexed_at": r.get("indexed_at"),
                     "layer": r.get("layer", "knowledge"),
+                    "workspace_id": r.get("workspace_id", ""),
+                    "bm25_rank": r.get("bm25_rank"),
                 }
             doc_scores[did]["rrf_score"] += self.config.fts_weight / (k + rank)
 
@@ -551,6 +635,7 @@ class SemanticRerankMixin:
                     "fts_rank": None,
                     "sem_rank": rank,
                     "chunk_text": r.get("chunk_text", ""),
+                    "_no_chunk_text": "chunk_text" not in r,
                     "heading_context": r.get("heading_context", ""),
                     "page_status": r.get("page_status", "candidate"),
                     "privacy_level": r.get("privacy_level", "safe"),
@@ -558,6 +643,8 @@ class SemanticRerankMixin:
                     "evidence_refs": r.get("evidence_refs"),
                     "indexed_at": r.get("indexed_at"),
                     "layer": r.get("layer", "knowledge"),
+                    "workspace_id": r.get("workspace_id", ""),
+                    "bm25_rank": r.get("bm25_rank"),
                 }
             doc_scores[did]["rrf_score"] += self.config.semantic_weight / (k + rank)
             if doc_scores[did]["sem_rank"] is None:
@@ -569,6 +656,7 @@ class SemanticRerankMixin:
                 doc_scores[did]["similarity"] = r["similarity"]
             if r.get("chunk_text"):
                 doc_scores[did]["chunk_text"] = r["chunk_text"]
+                doc_scores[did]["_no_chunk_text"] = False
                 doc_scores[did]["heading_context"] = r.get("heading_context", "")
                 if r.get("chunk_id") is not None:
                     doc_scores[did]["chunk_id"] = r["chunk_id"]
@@ -582,9 +670,17 @@ class SemanticRerankMixin:
                 doc_scores[did]["indexed_at"] = r["indexed_at"]
             if not doc_scores[did].get("layer") and r.get("layer"):
                 doc_scores[did]["layer"] = r["layer"]
+            if not doc_scores[did].get("workspace_id") and r.get("workspace_id"):
+                doc_scores[did]["workspace_id"] = r["workspace_id"]
 
         for d in doc_scores.values():
-            self._score_merged_doc(d)
+            if query_workspace:
+                try:
+                    self._score_merged_doc(d, query_workspace=query_workspace)
+                except TypeError:
+                    self._score_merged_doc(d)
+            else:
+                self._score_merged_doc(d)
 
         ranked = sorted(
             doc_scores.values(), key=lambda x: x["final_score"], reverse=True
@@ -768,13 +864,20 @@ class SemanticRerankMixin:
         doc_best: Dict[int, Dict] = {}
 
         with self.db.cursor() as c:
+            from minni.fts_search import _strip_leading_frontmatter
+
+            doc_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            ws_sel = "d.workspace_id" if "workspace_id" in doc_cols else "'' AS workspace_id"
             placeholders = ",".join("?" * len(chunk_ids))
             c.execute(
                 f"""
                 SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
                        d.path, d.agent, d.sigil, d.decay_score,
                        d.page_status, d.privacy_level, d.page_type,
-                       d.evidence_refs, d.indexed_at,
+                       d.evidence_refs, d.indexed_at, {ws_sel},
                        COALESCE(ce.layer, d.layer, 'knowledge') AS layer
                 FROM chunk_embeddings ce
                 JOIN documents d ON d.doc_id = ce.doc_id
@@ -784,6 +887,9 @@ class SemanticRerankMixin:
             )
 
             for row in c.fetchall():
+                clean_chunk = _strip_leading_frontmatter(row["chunk_text"] or "")
+                if not clean_chunk.strip():
+                    continue
                 cid = row["chunk_id"]
                 did = row["doc_id"]
                 sim, bname = score_map.get(cid, (0.0, "unknown"))
@@ -796,7 +902,7 @@ class SemanticRerankMixin:
                         "agent": row["agent"],
                         "sigil": row["sigil"],
                         "similarity": sim,
-                        "chunk_text": row["chunk_text"],
+                        "chunk_text": clean_chunk,
                         "heading_context": row["heading_context"] or "",
                         "decay_score": row["decay_score"] or 1.0,
                         "page_status": row["page_status"] or "candidate",
@@ -805,6 +911,7 @@ class SemanticRerankMixin:
                         "evidence_refs": row["evidence_refs"],
                         "indexed_at": row["indexed_at"],
                         "layer": row["layer"] or "knowledge",
+                        "workspace_id": str(row["workspace_id"] or ""),
                         "backend_name": bname,
                     }
 
@@ -830,6 +937,7 @@ class SemanticRerankMixin:
         semantic_results: List[Dict],
         extra_backend_results: List[List[Dict]],
         limit: int,
+        query_workspace: str = "",
     ) -> List[Dict]:
         """RRF merge: FTS + semantic + Nth backend stream(s)."""
         k = self.config.rrf_k
@@ -849,6 +957,7 @@ class SemanticRerankMixin:
                         "fts_rank": None,
                         "sem_rank": None,
                         "chunk_text": r.get("chunk_text", ""),
+                        "_no_chunk_text": "chunk_text" not in r,
                         "heading_context": r.get("heading_context", ""),
                         "page_status": r.get("page_status", "candidate"),
                         "privacy_level": r.get("privacy_level", "safe"),
@@ -856,6 +965,8 @@ class SemanticRerankMixin:
                         "evidence_refs": r.get("evidence_refs"),
                         "indexed_at": r.get("indexed_at"),
                         "layer": r.get("layer", "knowledge"),
+                        "workspace_id": r.get("workspace_id", ""),
+                        "bm25_rank": r.get("bm25_rank"),
                         "backend_name": r.get("backend_name", "faiss-disk"),
                     }
                 doc_scores[did]["rrf_score"] += weight / (k + rank)
@@ -865,6 +976,7 @@ class SemanticRerankMixin:
                     doc_scores[did]["sem_rank"] = rank
                 if r.get("chunk_text") and not doc_scores[did].get("_sem_chunk"):
                     doc_scores[did]["chunk_text"] = r["chunk_text"]
+                    doc_scores[did]["_no_chunk_text"] = False
                     doc_scores[did]["heading_context"] = r.get("heading_context", "")
                     if stream_label != "fts":
                         doc_scores[did]["_sem_chunk"] = True
@@ -878,6 +990,8 @@ class SemanticRerankMixin:
                     doc_scores[did]["indexed_at"] = r["indexed_at"]
                 if not doc_scores[did].get("layer") and r.get("layer"):
                     doc_scores[did]["layer"] = r["layer"]
+                if not doc_scores[did].get("workspace_id") and r.get("workspace_id"):
+                    doc_scores[did]["workspace_id"] = r["workspace_id"]
 
         _add_stream(fts_results, self.config.fts_weight, "fts")
         _add_stream(semantic_results, self.config.semantic_weight, "sem")
@@ -886,7 +1000,13 @@ class SemanticRerankMixin:
 
         for d in doc_scores.values():
             d.pop("_sem_chunk", None)
-            self._score_merged_doc(d)
+            if query_workspace:
+                try:
+                    self._score_merged_doc(d, query_workspace=query_workspace)
+                except TypeError:
+                    self._score_merged_doc(d)
+            else:
+                self._score_merged_doc(d)
 
         ranked = sorted(
             doc_scores.values(), key=lambda x: x["final_score"], reverse=True

@@ -135,9 +135,11 @@ def test_seeding_backfills_only_the_missing_file(vault, capsys):
     assert report["kept"] == ["core.md"]
 
 
-def test_bootstrapped_vault_reports_layer1_present_to_the_distill_gauges(vault):
-    """Seeding order matters: gauges are written after layer1/ exists."""
-    assert "layer1/core.md present" in (vault / "distill" / "gauges.md").read_text()
+def test_bootstrapped_vault_seeds_layer1_without_distill(vault):
+    """Vault bootstrap seeds layer1/core.md + budget.md and does not create retired distill/."""
+    assert (vault / "layer1" / "core.md").is_file()
+    assert (vault / "layer1" / "budget.md").is_file()
+    assert not (vault / "distill").exists()
 
 
 def test_missing_templates_do_not_break_bootstrap(tmp_path, monkeypatch, capsys):

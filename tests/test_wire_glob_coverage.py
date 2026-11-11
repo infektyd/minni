@@ -19,7 +19,7 @@ PACKAGE_JSON = REPO / "plugins" / "minni" / "package.json"
 PLUGIN_ROOT = REPO / "plugins" / "minni"
 
 EXCLUDED = {
-    "frontend-src", "src", "tests", "node_modules",
+    "src", "tests", "node_modules",
     "package.json", "package-lock.json",
 }
 JUNK = {".DS_Store", "__pycache__", ".pytest_cache"}

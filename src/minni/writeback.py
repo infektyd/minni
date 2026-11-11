@@ -98,6 +98,7 @@ class WriteBackMemory:
         evidence_doc_ids: Optional[List[int]] = None,
         confidence: float = 1.0,
         supersedes: Optional[int] = None,
+        workspace_id: str = "default",
     ) -> int:
         """
         Store a new learning.
@@ -111,13 +112,17 @@ class WriteBackMemory:
             evidence_doc_ids: PR-6 structured evidence document IDs
             confidence: How confident (0-1) the agent is
             supersedes: learning_id this replaces (versioning)
+            workspace_id: Project workspace scope (default 'default')
 
         Returns:
             learning_id
         """
+        from minni.config import normalize_workspace_scope
+
         category = str(category or "general").strip().lower()
         if category not in CATEGORIES:
             category = "general"
+        ws = normalize_workspace_scope(workspace_id, default="default")
 
         now = time.time()
         doc_ids_json = json.dumps(source_doc_ids) if source_doc_ids else None
@@ -137,15 +142,30 @@ class WriteBackMemory:
         # failure rolls everything back (no partial durable state). Model
         # encoding stays outside the transaction, per the write-path contract.
         with self.db.cursor() as c:
-            c.execute("""
-                INSERT INTO learnings
-                (agent_id, category, content, source_doc_ids, source_query,
-                 confidence, embedding, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                agent_id, category, content, doc_ids_json, source_query,
-                confidence, emb_bytes, now,
-            ))
+            l_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            if "workspace_id" in l_cols:
+                c.execute("""
+                    INSERT INTO learnings
+                    (agent_id, category, content, source_doc_ids, source_query,
+                     confidence, embedding, created_at, workspace_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    agent_id, category, content, doc_ids_json, source_query,
+                    confidence, emb_bytes, now, ws,
+                ))
+            else:
+                c.execute("""
+                    INSERT INTO learnings
+                    (agent_id, category, content, source_doc_ids, source_query,
+                     confidence, embedding, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    agent_id, category, content, doc_ids_json, source_query,
+                    confidence, emb_bytes, now,
+                ))
             learning_id = c.lastrowid
 
             # Mark superseded learning
@@ -162,6 +182,7 @@ class WriteBackMemory:
                 content=content,
                 vault_path=self.config.vault_path,
                 created_at=now,
+                workspace_id=ws,
             )
 
             self.add_derived_from_edges(
@@ -182,7 +203,7 @@ class WriteBackMemory:
 
         # Write to disk as markdown (for Obsidian integration)
         if self.config.writeback_enabled:
-            self._write_to_disk(learning_id, agent_id, category, content, now)
+            self._write_to_disk(learning_id, agent_id, category, content, now, workspace_id=ws)
 
         return learning_id
 
@@ -358,10 +379,15 @@ class WriteBackMemory:
         fts_query = " ".join(words)
 
         with self.db.cursor() as c:
-            sql = """
+            l_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            ws_select = "l.workspace_id" if "workspace_id" in l_cols else "'default' AS workspace_id"
+            sql = f"""
                 SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
                        l.confidence, l.created_at, l.access_count,
-                       l.source_query, l.source_doc_ids
+                       l.source_query, l.source_doc_ids, {ws_select}
                 FROM learnings_fts lf
                 JOIN learnings l ON l.learning_id = lf.learning_id
                 WHERE learnings_fts MATCH ?
@@ -392,6 +418,7 @@ class WriteBackMemory:
                         "created_at": datetime.fromtimestamp(row["created_at"]).isoformat(),
                         "access_count": row["access_count"],
                         "source_query": row["source_query"],
+                        "workspace_id": str(row["workspace_id"] or "default"),
                     })
             except Exception as e:
                 logger.warning("Learning FTS search failed: %s", e)
@@ -443,9 +470,14 @@ class WriteBackMemory:
 
         results = []
         with self.db.cursor() as c:
-            sql = """
+            l_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            ws_select = "workspace_id" if "workspace_id" in l_cols else "'default' AS workspace_id"
+            sql = f"""
                 SELECT learning_id, agent_id, category, content, confidence,
-                       created_at, access_count, source_query, embedding
+                       created_at, access_count, source_query, embedding, {ws_select}
                 FROM learnings
                 WHERE superseded_by IS NULL AND embedding IS NOT NULL
                       AND (status IS NULL OR status NOT IN ('rejected','expired','superseded'))
@@ -479,6 +511,7 @@ class WriteBackMemory:
                     "created_at": datetime.fromtimestamp(row["created_at"]).isoformat(),
                     "access_count": row["access_count"],
                     "source_query": row["source_query"],
+                    "workspace_id": str(row["workspace_id"] or "default"),
                     "similarity": round(sim, 4),
                 })
 
@@ -491,6 +524,7 @@ class WriteBackMemory:
         category: str,
         content: str,
         timestamp: float,
+        workspace_id: str = "",
     ) -> None:
         """Write learning as a markdown file to the writeback directory."""
         try:
@@ -507,11 +541,13 @@ class WriteBackMemory:
                 )
                 return
 
+            ws_clean = str(workspace_id or "").replace("\r", "").replace("\n", "").strip()
+            ws_line = f"workspace_id: {ws_clean}\n" if ws_clean else ""
             md_content = f"""---
 learning_id: {learning_id}
 agent: {agent_id}
 category: {category}
-created: {dt.isoformat()}
+{ws_line}created: {dt.isoformat()}
 ---
 
 # {category.title()}: {content[:80]}
@@ -547,152 +583,6 @@ created: {dt.isoformat()}
                         if ln.strip() == "---":
                             return True
         return False
-
-    def detect_contradictions(
-        self,
-        content_or_assertion: str,
-        agent_id: Optional[str] = None,
-        threshold: Optional[float] = None,
-    ) -> List[Dict]:
-        """
-        Detect active learnings that semantically contradict the given text.
-
-        Uses cosine similarity between the embedded assertion and embeddings of
-        all active learnings (status not in superseded/rejected/expired, and
-        superseded_by IS NULL).
-
-        Args:
-            content_or_assertion: The text to check against existing learnings.
-            agent_id: Optional — if supplied, scope detection to this agent.
-            threshold: Override the config contradiction_threshold.
-
-        Returns:
-            List of candidate dicts, each containing:
-              id, content, assertion, score, agent_id, created_at
-            Sorted by score descending (highest similarity first).
-
-        Graceful failure: if embedding is unavailable, logs a warning and
-        returns [] so the caller can proceed with the write.
-        """
-        if not self.model:
-            logger.warning(
-                "detect_contradictions: embedding model unavailable — skipping detection"
-            )
-            return []
-
-        np = _numpy()
-        effective_threshold = (
-            threshold if threshold is not None else self.config.contradiction_threshold
-        )
-
-        try:
-            from minni.models import get_embedder_lock
-
-            with get_embedder_lock():
-                query_emb = self.model.encode(
-                    content_or_assertion, show_progress_bar=False
-                ).astype(np.float32)
-        except Exception as exc:
-            logger.warning(
-                "detect_contradictions: failed to embed assertion (%s) — skipping detection",
-                exc,
-            )
-            return []
-
-        query_norm = np.linalg.norm(query_emb)
-        if query_norm < 1e-8:
-            return []
-        query_emb = query_emb / query_norm
-
-        candidates = []
-        with self.db.cursor() as c:
-            # Active learnings: not superseded via superseded_by FK, and
-            # status column (if present) not in terminal states.
-            sql = """
-                SELECT learning_id, agent_id, content, assertion,
-                       confidence, created_at, embedding
-                FROM learnings
-                WHERE superseded_by IS NULL
-                  AND embedding IS NOT NULL
-                  AND (status IS NULL OR status NOT IN ('superseded', 'rejected', 'expired'))
-            """
-            params = []
-            if agent_id:
-                sql += " AND agent_id = ?"
-                params.append(agent_id)
-
-            try:
-                c.execute(sql, params)
-                rows = c.fetchall()
-            except Exception as exc:
-                logger.warning(
-                    "detect_contradictions: DB query failed (%s) — skipping detection",
-                    exc,
-                )
-                return []
-
-        for row in rows:
-            try:
-                emb = np.frombuffer(row["embedding"], dtype=np.float32)
-                norm = np.linalg.norm(emb)
-                if norm < 1e-8:
-                    continue
-                sim = float(np.dot(query_emb, emb / norm))
-                if sim > effective_threshold:
-                    candidates.append({
-                        "id": row["learning_id"],
-                        "content": row["content"],
-                        "assertion": row["assertion"],
-                        "score": round(sim, 4),
-                        "agent_id": row["agent_id"],
-                        "created_at": datetime.fromtimestamp(row["created_at"]).isoformat(),
-                    })
-            except Exception as exc:
-                logger.debug("detect_contradictions: skipping row due to error: %s", exc)
-                continue
-
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-
-        # G18: log every detected contradiction for audit + candidate surfacing
-        # (rows preserved; resolution_id wired on resolve_candidate)
-        try:
-            now = time.time()
-            # Probe once per invocation: baseline 009 lacks resolution_status
-            # (021 unavailable is non-fatal), so use the legacy column shape
-            # there instead of dropping every audit row under the catch below.
-            with self.db.cursor() as probe:
-                log_cols = {
-                    row[1]
-                    for row in probe.execute(
-                        "PRAGMA table_info(contradiction_log)"
-                    ).fetchall()
-                }
-            typed_log = "resolution_status" in log_cols
-            for cand in candidates:
-                with self.db.cursor() as c:
-                    if typed_log:
-                        c.execute(
-                            """
-                            INSERT INTO contradiction_log
-                            (memory_a_id, memory_b_id, detected_at, detection_method,
-                             resolution_status)
-                            VALUES (?, ?, ?, ?, 'legacy_unclassified')
-                            """,
-                            (cand.get("id"), None, now, "cosine"),
-                        )
-                    else:
-                        c.execute(
-                            """
-                            INSERT INTO contradiction_log
-                            (memory_a_id, memory_b_id, detected_at, detection_method)
-                            VALUES (?, ?, ?, ?)
-                            """,
-                            (cand.get("id"), None, now, "cosine"),
-                        )
-        except Exception as exc:
-            logger.debug("contradiction_log insert skipped (non-fatal): %s", exc)
-
-        return candidates
 
     def get_stats(self) -> Dict:
         """Get write-back memory statistics."""

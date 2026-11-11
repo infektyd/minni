@@ -367,7 +367,8 @@ class MinniDB:
                 superseded_by INTEGER,
                 expires_at REAL,
                 evidence_refs TEXT,
-                layer TEXT DEFAULT NULL
+                layer TEXT DEFAULT NULL,
+                workspace_id TEXT NOT NULL DEFAULT ''
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_doc_path ON documents(path)")
@@ -377,6 +378,33 @@ class MinniDB:
         except sqlite3.OperationalError as e:
             if "no such column: layer" not in str(e).lower():
                 raise
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_documents_workspace ON documents(workspace_id)")
+        except sqlite3.OperationalError as e:
+            if "no such column: workspace_id" not in str(e).lower():
+                raise
+
+        # === Living Repo Map Cards (Wave 4 / BUG-15) ===
+        # Named repo_map_cards to avoid colliding with legacy document_metadata.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS repo_map_cards (
+                doc_id INTEGER PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                repo_root TEXT NOT NULL,
+                subsystem_slug TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary_line TEXT NOT NULL DEFAULT '',
+                owned_files_json TEXT NOT NULL DEFAULT '[]',
+                git_sha TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_repo_map_cards_ws ON repo_map_cards(workspace_id)")
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_map_cards_ws_slug "
+            "ON repo_map_cards(workspace_id, subsystem_slug)"
+        )
 
         # === Chunk Embeddings (one doc → many chunks) ===
         # V3.1: No more 'compressed' or 'norm' columns.
@@ -513,12 +541,18 @@ class MinniDB:
                 access_count INTEGER DEFAULT 0,
                 last_accessed REAL,
                 superseded_by INTEGER,
+                workspace_id TEXT NOT NULL DEFAULT 'default',
                 FOREIGN KEY(superseded_by) REFERENCES learnings(learning_id)
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_learn_agent ON learnings(agent_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_learn_cat ON learnings(category)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_learn_superseded ON learnings(superseded_by)")
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_learn_workspace ON learnings(workspace_id)")
+        except sqlite3.OperationalError as e:
+            if "no such column: workspace_id" not in str(e).lower():
+                raise
 
         # === Learnings FTS (V3.1 NEW) ===
         c.execute("""
@@ -669,6 +703,8 @@ class MinniDB:
                         run_migrations(conn)
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_layer ON documents(layer)")
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_layer ON chunk_embeddings(layer)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_workspace ON documents(workspace_id)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_learn_workspace ON learnings(workspace_id)")
                         conn.commit()
                         # Only mark migrated after success so a failed 015 (etc.)
                         # is retried on the next open of this path.

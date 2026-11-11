@@ -220,7 +220,6 @@ def _populate_container_from_staged(container_dir: Path, staged_dir: Path) -> No
         "skills",
         "commands",
         "hooks",
-        "frontend",
         ".claude-plugin",
         ".codex-plugin",
         ".cursor-plugin",

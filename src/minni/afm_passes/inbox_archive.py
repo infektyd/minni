@@ -41,6 +41,7 @@ from minni.afm_passes.inbox_ingest import (
     _principal_family,
     _principal_for_inbox,
     discover_inboxes,
+    intake_junk_reason,
     is_audit_echo,
 )
 
@@ -233,7 +234,7 @@ def _eligible_candidates(doc: Any) -> Optional[dict]:
             continue
         if cand in log_only or cand in dns:
             continue
-        if is_audit_echo(cand):
+        if is_audit_echo(cand) or intake_junk_reason(cand) is not None:
             continue
         out[idx] = cand.strip()[:CONTENT_CAP]
     return out
@@ -416,7 +417,7 @@ def _inert_reason(doc: Any, inbox_principal: str) -> Optional[Dict[str, Any]]:
         if cand in log_only or cand in dns:
             listed += 1
             continue
-        if is_audit_echo(cand):
+        if is_audit_echo(cand) or intake_junk_reason(cand) is not None:
             echo += 1
             continue
         return None  # at least one ingestible candidate: file stays live

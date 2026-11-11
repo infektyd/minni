@@ -163,7 +163,7 @@ test("grok worker-start is honest MISSING and never a silent spawn", async (t) =
   assert.match(grokHooks, /"Stop"/);
 });
 
-test("agy default allowlist is honest CANNOT for minni_thread_worker_update", async (t) => {
+test("agy default allowlist is honest CANNOT for minni_thread_update", async (t) => {
   const fixture = await seedClaimedPacket(t);
   const result = dispatchWorkerPacket({ host: "agy", packet: fixture.packet });
 
@@ -176,21 +176,18 @@ test("agy default allowlist is honest CANNOT for minni_thread_worker_update", as
     "minni_recall",
     "minni_drill",
     "minni_status",
-    "minni_audit_tail",
-    "minni_audit_report",
-    "minni_route",
-    "minni_list_pending_handoffs",
-    "minni_ping_agent_inbox",
-    "minni_ping_agent_status",
+    "minni_list_candidates",
+    "minni_handoff_inbox",
+    "minni_thread_status",
   ]);
   assert.equal(AGY_DEFAULT_ALLOWLIST.includes(WORKER_COMPLETION_TOOL), false);
   assert.deepEqual([...result.allowlist], [...AGY_DEFAULT_ALLOWLIST]);
   assert.deepEqual([...result.missing], [WORKER_COMPLETION_TOOL]);
-  assert.match(result.missing.join(","), /minni_thread_worker_update/);
+  assert.match(result.missing.join(","), /minni_thread_update/);
   assert.equal(
-    AGY_DEFAULT_ALLOWLIST.some((tool) => tool.startsWith("minni_thread_")),
+    AGY_DEFAULT_ALLOWLIST.some((tool) => tool === "minni_thread_update" || tool === "minni_thread_create"),
     false,
-    "default still has no minni_thread_*",
+    "default allowlist only includes read-only minni_thread_status, never write thread tools",
   );
 
   const [writers, propagate] = await Promise.all([
@@ -203,17 +200,21 @@ test("agy default allowlist is honest CANNOT for minni_thread_worker_update", as
   }
   assert.match(writers, /MINNI_READONLY_TOOLS = \([\s\S]*?\)/);
   const readonlyBlock = writers.match(/MINNI_READONLY_TOOLS = \(([\s\S]*?)\)/)[1];
-  assert.doesNotMatch(readonlyBlock, /minni_thread_worker_update/);
+  assert.doesNotMatch(readonlyBlock, /minni_thread_update/);
   assert.doesNotMatch(propagate, /minni_thread_worker_update/);
 });
 
-test("agy worker allowlist exists as worker_update only and is still not wet", async (t) => {
+test("agy worker allowlist uses v1 worker tools and is still not wet", async (t) => {
   const fixture = await seedClaimedPacket(t);
   const defaultResult = dispatchWorkerPacket({ host: "agy", packet: fixture.packet });
   const named = reportAgyWorkerAllowlist();
 
   assert.notEqual(AGY_WORKER_ALLOWLIST, null);
-  assert.deepEqual([...AGY_WORKER_ALLOWLIST], [WORKER_COMPLETION_TOOL]);
+  assert.deepEqual([...AGY_WORKER_ALLOWLIST], [
+    "minni_thread_update",
+    "minni_thread_scar",
+    "minni_learn",
+  ]);
   assert.equal(AGY_WORKER_ALLOWLIST.includes("minni_thread_claim"), false);
   assert.equal(GROK_WORKER_START, null, "do not invent a grok start API");
   assert.equal(defaultResult.outcome, "CANNOT");
@@ -229,7 +230,10 @@ test("agy worker allowlist exists as worker_update only and is still not wet", a
     readFile(DISPATCH_SRC, "utf8"),
     readFile(SERVER_SRC, "utf8"),
   ]);
-  assert.match(writers, /MINNI_WORKER_TOOLS = \(\s*"minni_thread_worker_update",?\s*\)/);
+  assert.match(
+    writers,
+    /MINNI_WORKER_TOOLS = \(\s*"minni_thread_update",\s*"minni_thread_scar",\s*"minni_learn",?\s*\)/,
+  );
   assert.match(writers, /MINNI_WORKER_GRANTS = tuple\(f"mcp\(minni\/\{tool\}\)" for tool in MINNI_WORKER_TOOLS\)/);
   assert.match(writers, /def ensure_worker_permission_grant\(/);
   assert.doesNotMatch(writers, /minni_thread_claim/);
@@ -323,8 +327,9 @@ test("adapter is not a new MCP tool, not team_runtime, and cursor stays out of t
     serverSrc,
     /registerTool\(\s*"dispatch"|registerTool\(\s*"host_dispatch"|registerTool\(\s*"minni_plan_/,
   );
-  assert.match(serverSrc, /"minni_thread_worker_update"/);
-  assert.match(serverSrc, /"minni_team_evidence"/);
+  assert.match(serverSrc, /"minni_thread_update"/);
+  assert.match(serverSrc, /"minni_thread_scar"/);
+  assert.doesNotMatch(serverSrc, /"minni_thread_worker_update"|"minni_team_evidence"/);
   assert.doesNotMatch(dispatchSrc, /minni_plan_/);
   assert.doesNotMatch(dispatchSrc, /registerTool/);
   assert.doesNotMatch(
@@ -334,5 +339,5 @@ test("adapter is not a new MCP tool, not team_runtime, and cursor stays out of t
   );
   assert.doesNotMatch(packetSrc, /dispatchWorkerPacket/);
   assert.match(dispatchSrc, /WorkerPacket/);
-  assert.match(dispatchSrc, /minni_thread_worker_update/);
+  assert.match(dispatchSrc, /minni_thread_update/);
 });

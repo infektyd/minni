@@ -422,9 +422,8 @@ test("adapter is not team_runtime, not a new MCP tool, and does not revive minni
     /registerTool\(\s*"claim"|registerTool\(\s*"worker_update"|registerTool\(\s*"minni_plan_/,
     "do not invent claim / worker_update / minni_plan_* tools",
   );
-  assert.match(serverSrc, /"minni_thread_claim"/);
-  assert.match(serverSrc, /"minni_thread_worker_update"/);
-  assert.match(serverSrc, /claim_token:\s*z\.string\(\)\.min\(1\)/);
+  assert.match(serverSrc, /"minni_thread_update"/);
+  assert.match(serverSrc, /"minni_thread_scar"/);
   assert.doesNotMatch(packetSrc, /minni_plan_/);
   assert.doesNotMatch(packetSrc, /registerTool/);
 });

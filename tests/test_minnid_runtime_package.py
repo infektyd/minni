@@ -298,7 +298,6 @@ def test_operational_domains_live_in_runtime_modules_and_registry_delegates():
         promote_candidate_durable,
         reject_candidate_dedup,
     )
-    from minni.minnid_runtime.ax import AXContext, handle_ax_snapshot_get, handle_ax_snapshot_store
     from minni.minnid_runtime.health import (
         HealthContext,
         handle_health_report,
@@ -331,12 +330,6 @@ def test_operational_domains_live_in_runtime_modules_and_registry_delegates():
     assert minnid._runtime_mark_candidate_review is mark_candidate_review
     assert minnid._METHODS["daemon.compile"] is minnid._handle_daemon_compile
     assert minnid._METHODS["daemon.endorse"] is minnid._handle_daemon_endorse
-
-    assert isinstance(minnid._ax_context(), AXContext)
-    assert minnid._runtime_handle_ax_snapshot_store is handle_ax_snapshot_store
-    assert minnid._runtime_handle_ax_snapshot_get is handle_ax_snapshot_get
-    assert minnid._METHODS["ax_snapshot_store"] is minnid._handle_ax_snapshot_store
-    assert minnid._METHODS["ax_snapshot_get"] is minnid._handle_ax_snapshot_get
 
     assert isinstance(minnid._vault_index_context(), VaultIndexContext)
     assert minnid._MAX_VAULT_PAGE_CHARS == MAX_VAULT_PAGE_CHARS

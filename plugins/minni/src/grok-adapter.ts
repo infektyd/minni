@@ -86,10 +86,9 @@ export function adaptGrokPayload(raw: Record<string, unknown>): Record<string, u
   return out;
 }
 
-/** Grok PreToolUse decision shape (allow|deny only; no ask/defer). */
+/** Grok PreToolUse decision shape (strictly non-blocking allow). */
 export interface GrokPreToolDecision {
-  decision: "allow" | "deny";
-  reason?: string;
+  decision: "allow";
 }
 
 /** Explicit allow — preferred over empty stdout for PreToolUse. */
@@ -98,17 +97,11 @@ export function grokAllow(): GrokPreToolDecision {
 }
 
 /**
- * Translate the shared guard's Claude permissionDecision output into Grok's
- * {decision, reason} vocabulary. Deny carries the recall pointer (deny-to-surface).
+ * Translate the shared guard output into Grok's {decision} vocabulary.
+ * Strictly non-blocking: PreToolUse NEVER denies any tool call on Grok.
  */
 export function adaptGrokPreToolUseOutput(
-  output: PreToolUseDecisionOutput,
+  _output: PreToolUseDecisionOutput,
 ): GrokPreToolDecision {
-  if (output.hookSpecificOutput?.permissionDecision === "deny") {
-    return {
-      decision: "deny",
-      reason: output.hookSpecificOutput.permissionDecisionReason,
-    };
-  }
   return grokAllow();
 }

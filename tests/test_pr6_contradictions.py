@@ -252,233 +252,181 @@ class TestMigration005:
 
 
 # ---------------------------------------------------------------------------
-# 6.2  detect_contradictions: semantic matching
+# 6.2 & 6.3  Typed Graph Contradiction & Supersession Shortlist (Wave 3)
 # ---------------------------------------------------------------------------
 
-class TestDetectContradictions:
+class TestTypedGraphContradictions:
 
-    def _seed_learning_with_emb(self, db_obj, agent_id, content, embedding: np.ndarray):
-        """Insert a learning row directly with a specific embedding."""
+    def _seed_canonical_learning(
+        self, db_obj, cfg, agent_id, content, *, category="fact", status="active", superseded_by=None
+    ):
+        from minni.graph_commit import ensure_canonical_learning_node
+
         now = time.time()
-        with db_obj.cursor() as c:
-            c.execute("""
+        with db_obj.transaction() as c:
+            c.execute(
+                """
                 INSERT INTO learnings
-                (agent_id, category, content, confidence, embedding, created_at, status)
-                VALUES (?, 'fact', ?, 1.0, ?, ?, 'active')
-            """, (agent_id, content, embedding.astype(np.float32).tobytes(), now))
-            return c.lastrowid
+                (agent_id, category, content, confidence, created_at, status, superseded_by)
+                VALUES (?, ?, ?, 1.0, ?, ?, ?)
+                """,
+                (agent_id, category, content, now, status, superseded_by),
+            )
+            lid = c.lastrowid
+            doc_id = ensure_canonical_learning_node(
+                c,
+                learning_id=lid,
+                agent_id=agent_id,
+                content=content,
+                vault_path=cfg.vault_path,
+                created_at=now,
+                workspace_id="default",
+            )
+            if status in ("superseded", "rejected", "expired") or superseded_by is not None:
+                c.execute(
+                    "UPDATE documents SET page_status = ? WHERE doc_id = ?",
+                    ("superseded" if superseded_by is not None else status, doc_id),
+                )
+        return lid, doc_id
 
-    def test_high_cosine_match_returned(self, tmp_path):
-        """A seeded learning with nearly identical embedding appears in candidates."""
-        from minni.writeback import WriteBackMemory
-        from minni.config import MinniConfig
-        import minni.db as db_mod
+    def test_opposing_polarity_classified_as_contradicts(self, tmp_path, monkeypatch):
+        """Opposing polarity across categories emits a typed `contradicts` edge."""
+        from minni.minnid_runtime.graph_adapters import prepare_governed_promotion
+        from minni.principal import EffectivePrincipal
 
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
         db_obj, cfg = _make_db(tmp_path)
-        cfg = MinniConfig(db_path=cfg.db_path, contradiction_threshold=0.85)
-        wb = WriteBackMemory(db_obj, cfg)
+        self._seed_canonical_learning(
+            db_obj, cfg, "agent1",
+            "Always route internal auth service calls through JWT bearer tokens.",
+            category="fact",
+        )
+        principal = EffectivePrincipal(
+            agent_id="agent1", workspace_id="default", capabilities=["read", "learn"]
+        )
+        plan = prepare_governed_promotion(
+            db_obj,
+            author_agent="agent1",
+            workspace_id="default",
+            caller_principal=principal,
+            content="Never route internal auth service calls through JWT bearer tokens.",
+            category="correction",
+            vault_path=cfg.vault_path,
+        )
+        assert plan.fallback_edges is not None
+        validated, _info, _snaps = plan.fallback_edges
+        assert len(validated) == 1
+        _desc, label, _dir, conf = validated[0]
+        assert label == "contradicts"
+        assert conf >= 0.88
 
-        base_emb = _fixed_embedding("The auth system uses JWT tokens")
-        close_emb = _nearly_identical_embedding(base_emb, noise=0.005)
-        self._seed_learning_with_emb(db_obj, "agent1", "The auth system uses JWT tokens", base_emb)
+    def test_unrelated_topic_emits_no_edges(self, tmp_path, monkeypatch):
+        """Unrelated learnings emit zero typed graph edges."""
+        from minni.minnid_runtime.graph_adapters import prepare_governed_promotion
+        from minni.principal import EffectivePrincipal
 
-        # Patch the model to return a deterministic near-identical embedding
-        class _FakeModel:
-            def encode(self, text, **kwargs):
-                return close_emb
-
-        wb._model = _FakeModel()
-        # Override the property by monkeypatching
-        import types
-        original_model_prop = WriteBackMemory.model.fget
-        WriteBackMemory.model = property(lambda self: self._model)
-        try:
-            candidates = wb.detect_contradictions("The auth system uses JWT tokens")
-        finally:
-            WriteBackMemory.model = property(original_model_prop)
-
-        assert len(candidates) >= 1
-        assert candidates[0]["score"] > 0.85
-        assert "JWT" in candidates[0]["content"]
-
-    def test_low_cosine_match_excluded(self, tmp_path):
-        """A seeded learning with orthogonal embedding is NOT returned."""
-        from minni.writeback import WriteBackMemory
-        from minni.config import MinniConfig
-
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
         db_obj, cfg = _make_db(tmp_path)
-        cfg = MinniConfig(db_path=cfg.db_path, contradiction_threshold=0.85)
-        wb = WriteBackMemory(db_obj, cfg)
+        self._seed_canonical_learning(
+            db_obj, cfg, "agent1",
+            "PostgreSQL connection pools default to 20 workers on macOS.",
+            category="fact",
+        )
+        principal = EffectivePrincipal(
+            agent_id="agent1", workspace_id="default", capabilities=["read", "learn"]
+        )
+        plan = prepare_governed_promotion(
+            db_obj,
+            author_agent="agent1",
+            workspace_id="default",
+            caller_principal=principal,
+            content="SwiftUI preview rendering requires Xcode 27 headless simulator.",
+            category="fact",
+            vault_path=cfg.vault_path,
+        )
+        assert plan.fallback_edges is None
 
-        base_emb = _fixed_embedding("Completely unrelated topic A")
-        orth_emb = _orthogonal_embedding(base_emb)
-        self._seed_learning_with_emb(db_obj, "agent1", "Completely unrelated topic A", orth_emb)
+    def test_superseded_learnings_excluded(self, tmp_path, monkeypatch):
+        """Learnings with superseded_by IS NOT NULL are excluded from graph shortlist."""
+        from minni.minnid_runtime.graph_adapters import prepare_governed_promotion
+        from minni.principal import EffectivePrincipal
 
-        query_emb = base_emb  # orthogonal to orth_emb
-
-        class _FakeModel:
-            def encode(self, text, **kwargs):
-                return query_emb
-
-        wb._model = _FakeModel()
-        import types
-        WriteBackMemory.model = property(lambda self: self._model)
-        try:
-            candidates = wb.detect_contradictions("Some query")
-        finally:
-            from minni.models import get_embedder as _ge
-            WriteBackMemory.model = property(lambda self: _ge())
-
-        assert candidates == []
-
-    def test_superseded_learnings_excluded(self, tmp_path):
-        """Learnings with superseded_by IS NOT NULL are excluded from detection."""
-        from minni.writeback import WriteBackMemory
-
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
         db_obj, cfg = _make_db(tmp_path)
-        wb = WriteBackMemory(db_obj, cfg)
+        new_lid, _ = self._seed_canonical_learning(
+            db_obj, cfg, "agent1", "Current active replacement rule for deployments.", category="fact"
+        )
+        self._seed_canonical_learning(
+            db_obj, cfg, "agent1",
+            "Always route internal auth service calls through JWT bearer tokens.",
+            category="fact",
+            superseded_by=new_lid,
+        )
+        principal = EffectivePrincipal(
+            agent_id="agent1", workspace_id="default", capabilities=["read", "learn"]
+        )
+        plan = prepare_governed_promotion(
+            db_obj,
+            author_agent="agent1",
+            workspace_id="default",
+            caller_principal=principal,
+            content="Never route internal auth service calls through JWT bearer tokens.",
+            category="correction",
+            vault_path=cfg.vault_path,
+        )
+        assert plan.fallback_edges is None
 
-        base_emb = _fixed_embedding("auth uses JWT")
-        now = time.time()
-        with db_obj.cursor() as c:
-            # Insert the "new" learning first so the FK reference is valid
-            c.execute("""
-                INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
-                VALUES ('agent1', 'fact', 'new learning', 1.0, ?, 'active')
-            """, (now,))
-            new_id = c.lastrowid
-            # Now insert the "superseded" learning referencing it
-            c.execute("""
-                INSERT INTO learnings
-                (agent_id, category, content, confidence, embedding, created_at, superseded_by)
-                VALUES ('agent1', 'fact', 'auth uses JWT', 1.0, ?, ?, ?)
-            """, (base_emb.tobytes(), now, new_id))
-
-        class _FakeModel:
-            def encode(self, text, **kwargs):
-                return _nearly_identical_embedding(base_emb, noise=0.001)
-
-        wb._model = _FakeModel()
-        WriteBackMemory.model = property(lambda self: self._model)
-        try:
-            candidates = wb.detect_contradictions("auth uses JWT")
-        finally:
-            from minni.models import get_embedder as _ge
-            WriteBackMemory.model = property(lambda self: _ge())
-
-        assert candidates == [], "Superseded learnings should not appear as candidates"
-
-    def test_status_superseded_excluded(self, tmp_path):
+    def test_status_superseded_excluded(self, tmp_path, monkeypatch):
         """Learnings with status='superseded' are excluded even if superseded_by IS NULL."""
-        from minni.writeback import WriteBackMemory
+        from minni.minnid_runtime.graph_adapters import prepare_governed_promotion
+        from minni.principal import EffectivePrincipal
 
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
         db_obj, cfg = _make_db(tmp_path)
-        wb = WriteBackMemory(db_obj, cfg)
+        self._seed_canonical_learning(
+            db_obj, cfg, "agent1",
+            "Always route internal auth service calls through JWT bearer tokens.",
+            category="fact",
+            status="superseded",
+        )
+        principal = EffectivePrincipal(
+            agent_id="agent1", workspace_id="default", capabilities=["read", "learn"]
+        )
+        plan = prepare_governed_promotion(
+            db_obj,
+            author_agent="agent1",
+            workspace_id="default",
+            caller_principal=principal,
+            content="Never route internal auth service calls through JWT bearer tokens.",
+            category="correction",
+            vault_path=cfg.vault_path,
+        )
+        assert plan.fallback_edges is None
 
-        base_emb = _fixed_embedding("auth jwt")
-        now = time.time()
-        with db_obj.cursor() as c:
-            c.execute("""
-                INSERT INTO learnings
-                (agent_id, category, content, confidence, embedding, created_at, status)
-                VALUES ('agent1', 'fact', 'auth jwt', 1.0, ?, ?, 'superseded')
-            """, (base_emb.tobytes(), now))
 
-        class _FakeModel:
-            def encode(self, text, **kwargs):
-                return _nearly_identical_embedding(base_emb, noise=0.001)
+class TestTypedGraphGraceful:
 
-        wb._model = _FakeModel()
-        WriteBackMemory.model = property(lambda self: self._model)
-        try:
-            candidates = wb.detect_contradictions("auth jwt")
-        finally:
-            from minni.models import get_embedder as _ge
-            WriteBackMemory.model = property(lambda self: _ge())
+    def test_graceful_when_afm_disabled_and_embedder_none(self, tmp_path, monkeypatch):
+        """Typed graph preparation degrades cleanly without blocking when AFM and embedder are disabled."""
+        from minni.minnid_runtime.graph_adapters import prepare_governed_promotion
+        from minni.principal import EffectivePrincipal
 
-        assert candidates == []
-
-    def test_candidates_sorted_by_score_descending(self, tmp_path):
-        """Candidates list is sorted by score descending."""
-        from minni.writeback import WriteBackMemory
-        from minni.config import MinniConfig
-
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
         db_obj, cfg = _make_db(tmp_path)
-        cfg = MinniConfig(db_path=cfg.db_path, contradiction_threshold=0.50)
-        wb = WriteBackMemory(db_obj, cfg)
-
-        emb_a = _fixed_embedding("topic A")
-        emb_b = _nearly_identical_embedding(emb_a, noise=0.02)  # slightly different
-
-        now = time.time()
-        with db_obj.cursor() as c:
-            c.execute("""
-                INSERT INTO learnings (agent_id, category, content, confidence, embedding, created_at, status)
-                VALUES ('a', 'fact', 'topic A exact', 1.0, ?, ?, 'active')
-            """, (emb_a.tobytes(), now))
-            c.execute("""
-                INSERT INTO learnings (agent_id, category, content, confidence, embedding, created_at, status)
-                VALUES ('a', 'fact', 'topic A variant', 1.0, ?, ?, 'active')
-            """, (emb_b.tobytes(), now))
-
-        class _FakeModel:
-            def encode(self, text, **kwargs):
-                return emb_a  # identical to emb_a → sim=1.0
-
-        wb._model = _FakeModel()
-        WriteBackMemory.model = property(lambda self: self._model)
-        try:
-            candidates = wb.detect_contradictions("topic A exact", threshold=0.50)
-        finally:
-            from minni.models import get_embedder as _ge
-            WriteBackMemory.model = property(lambda self: _ge())
-
-        if len(candidates) >= 2:
-            assert candidates[0]["score"] >= candidates[1]["score"]
-
-
-# ---------------------------------------------------------------------------
-# 6.3  detect_contradictions: graceful failure
-# ---------------------------------------------------------------------------
-
-class TestDetectContradictionsGraceful:
-
-    def test_returns_empty_when_model_none(self, tmp_path):
-        """detect_contradictions returns [] when model is None."""
-        from minni.writeback import WriteBackMemory
-
-        db_obj, cfg = _make_db(tmp_path)
-        wb = WriteBackMemory(db_obj, cfg)
-
-        WriteBackMemory.model = property(lambda self: None)
-        try:
-            result = wb.detect_contradictions("anything")
-        finally:
-            from minni.models import get_embedder as _ge
-            WriteBackMemory.model = property(lambda self: _ge())
-
-        assert result == []
-
-    def test_returns_empty_when_encode_raises(self, tmp_path):
-        """detect_contradictions returns [] when embedding raises an exception."""
-        from minni.writeback import WriteBackMemory
-
-        db_obj, cfg = _make_db(tmp_path)
-        wb = WriteBackMemory(db_obj, cfg)
-
-        class _BrokenModel:
-            def encode(self, text, **kwargs):
-                raise RuntimeError("GPU exploded")
-
-        wb._model = _BrokenModel()
-        WriteBackMemory.model = property(lambda self: self._model)
-        try:
-            result = wb.detect_contradictions("anything")
-        finally:
-            from minni.models import get_embedder as _ge
-            WriteBackMemory.model = property(lambda self: _ge())
-
-        assert result == []
+        principal = EffectivePrincipal(
+            agent_id="agent1", workspace_id="default", capabilities=["read", "learn"]
+        )
+        plan = prepare_governed_promotion(
+            db_obj,
+            author_agent="agent1",
+            workspace_id="default",
+            caller_principal=principal,
+            content="Standalone durable rule with no prior graph nodes.",
+            category="fact",
+            vault_path=cfg.vault_path,
+        )
+        assert plan.adapter is None
+        assert plan.fallback_edges is None
 
 
 # ---------------------------------------------------------------------------
@@ -540,90 +488,68 @@ class TestHandleLearn:
         assert "error" in resp
         assert resp["error"]["code"] == -32602
 
-    def test_learn_force_false_blocked_on_contradiction(self, tmp_path, monkeypatch):
-        """learn(force=False) returns {status: contradiction} when a match exists.
-
-        R5: contradiction detection on learn is now scoped to the CALLER's own
-        agent (a global scan leaked other agents' content on the learn probe),
-        so the seeded contradiction is owned by the same agent as the learn
-        call ('test').
-        """
+    def test_learn_force_false_stages_proposal_without_legacy_cosine_block(self, tmp_path, monkeypatch):
+        """Wave 3: learn(force=False) stages a candidate packet directly without
+        spawning legacy_unclassified cosine contradiction_log rows."""
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
 
         base_emb = _fixed_embedding("The auth system uses JWT tokens")
-
-        # Seed an existing learning with that embedding, owned by the SAME agent
-        # ('test') that the learn call below is stamped as (R5 same-agent scope).
         now = time.time()
         with db_obj.cursor() as c:
-            c.execute("""
+            c.execute(
+                """
                 INSERT INTO learnings (agent_id, category, content, confidence,
                                        embedding, created_at, status)
                 VALUES ('test', 'fact', 'The auth system uses JWT tokens', 1.0, ?, ?, 'active')
-            """, (base_emb.tobytes(), now))
+                """,
+                (base_emb.tobytes(), now),
+            )
 
-        # Patch model to return a near-identical embedding
-        close_emb = _nearly_identical_embedding(base_emb, noise=0.001)
-
-        import minni.writeback as wb_mod
-        class _FakeModel:
-            def encode(self, text, **kwargs):
-                return close_emb
-        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
-        try:
-            resp = self._dispatch("learn", {
+        resp = self._dispatch(
+            "learn",
+            {
                 "content": "The auth system uses session cookies, not JWT",
                 "agent_id": "test",
-                # force defaults to False
-            })
-        finally:
-            from minni.models import get_embedder as _ge
-            wb_mod.WriteBackMemory.model = property(lambda self: _ge())
-
+            },
+        )
         assert "error" not in resp, f"Unexpected error: {resp}"
         result = resp["result"]
-        assert result["status"] == "contradiction"
-        assert "candidates" in result
-        assert len(result["candidates"]) >= 1
+        assert result["status"] == "proposed"
+        with db_obj.cursor() as c:
+            legacy_rows = c.execute(
+                "SELECT COUNT(*) FROM contradiction_log WHERE detection_method = 'cosine'"
+            ).fetchone()[0]
+        assert legacy_rows == 0
 
     def test_learn_does_not_leak_cross_agent_contradictions(self, tmp_path, monkeypatch):
-        """R5: a learn(force=False) probe must NOT surface another agent's
-        durable learning. A near-identical assertion owned by 'agent1' must be
-        invisible to a caller stamped as 'test' — otherwise crafted assertions
-        exfiltrate cross-agent content/agent_id via the contradiction candidates.
-        """
+        """R5: a learn(force=False) call owned by 'test' never leaks another
+        agent's ('agent1') durable learning content."""
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
 
         base_emb = _fixed_embedding("The auth system uses JWT tokens")
         now = time.time()
         with db_obj.cursor() as c:
-            c.execute("""
+            c.execute(
+                """
                 INSERT INTO learnings (agent_id, category, content, confidence,
                                        embedding, created_at, status)
                 VALUES ('agent1', 'fact', 'The auth system uses JWT tokens', 1.0, ?, ?, 'active')
-            """, (base_emb.tobytes(), now))
+                """,
+                (base_emb.tobytes(), now),
+            )
 
-        close_emb = _nearly_identical_embedding(base_emb, noise=0.001)
-
-        import minni.writeback as wb_mod
-        class _FakeModel:
-            def encode(self, text, **kwargs):
-                return close_emb
-        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
-        try:
-            resp = self._dispatch("learn", {
+        resp = self._dispatch(
+            "learn",
+            {
                 "content": "The auth system uses session cookies, not JWT",
                 "agent_id": "test",
-            })
-        finally:
-            from minni.models import get_embedder as _ge
-            wb_mod.WriteBackMemory.model = property(lambda self: _ge())
-
+            },
+        )
         assert "error" not in resp, f"Unexpected error: {resp}"
         result = resp["result"]
-        # No cross-agent contradiction leaked: the probe is staged as a
-        # candidate (or written), NOT returned with agent1's content.
-        assert result["status"] != "contradiction", result
+        assert result["status"] == "proposed", result
         assert "agent1" not in json.dumps(result)
 
     def test_learn_force_true_writes_through(self, tmp_path, monkeypatch):
@@ -1200,67 +1126,73 @@ class TestFullWorkflow:
 
     def test_seed_detect_resolve(self, tmp_path, monkeypatch):
         """
+        Wave 3 typed graph contradiction & resolution workflow:
         1. Seed a learning with force=True.
-        2. A contradicting learn() is blocked.
-        3. resolve_contradiction() writes new + supersedes old.
+        2. Store an opposing-polarity learning with force=True -> typed
+           `contradicts` edge in memory_links + unresolved row in contradiction_log.
+        3. resolve_contradiction() writes the resolution + supersedes old.
         """
-        wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
-
-        jwt_emb = _fixed_embedding("The auth system uses JWT tokens")
-        cookie_emb = _nearly_identical_embedding(jwt_emb, noise=0.001)
-
+        import minni.minnid as minnid
         import minni.writeback as wb_mod
-        call_count = [0]
 
-        class _SeqModel:
-            """Returns jwt_emb for the first call, cookie_emb for subsequent calls."""
-            def encode(self, text, **kwargs):
-                call_count[0] += 1
-                if call_count[0] == 1:
-                    return jwt_emb
-                return cookie_emb
+        wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+        monkeypatch.setattr(minnid, "MinniDB", lambda *a, **k: db_obj)
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
+        monkeypatch.setattr(wb_mod.WriteBackMemory, "model", property(lambda self: None))
 
-        wb_mod.WriteBackMemory.model = property(lambda self: _SeqModel())
-        try:
-            # Step 1: seed with force=True
-            resp1 = self._dispatch("learn", {
-                "content": "The auth system uses JWT tokens",
+        resp1 = self._dispatch(
+            "learn",
+            {
+                "content": "Always authenticate internal API calls with JWT bearer tokens.",
                 "agent_id": "test",
+                "category": "fact",
                 "force": True,
-            })
-            assert resp1["result"]["status"] == "ok", resp1
-            seed_id = resp1["result"]["learning_id"]
+            },
+        )
+        assert resp1["result"]["status"] == "ok", resp1
+        seed_id = resp1["result"]["learning_id"]
 
-            # Step 2: contradicting learn is blocked
-            resp2 = self._dispatch("learn", {
-                "content": "The auth system uses session cookies, not JWT",
+        resp2 = self._dispatch(
+            "learn",
+            {
+                "content": "Never authenticate internal API calls with JWT bearer tokens.",
                 "agent_id": "test",
-            })
-            assert resp2["result"]["status"] == "contradiction", resp2
-            assert len(resp2["result"]["candidates"]) >= 1
-            candidate_id = resp2["result"]["candidates"][0]["id"]
+                "category": "correction",
+                "force": True,
+            },
+        )
+        assert resp2["result"]["status"] == "ok", resp2
 
-            # Step 3: resolve
-            resp3 = self._dispatch("resolve_contradiction", {
-                "new_content": "The auth system migrated from JWT to session cookies in April 2026",
-                "supersede_ids": [candidate_id],
+        with db_obj.cursor() as c:
+            edges = c.execute(
+                "SELECT link_type FROM memory_links WHERE link_type = 'contradicts'"
+            ).fetchall()
+            logs = c.execute(
+                "SELECT detection_method, resolution_status FROM contradiction_log"
+            ).fetchall()
+        assert len(edges) >= 1
+        assert len(logs) == 1
+        assert logs[0]["detection_method"] == "graph_classifier"
+        assert logs[0]["resolution_status"] == "unresolved"
+
+        resp3 = self._dispatch(
+            "resolve_contradiction",
+            {
+                "new_content": "Internal API calls migrated from JWT to session cookies in April 2026.",
+                "supersede_ids": [seed_id],
                 "agent_id": "test",
-            })
-            assert resp3["result"]["status"] == "ok", resp3
-            assert candidate_id in resp3["result"]["superseded"]
+            },
+        )
+        assert resp3["result"]["status"] == "ok", resp3
+        assert seed_id in resp3["result"]["superseded"]
 
-            # Verify old learning is superseded
-            with db_obj.cursor() as c:
-                row = c.execute(
-                    "SELECT status, superseded_by FROM learnings WHERE learning_id = ?",
-                    (candidate_id,)
-                ).fetchone()
-            assert row["status"] == "superseded"
-            assert row["superseded_by"] == resp3["result"]["new_learning_id"]
-
-        finally:
-            from minni.models import get_embedder as _ge
-            wb_mod.WriteBackMemory.model = property(lambda self: _ge())
+        with db_obj.cursor() as c:
+            row = c.execute(
+                "SELECT status, superseded_by FROM learnings WHERE learning_id = ?",
+                (seed_id,),
+            ).fetchone()
+        assert row["status"] == "superseded"
+        assert row["superseded_by"] == resp3["result"]["new_learning_id"]
 
     def test_backward_compat_regression(self, tmp_path, monkeypatch):
         """
@@ -1289,136 +1221,97 @@ class TestFullWorkflow:
             wb_mod.WriteBackMemory.model = property(lambda self: _ge())
 
     def test_contradiction_log_rows_written_g18(self, tmp_path, monkeypatch):
-        """G18: detect_contradictions writes rows to contradiction_log (wired in writeback)."""
-        from minni.writeback import WriteBackMemory
+        """G18 + Wave 3: typed graph contradiction commits write unresolved graph_classifier rows."""
+        import minni.minnid as minnid
         import minni.writeback as wb_mod
 
-        db_obj, cfg = _make_db(tmp_path)
-        wb = WriteBackMemory(db_obj, cfg)
+        wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+        monkeypatch.setattr(minnid, "MinniDB", lambda *a, **k: db_obj)
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
+        monkeypatch.setattr(wb_mod.WriteBackMemory, "model", property(lambda self: None))
 
-        base_emb = _fixed_embedding("JWT tokens are used for auth")
-        now = time.time()
-        with db_obj.cursor() as c:
-            c.execute(
-                """
-                INSERT INTO learnings
-                (agent_id, category, content, confidence, embedding, created_at, status)
-                VALUES ('a1', 'fact', 'JWT tokens are used for auth in the API layer', 1.0, ?, ?, 'active')
-                """,
-                (base_emb.astype(np.float32).tobytes(), now),
-            )
-            seeded_id = c.lastrowid
+        r1 = self._dispatch(
+            "learn",
+            {
+                "content": "Always enable WAL synchronous NORMAL on SQLite stores.",
+                "agent_id": "main",
+                "category": "fact",
+                "force": True,
+            },
+        )
+        assert r1["result"]["status"] == "ok", r1
+        r2 = self._dispatch(
+            "learn",
+            {
+                "content": "Never enable WAL synchronous NORMAL on SQLite stores.",
+                "agent_id": "main",
+                "category": "correction",
+                "force": True,
+            },
+        )
+        assert r2["result"]["status"] == "ok", r2
+        new_lid = r2["result"]["learning_id"]
 
-        class _FakeModel:
-            def encode(self, _text, **kwargs):
-                return _nearly_identical_embedding(base_emb, noise=0.001)
-
-        original_model_prop = wb_mod.WriteBackMemory.model.fget
-        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
-        try:
-            cands = wb.detect_contradictions("JWT tokens are used for auth")
-        finally:
-            wb_mod.WriteBackMemory.model = property(original_model_prop)
-
-        assert [cand["id"] for cand in cands] == [seeded_id]
         with db_obj.cursor() as c:
             rows = c.execute(
                 """
-                SELECT memory_a_id, detected_at, detection_method, resolution_id
+                SELECT memory_a_id, detected_at, detection_method, resolution_status
                 FROM contradiction_log
                 WHERE memory_a_id = ?
                 """,
-                (seeded_id,),
+                (new_lid,),
             ).fetchall()
             assert len(rows) == 1
             assert rows[0]["detected_at"] is not None
-            assert rows[0]["detection_method"] == "cosine"
-            assert rows[0]["resolution_id"] is None
+            assert rows[0]["detection_method"] == "graph_classifier"
+            assert rows[0]["resolution_status"] == "unresolved"
 
 
 class TestContradictionLogResolutionStatusShapes:
-    """Audit rows must persist with and without the 021 resolution_status column."""
+    """Typed graph contradiction rows stamp graph_classifier + unresolved (never legacy_unclassified)."""
 
-    def _seed_learning(self, db_obj, content):
-        emb = _fixed_embedding(content)
-        with db_obj.cursor() as c:
-            c.execute(
-                """INSERT INTO learnings
-                   (agent_id, category, content, confidence, embedding, created_at, status)
-                   VALUES ('agent1', 'fact', ?, 1.0, ?, ?, 'active')""",
-                (content, emb.astype(np.float32).tobytes(), time.time()),
-            )
-            return c.lastrowid, emb
-
-    def _detect(self, tmp_path, content):
+    def test_typed_graph_contradiction_never_emits_legacy_unclassified(self, tmp_path, monkeypatch):
+        import minni.minnid as minnid
         import minni.writeback as wb_mod
+        from minni.writeback import WriteBackMemory
 
+        monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "disabled")
         db_obj, cfg = _make_db(tmp_path)
-        seeded_id, base_emb = self._seed_learning(db_obj, content)
-        wb = wb_mod.WriteBackMemory(db_obj, cfg)
+        wb = WriteBackMemory(db_obj, cfg)
+        monkeypatch.setattr(minnid, "_writeback", wb)
+        monkeypatch.setattr(minnid, "MinniDB", lambda *a, **k: db_obj)
+        monkeypatch.setattr(wb_mod.WriteBackMemory, "model", property(lambda self: None))
 
-        close_emb = _nearly_identical_embedding(base_emb, noise=0.001)
-
-        class _FakeModel:
-            def encode(self, _text, **kwargs):
-                return close_emb
-
-        original_model_prop = wb_mod.WriteBackMemory.model.fget
-        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
-        try:
-            candidates = wb.detect_contradictions(content)
-        finally:
-            wb_mod.WriteBackMemory.model = property(original_model_prop)
-        assert [cand["id"] for cand in candidates] == [seeded_id]
-        return db_obj, seeded_id
-
-    def test_audit_row_written_without_resolution_status_column(self, tmp_path):
-        """Baseline 009 shape: legacy insert must record the audit row."""
-        import minni.writeback as wb_mod
-
-        db_obj, cfg = _make_db(tmp_path)
-        with db_obj.cursor() as c:
-            # Reconstruct the true 009 shape: 021's index references the
-            # column, so drop the dependent index before dropping the column.
-            c.execute("DROP INDEX IF EXISTS idx_contradiction_graph_pair")
-            c.execute("ALTER TABLE contradiction_log DROP COLUMN resolution_status")
-            cols = {row[1] for row in c.execute("PRAGMA table_info(contradiction_log)").fetchall()}
-            assert "resolution_status" not in cols
-
-        content = "The auth system uses JWT tokens"
-        seeded_id, base_emb = self._seed_learning(db_obj, content)
-        wb = wb_mod.WriteBackMemory(db_obj, cfg)
-
-        close_emb = _nearly_identical_embedding(base_emb, noise=0.001)
-
-        class _FakeModel:
-            def encode(self, _text, **kwargs):
-                return close_emb
-
-        original_model_prop = wb_mod.WriteBackMemory.model.fget
-        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
-        try:
-            candidates = wb.detect_contradictions(content)
-        finally:
-            wb_mod.WriteBackMemory.model = property(original_model_prop)
-
-        assert [cand["id"] for cand in candidates] == [seeded_id]
+        minnid._dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "learn",
+                "params": {
+                    "content": "Always retry transient RPC timeouts up to 3 times.",
+                    "agent_id": "main",
+                    "category": "fact",
+                    "force": True,
+                },
+            }
+        )
+        minnid._dispatch_sync(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "learn",
+                "params": {
+                    "content": "Never retry transient RPC timeouts up to 3 times.",
+                    "agent_id": "main",
+                    "category": "correction",
+                    "force": True,
+                },
+            }
+        )
         with db_obj.cursor() as c:
             rows = c.execute(
-                "SELECT memory_a_id, detection_method FROM contradiction_log WHERE memory_a_id = ?",
-                (seeded_id,),
+                "SELECT detection_method, resolution_status FROM contradiction_log"
             ).fetchall()
-            assert len(rows) == 1
-            assert rows[0]["detection_method"] == "cosine"
-
-    def test_audit_row_marked_legacy_unclassified_with_typed_schema(self, tmp_path):
-        """Migrated 021 shape: audit row keeps legacy_unclassified status."""
-        content = "The auth system uses JWT tokens"
-        db_obj, seeded_id = self._detect(tmp_path, content)
-        with db_obj.cursor() as c:
-            rows = c.execute(
-                "SELECT resolution_status FROM contradiction_log WHERE memory_a_id = ?",
-                (seeded_id,),
-            ).fetchall()
-            assert len(rows) == 1
-            assert rows[0]["resolution_status"] == "legacy_unclassified"
+        assert len(rows) == 1
+        assert rows[0]["detection_method"] == "graph_classifier"
+        assert rows[0]["resolution_status"] == "unresolved"

@@ -1824,13 +1824,21 @@ export function compactPlanView(plan: PlanArtifact): {
 } {
   const pending = plan.slices
     .filter((s) => s.status === "pending" || s.status === "in_progress")
-    .map((s) => ({ id: s.id, title: s.title, status: s.status }));
+    .slice(0, 8)
+    .map((s) => ({
+      id: s.id,
+      title: s.title.length <= 80 ? s.title : `${s.title.slice(0, 77)}...`,
+      status: s.status,
+    }));
   const shelf = plan.shelf_ref
     ? `${plan.shelf_ref.agent} ${plan.shelf_ref.wikilink} (${plan.shelf_ref.pull_hint})`
     : undefined;
   const scars = (plan.scar_tissue ?? [])
     .slice(-3)
-    .map((s) => `${s.kind}: ${s.signal}`);
+    .map((s) => {
+      const raw = `${s.kind}: ${s.signal}`;
+      return raw.length <= 160 ? raw : `${raw.slice(0, 157)}...`;
+    });
 
   // P3 (progress salience): make plan-level progress the headline so closing one slice is
   // never misread as closing the whole plan. A done/superseded slice counts as resolved.
@@ -1849,13 +1857,23 @@ export function compactPlanView(plan: PlanArtifact): {
       `NEXT: ${activeSlice ? activeSlice.id : plan.next_action}. ` +
       `The plan is NOT complete until all ${total} slices are done — do not stop after one slice.`;
 
+  const boundedGoal =
+    plan.goal.length <= 200 ? plan.goal : `${plan.goal.slice(0, 197)}...`;
+  const boundedNextAction =
+    plan.next_action.length <= 200
+      ? plan.next_action
+      : `${plan.next_action.slice(0, 197)}...`;
+  const boundedOpenQuestions = (plan.open_questions ?? [])
+    .slice(0, 5)
+    .map((q) => (q.length <= 120 ? q : `${q.slice(0, 117)}...`));
+
   return {
     headline,
     progress: { done, total, remaining, complete },
-    goal: plan.goal,
-    next_action: plan.next_action,
+    goal: boundedGoal,
+    next_action: boundedNextAction,
     pending,
-    open_questions: plan.open_questions,
+    open_questions: boundedOpenQuestions,
     scar_tissue: plan.scar_tissue.length,
     scars,
     shelf,

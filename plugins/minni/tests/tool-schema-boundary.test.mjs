@@ -48,14 +48,28 @@ function extractInputSchemas(source) {
   }
 }
 
-test("model-facing MCP input schemas do not expose local path authority", async () => {
+test("model-facing MCP input schemas expose exact 12 v1 tools and no local path authority", async () => {
   const source = stripLineComments(
     await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
   );
   const schemas = extractInputSchemas(source);
-  // Task 6 added 5 tools (minni_thread_ready/assign/claim/worker_update/events).
-  // minni_list_candidates is the host drain pair with minni_resolve_candidate.
-  assert.equal(schemas.length, 43, "expected one schema per registered MCP tool");
+  assert.equal(schemas.length, 12, "expected exact 12 schemas for the v1 MCP tool surface");
+
+  const toolNames = [...source.matchAll(/server\.registerTool\(\s*"([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(toolNames, [
+    "minni_recall",
+    "minni_drill",
+    "minni_learn",
+    "minni_list_candidates",
+    "minni_resolve_candidate",
+    "minni_status",
+    "minni_handoff_send",
+    "minni_handoff_inbox",
+    "minni_thread_create",
+    "minni_thread_status",
+    "minni_thread_update",
+    "minni_thread_scar",
+  ]);
 
   const forbiddenFields = [
     "vaultPath",
@@ -71,6 +85,63 @@ test("model-facing MCP input schemas do not expose local path authority", async 
         new RegExp(`\\b${field}\\s*:`),
         `model-facing inputSchema exposes forbidden path field ${field}`,
       );
+    }
+  }
+});
+
+test("minni_handoff_send and minni_handoff_inbox schemas enforce server caller principal and 1-step handoff fields", async () => {
+  const source = stripLineComments(
+    await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
+  );
+
+  for (const [toolName, expectedFields, forbiddenIdentityFields] of [
+    [
+      "minni_handoff_send",
+      ["to_agent", "task", "summary", "files", "next_steps", "open_questions", "workspace_id"],
+      ["from_agent", "agent_id", "agentId"],
+    ],
+    [
+      "minni_handoff_inbox",
+      ["ack", "lease_id", "status", "note"],
+      ["from_agent", "to_agent", "agent_id", "agentId"],
+    ],
+  ]) {
+    const start = source.indexOf(`"${toolName}"`);
+    assert.notEqual(start, -1, `${toolName} registration not found`);
+    const nextTool = source.indexOf("server.registerTool(", start + 1);
+    const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+    const schema = block.slice(block.indexOf("inputSchema:"), block.indexOf("async"));
+    for (const f of expectedFields) {
+      assert.match(schema, new RegExp(`\\b${f}\\s*:`), `${toolName} must expose ${f}`);
+    }
+    for (const bad of forbiddenIdentityFields) {
+      assert.doesNotMatch(schema, new RegExp(`\\b${bad}\\s*:`), `${toolName} must not expose ${bad}`);
+    }
+  }
+});
+
+test("4 compact thread tools expose v1 schema boundaries (activate on update, optional slice_id on scar)", async () => {
+  const source = stripLineComments(
+    await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
+  );
+  for (const toolName of [
+    "minni_thread_create",
+    "minni_thread_status",
+    "minni_thread_update",
+    "minni_thread_scar",
+  ]) {
+    const start = source.indexOf(`"${toolName}"`);
+    assert.notEqual(start, -1, `${toolName} registration not found`);
+    const nextTool = source.indexOf("server.registerTool(", start + 1);
+    const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+    const schema = block.slice(block.indexOf("inputSchema:"), block.indexOf("async"));
+    assert.doesNotMatch(schema, /\b(?:vaultPath|vault_path|notePath|note_path)\s*:/);
+    if (toolName === "minni_thread_update") {
+      assert.match(schema, /\bactivate\s*:\s*z\.boolean\(\)\.optional\(\)/);
+      assert.match(schema, /\bcompact\s*:\s*z\.boolean\(\)\.optional\(\)/);
+    }
+    if (toolName === "minni_thread_scar") {
+      assert.match(schema, /\bslice_id\s*:[\s\S]*?\.optional\(\)/);
     }
   }
 });

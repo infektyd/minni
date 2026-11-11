@@ -23,7 +23,7 @@ def test_sovereign_config_graph_defaults(monkeypatch):
 
     cfg = MinniConfig()
     assert cfg.graph_classification_enabled is True
-    assert cfg.graph_expansion_enabled is False
+    assert cfg.graph_expansion_enabled is True
 
 
 def test_sovereign_config_graph_decoupling_via_constructor():

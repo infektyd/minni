@@ -34,7 +34,6 @@ def _write_verified_payload(root: Path, *, version: str, git_sha: str, server_bo
 
     root.mkdir(parents=True, exist_ok=True)
     for sub in (
-        "frontend",
         "hooks",
         "commands",
         "skills",

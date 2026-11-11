@@ -244,6 +244,16 @@ async function exists(filePath: string): Promise<boolean> {
 }
 
 function sectionPath(section: VaultSection, title: string): string {
+  const secStr = String(section ?? "").trim();
+  if (
+    !secStr ||
+    secStr.toLowerCase() === "maps" ||
+    secStr.includes("..") ||
+    secStr.includes("/") ||
+    secStr.includes("\\")
+  ) {
+    throw new Error(`Invalid or reserved vault section: ${secStr}`);
+  }
   const slug = slugify(title);
   if (section === "raw") return path.join("raw", `${compactDate()}-${slug}.md`);
   if (section === "sessions")
@@ -2445,7 +2455,12 @@ export async function writeVaultPage(
   await mkdir(path.dirname(notePath), { recursive: true });
 
   // PR-2: Build structured frontmatter with lifecycle fields
-  const pageType = inferPageType(input.section, input.type);
+  const rawRequestedType = typeof input.type === "string" ? input.type : undefined;
+  const safeInputType =
+    rawRequestedType && rawRequestedType.toLowerCase() === "repo_map"
+      ? undefined
+      : input.type;
+  const pageType = inferPageType(input.section, safeInputType);
   const pageStatus: PageStatus = input.status ?? "candidate";
   const privacyLevel: PrivacyLevel = input.privacy ?? "safe";
 
@@ -2453,6 +2468,16 @@ export async function writeVaultPage(
     input.sources && input.sources.length > 0
       ? `[${input.sources.join(", ")}]`
       : undefined;
+
+  const safeExtraFrontmatter = input.frontmatter ? { ...input.frontmatter } : undefined;
+  if (safeExtraFrontmatter) {
+    for (const k of ["page_type", "type"]) {
+      const v = safeExtraFrontmatter[k];
+      if (typeof v === "string" && v.trim().toLowerCase() === "repo_map") {
+        delete safeExtraFrontmatter[k];
+      }
+    }
+  }
 
   const fm = frontmatter({
     title: input.title,
@@ -2466,7 +2491,7 @@ export async function writeVaultPage(
     immutable: input.section === "raw" ? true : undefined,
     superseded_by: input.supersededBy,
     expires: input.expires,
-    ...input.frontmatter,
+    ...safeExtraFrontmatter,
   });
   const body = `${fm}\n# ${input.title}\n\n${input.content.trim()}\n`;
   // #293 (June audit N6): the plan note this function writes for a plan's
@@ -2488,6 +2513,62 @@ export async function writeVaultPage(
   });
 
   return { notePath, relativePath, wikilink: wikilinkFor(relativePath) };
+}
+
+const NON_INDEXED_VAULT_SECTIONS: ReadonlySet<string> = new Set([
+  "raw",
+  "sessions",
+  "artifacts",
+  "handoffs",
+  "tasks",
+]);
+
+export async function writeAndIndexVaultPage(
+  input: WriteVaultPageInput & { agentId?: string },
+  deps: WriteVaultPageDeps = {},
+): Promise<{
+  status: "written";
+  note: VaultWriteResult;
+  indexed: "ok" | "degraded" | "skipped";
+  index_detail?: unknown;
+}> {
+  const isNonIndexed = NON_INDEXED_VAULT_SECTIONS.has(input.section);
+  const note = await writeVaultPage(
+    {
+      ...input,
+      status: input.status ?? (isNonIndexed ? "candidate" : "accepted"),
+    },
+    deps,
+  );
+  if (isNonIndexed) {
+    return { status: "written", note, indexed: "skipped" };
+  }
+  try {
+    const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
+    const effectiveAgent = input.agentId ?? DEFAULT_AGENT_ID;
+    const fullContent = `---\ntitle: ${input.title}\nsection: ${input.section}\nstatus: accepted\nprivacy: safe\n---\n# ${input.title}\n\n${input.content}`;
+    const indexResult = await jsonRpcSocketRequestWithFallback("vault_index_doc", {
+      content: fullContent,
+      path: note.relativePath,
+      // agent_id is the field the daemon's provenance_claim() reads; without
+      // it the request resolves to the default principal and the ownership
+      // check degrades indexing (P0-D, 2026-07-19 recall blackout).
+      agent_id: effectiveAgent,
+      agent: effectiveAgent,
+      sigil: "📄",
+      privacy_level: "safe",
+      page_status: "accepted",
+      layer: "knowledge",
+    });
+    return {
+      status: "written",
+      note,
+      indexed: indexResult.ok ? "ok" : "degraded",
+      index_detail: indexResult.ok ? indexResult.data : indexResult.error,
+    };
+  } catch {
+    return { status: "written", note, indexed: "degraded" };
+  }
 }
 
 // Pillar 3 invariant: vaultFirstLearn writes a candidate note under wiki/sessions/
@@ -5430,7 +5511,7 @@ export async function vaultExists(vaultPath: string): Promise<boolean> {
  * pathological or over-curated file. Same posture as compact-harvest's
  * SUMMARY_TEXT_MAX_CHARS: a safety ceiling, not a target.
  */
-export const LAYER1_SHELF_MAX_BYTES = 8192;
+export const LAYER1_SHELF_MAX_BYTES = 24576;
 
 export interface Layer1ShelfResult {
   ok: boolean;

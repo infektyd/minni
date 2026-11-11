@@ -182,11 +182,11 @@ class MinniConfig:
             "MINNI_GRAPH_CLASSIFICATION_ENABLED", "on"
         ).lower() not in {"0", "false", "no", "off"}
     )
-    # Governs read-time 1-hop neighbor traversal in retrieve() (default False during bootstrap).
+    # Governs read-time 1-hop neighbor traversal in retrieve() (default True).
     graph_expansion_enabled: bool = field(
         default_factory=lambda: os.environ.get(
-            "MINNI_GRAPH_EXPANSION_ENABLED", "off"
-        ).lower() in {"1", "true", "yes", "on"}
+            "MINNI_GRAPH_EXPANSION_ENABLED", "on"
+        ).lower() not in {"0", "false", "no", "off"}
     )
 
     # AFM self-organization loop (PR-12)
@@ -536,3 +536,41 @@ def normalize_workspace_id(value: Optional[str]) -> str:
         # Edge case: "/" -> use empty (no valid basename)
         return ""
     return "workspace-" + basename.lower()
+
+
+_NON_PROJECT_WORKSPACES = frozenset({"", "default", "global", "*", "workspace-unknown"})
+
+
+def normalize_workspace_scope(value: Optional[str], *, default: str = "") -> str:
+    """Normalize a workspace scope while preserving sentinel scopes.
+
+    Unlike ``normalize_workspace_id`` (which maps any bare token ``foo`` to
+    ``workspace-foo``), this helper keeps ``""``, ``"default"``, ``"global"``,
+    ``"*"``, and ``"workspace-unknown"`` intact (and canonicalizes
+    ``"workspace-default"`` -> ``"default"``, ``"workspace-global"`` ->
+    ``"global"``) while delegating concrete project paths/names to
+    ``normalize_workspace_id``.
+    """
+    if value is None:
+        return default
+    raw = str(value).strip()
+    if not raw:
+        return default
+    lowered = raw.lower()
+    if lowered in ("default", "workspace-default"):
+        return "default"
+    if lowered in ("global", "workspace-global"):
+        return "global"
+    if lowered == "*":
+        return "*"
+    if lowered == "workspace-unknown":
+        return "workspace-unknown"
+    normalized = normalize_workspace_id(raw)
+    return normalized if normalized else default
+
+
+def is_concrete_project_workspace(value: Optional[str]) -> bool:
+    """Return True when *value* designates a specific project/repo workspace."""
+    ws = normalize_workspace_scope(value, default="")
+    return ws not in _NON_PROJECT_WORKSPACES
+

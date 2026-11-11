@@ -1,8 +1,9 @@
-// Phase 1b (S4c, §7): PostToolUse and PostToolUseFailure failure-lesson
-// surfacing. Solves the §7 open blocker where 350/352 Swift test-failure Bash
-// results had `is_error: false` due to exit-code masking (`| tail`,
-// `echo exit=$?`) by matching `PostToolUse` `tool_response` output text on
-// every Bash call, plus `PostToolUseFailure` for real failures.
+// Wave 1 (§2.3): PostToolUse and PostToolUseFailure failure-lesson surfacing.
+// PostToolUse checks fire STRICTLY on:
+//   (a) file-edit tools (Edit, Write, MultiEdit, NotebookEdit, edit_file, write_file, apply_patch), or
+//   (b) commands that failed (isError === true || (exitCode !== null && exitCode !== 0)).
+// Clean-exit shell commands (exitCode === 0 or exitCode === null && !isError) return
+// { continue: true } immediately without scanning stdout for scar keywords.
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -10,12 +11,15 @@ import test from "node:test";
 
 import { PLUGIN_ROOT, additionalContext, makeFixture, runHook, startFakeDaemon } from "./use-telemetry-hook-fixture.mjs";
 
-test("hooks/hooks.json declares PostToolUse and widened PostToolUseFailure matcher", async () => {
+test("hooks/hooks.json declares PostToolUse for failed commands + file-edit tools and widened PostToolUseFailure matcher", async () => {
   const raw = await readFile(path.join(PLUGIN_ROOT, "hooks", "hooks.json"), "utf8");
   const manifest = JSON.parse(raw);
   assert.ok(Array.isArray(manifest?.hooks?.PostToolUse), "PostToolUse must be declared in hooks.json");
   assert.ok(Array.isArray(manifest?.hooks?.PostToolUseFailure), "PostToolUseFailure must be declared in hooks.json");
-  assert.equal(manifest.hooks.PostToolUse[0].matcher, "^(?:Bash|run_terminal_command)$");
+  assert.equal(
+    manifest.hooks.PostToolUse[0].matcher,
+    "^(?:Bash|run_terminal_command|Edit|Write|MultiEdit|NotebookEdit|edit_file|write_file|apply_patch)$",
+  );
   const failureMatcher = manifest.hooks.PostToolUseFailure[0].matcher;
   assert.ok(
     failureMatcher === "" ||
@@ -24,45 +28,70 @@ test("hooks/hooks.json declares PostToolUse and widened PostToolUseFailure match
   );
 });
 
-test("PostToolUse matches exit-masked Bash output (is_error: false with | tail / echo exit=$?) and surfaces the matching lesson", async (t) => {
+test("PostToolUse skips clean-exit commands without stdout scan and fires on failed commands (exit_code !== 0 or is_error: true)", async (t) => {
   const fixture = await makeFixture(t, "posttooluse-masked");
   await startFakeDaemon(fixture);
 
-  // 1. Swift Testing failure with exit code masked by `| tail -n 20; echo exit=$?` (`is_error: false`)
-  const maskedSwift = await runHook(fixture, "PostToolUse", {
-    session_id: "sess-post-1",
+  // 1. Clean-exit Bash (exit_code: 0, is_error: false) MUST return { continue: true } immediately
+  // even when stdout contains scar keywords ("Expectation failed", "verify_source_baseline.sh: FAIL").
+  const cleanExitZeroWithNoise = await runHook(fixture, "PostToolUse", {
+    session_id: "sess-post-clean-0",
     tool_name: "Bash",
-    tool_input: { command: "swift test 2>&1 | tail -n 20; echo exit=$?" },
+    tool_input: { command: "grep 'Expectation failed' gate.log" },
     is_error: false,
     tool_response: {
-      stdout: '✘ Test "Inspector layout bounds" failed after 0.042 seconds.\nExpectation failed: (frame.width → 0.0) == 320.0\nexit=0',
+      stdout: '✘ Test "Inspector layout bounds" failed after 0.042 seconds.\nExpectation failed: (frame.width → 0.0) == 320.0\nverify_source_baseline.sh: FAIL',
       stderr: "",
       exit_code: 0,
     },
   });
-  assert.equal(maskedSwift.code, 0);
-  assert.equal(maskedSwift.output.continue, true);
-  assert.equal(maskedSwift.output.hookSpecificOutput?.hookEventName, "PostToolUse");
-  const ctx1 = additionalContext(maskedSwift.output);
+  assert.deepEqual(cleanExitZeroWithNoise.output, { continue: true });
+
+  // 2. Clean-exit Bash with omitted exit_code (exitCode === null && !isError) MUST ALSO return { continue: true } immediately.
+  const cleanExitNullWithNoise = await runHook(fixture, "PostToolUse", {
+    session_id: "sess-post-clean-null",
+    tool_name: "Bash",
+    tool_input: { command: "cat gate.log" },
+    is_error: false,
+    tool_response: '✘ Test "Inspector layout bounds" failed after 0.042 seconds.\nExpectation failed: (frame.width → 0.0) == 320.0',
+  });
+  assert.deepEqual(cleanExitNullWithNoise.output, { continue: true });
+
+  // 3. Failed Bash via non-zero exit_code (exit_code: 1, even with is_error: false) surfaces lesson.
+  const nonZeroExitSwift = await runHook(fixture, "PostToolUse", {
+    session_id: "sess-post-1",
+    tool_name: "Bash",
+    tool_input: { command: "swift test" },
+    is_error: false,
+    tool_response: {
+      stdout: '✘ Test "Inspector layout bounds" failed after 0.042 seconds.\nExpectation failed: (frame.width → 0.0) == 320.0',
+      stderr: "",
+      exit_code: 1,
+    },
+  });
+  assert.equal(nonZeroExitSwift.code, 0);
+  assert.equal(nonZeroExitSwift.output.continue, true);
+  assert.equal(nonZeroExitSwift.output.hookSpecificOutput?.hookEventName, "PostToolUse");
+  const ctx1 = additionalContext(nonZeroExitSwift.output);
   assert.match(ctx1, /📓 Minni failure lesson/);
   assert.match(ctx1, /Expectation failed/i);
   assert.match(ctx1, /<EVIDENCE\b[\s\S]*<\/EVIDENCE>/);
 
-  // 2. verify_source_baseline.sh failure with `is_error: false`
-  const maskedBaseline = await runHook(fixture, "PostToolUse", {
+  // 4. Failed Bash via is_error: true surfaces verify_source_baseline.sh lesson.
+  const failedBaseline = await runHook(fixture, "PostToolUse", {
     session_id: "sess-post-1",
     tool_name: "Bash",
-    tool_input: { command: "./scripts/verify_source_baseline.sh; echo exit=$?" },
-    is_error: false,
+    tool_input: { command: "./scripts/verify_source_baseline.sh" },
+    is_error: true,
     tool_response: "verify_source_baseline.sh: FAIL: unregistered test file NewFeatureTests.swift\nexit=1",
   });
-  assert.equal(maskedBaseline.code, 0);
-  assert.equal(maskedBaseline.output.continue, true);
-  const ctx2 = additionalContext(maskedBaseline.output);
+  assert.equal(failedBaseline.code, 0);
+  assert.equal(failedBaseline.output.continue, true);
+  const ctx2 = additionalContext(failedBaseline.output);
   assert.match(ctx2, /📓 Minni failure lesson/);
   assert.match(ctx2, /project\.pbxproj|membershipExceptions/);
 
-  // 3. PostToolUseFailure with real non-zero exit / error (`is_error: true`)
+  // 5. PostToolUseFailure with real non-zero exit / error (is_error: true)
   const realFailure = await runHook(fixture, "PostToolUseFailure", {
     session_id: "sess-post-1",
     tool_name: "Bash",
@@ -74,19 +103,9 @@ test("PostToolUse matches exit-masked Bash output (is_error: false with | tail /
   assert.equal(realFailure.output.continue, true);
   assert.equal(realFailure.output.hookSpecificOutput?.hookEventName, "PostToolUseFailure");
   assert.match(additionalContext(realFailure.output), /📓 Minni failure lesson/);
-
-  // 4. Clean Bash output returns plain `{ continue: true }`
-  const cleanBash = await runHook(fixture, "PostToolUse", {
-    session_id: "sess-post-1",
-    tool_name: "Bash",
-    tool_input: { command: "swift test" },
-    is_error: false,
-    tool_response: "Test run with 128 tests in 14 suites passed after 0.812 seconds.",
-  });
-  assert.deepEqual(cleanBash.output, { continue: true });
 });
 
-test("B4: Swift/Praxis antipattern rules (m:7a11e510..m:7a11e513) respect repo-scope, ignore read-only exit_code=0 search/diff and doc comments, fire on non-Bash PostToolUseFailure, and persist .handles.json", async (t) => {
+test("B4 & Wave 1: file-edit tools (Edit, Write, edit_file, write_file, apply_patch) fire Swift antipattern rules while clean-exit Bash and non-Swift repos stay quiet", async (t) => {
   const fixture = await makeFixture(t, "posttooluse-b4");
   await startFakeDaemon(fixture);
 
@@ -109,7 +128,7 @@ test("B4: Swift/Praxis antipattern rules (m:7a11e510..m:7a11e513) respect repo-s
     "read-only rg with exit_code=0 must not trigger Swift antipattern failure lesson",
   );
 
-  // 2. Non-Swift repo (`cwd: /workspace/Projects/PythonApp`) running pytest MUST NOT trigger Swift-scoped rule even if output mentions Foo.swift and @unchecked Sendable
+  // 2. Non-Swift repo (`cwd: /workspace/Projects/PythonApp`) running failed pytest MUST NOT trigger Swift-scoped rule
   const nonSwiftRepo = await runHook(fixture, "PostToolUse", {
     session_id: "sess-b4-2",
     cwd: "/workspace/Projects/PythonApp",
@@ -128,26 +147,76 @@ test("B4: Swift/Praxis antipattern rules (m:7a11e510..m:7a11e513) respect repo-s
     "Swift-scoped rule must not fire in a non-Swift repo during pytest even if test output mentions Foo.swift",
   );
 
-  // 3. Doc-comment-only match (`/// Do not use @unchecked Sendable`) in Praxis MUST NOT fire
-  const commentOnly = await runHook(fixture, "PostToolUse", {
+  // 3. Doc-comment-only match (`/// Do not use @unchecked Sendable`) on file-edit Write MUST NOT fire
+  const commentOnlyEdit = await runHook(fixture, "PostToolUse", {
     session_id: "sess-b4-3",
     cwd: "/workspace/Projects/Praxis",
-    tool_name: "Bash",
-    tool_input: { command: "swift build" },
-    is_error: false,
-    tool_response: {
-      stdout: "/// Warning: avoid @unchecked Sendable in actor code",
-      stderr: "",
-      exit_code: 0,
+    tool_name: "Write",
+    tool_input: {
+      file_path: "/workspace/Projects/Praxis/Sources/DocNote.swift",
+      content: "/// Warning: avoid @unchecked Sendable in actor code\nstruct SafeActor {}\n",
     },
+    is_error: false,
+    tool_response: { ok: true },
   });
   assert.deepEqual(
-    commentOnly.output,
+    commentOnlyEdit.output,
     { continue: true },
-    "comment-only mention of @unchecked Sendable must not fire",
+    "comment-only mention of @unchecked Sendable in file edit must not fire",
   );
 
-  // 4. Real Swift/Praxis violation (`@unchecked Sendable` on code line during build/check) fires m:7a11e510
+  // 4a. File-edit `Edit` introducing `@unchecked Sendable` in Swift fires m:7a11e510 (even with is_error: false)
+  const editUnchecked = await runHook(fixture, "PostToolUse", {
+    session_id: "sess-b4-edit-1",
+    cwd: "/workspace/Projects/Praxis",
+    tool_name: "Edit",
+    tool_input: {
+      file_path: "/workspace/Projects/Praxis/Sources/SyncEngine.swift",
+      new_string: "final class SyncEngine: @unchecked Sendable {}",
+    },
+    is_error: false,
+    tool_response: "File updated",
+  });
+  assert.match(additionalContext(editUnchecked.output), /m:7a11e510/);
+
+  // 4b. File-edit `edit_file` / `write_file` / `apply_patch` introducing silent `try?` in Swift fires m:7a11e511
+  for (const [idx, editPayload] of [
+    {
+      tool_name: "edit_file",
+      tool_input: {
+        Path: "/workspace/Projects/Praxis/Sources/Worker.swift",
+        Replacement: "    let parsed = try? JSONDecoder().decode(Item.self, from: raw)",
+      },
+    },
+    {
+      tool_name: "write_file",
+      tool_input: {
+        Path: "/workspace/Projects/Praxis/Sources/Loader.swift",
+        Content: "import Foundation\nfunc load() { _ = try? Data(contentsOf: url) }\n",
+      },
+    },
+    {
+      tool_name: "apply_patch",
+      tool_input: {
+        patch: "*** Update File: Sources/PatchTarget.swift\n@@\n+    _ = try? session.send(msg)\n",
+      },
+    },
+  ].entries()) {
+    const res = await runHook(fixture, "PostToolUse", {
+      session_id: `sess-b4-file-edit-${idx}`,
+      cwd: "/workspace/Projects/Praxis",
+      ...editPayload,
+      is_error: false,
+      tool_response: "Applied",
+    });
+    assert.match(
+      additionalContext(res.output),
+      /m:7a11e511/,
+      `${editPayload.tool_name} must fire swift_silent_try_question on PostToolUse`,
+    );
+  }
+
+  // 4c. Real Swift/Praxis violation (`@unchecked Sendable` on code line during failed build) fires m:7a11e510
   const swiftUnchecked = await runHook(fixture, "PostToolUse", {
     session_id: "sess-b4-4",
     cwd: "/workspace/Projects/Praxis",
@@ -206,11 +275,12 @@ test("B4: Swift/Praxis antipattern rules (m:7a11e510..m:7a11e513) respect repo-s
     assert.ok(defaultHandlesRaw?.handles?.[h], `expected ${h} registered in .runtime/recall-state.d/default.handles.json`);
   }
 
-  const { isSwiftOrPraxisContext } = await import("../dist/failure-lessons.js");
+  const { isSwiftOrPraxisContext, isFileEditTool } = await import("../dist/failure-lessons.js");
   assert.equal(typeof isSwiftOrPraxisContext, "function", "isSwiftOrPraxisContext must be exported");
+  assert.equal(typeof isFileEditTool, "function", "isFileEditTool must be exported");
 });
 
-test("Wave 1 & 2: expandTilde on MINNI_SOCKET_PATH, read-only Bash inspection with quoted pipes/var assignments/cut/sort/cat, and scheduled prompt skip", async (t) => {
+test("Wave 1 & 2: expandTilde on MINNI_SOCKET_PATH, clean-exit Bash fast return, and scheduled prompt skip", async (t) => {
   const os = await import("node:os");
   const { jsonRpcSocketCandidates } = await import("../dist/daemon_transport.js");
   const prevSock = process.env.MINNI_SOCKET_PATH;
@@ -230,89 +300,29 @@ test("Wave 1 & 2: expandTilde on MINNI_SOCKET_PATH, read-only Bash inspection wi
   const fixture = await makeFixture(t, "posttooluse-readonly-wave2");
   await startFakeDaemon(fixture);
 
-  // 1. Quoted alternation pipe in grep + cut must be recognized as read-only
-  const quotedPipeGrep = await runHook(fixture, "PostToolUse", {
-    session_id: "sess-w2-1",
-    cwd: "/workspace/Projects/Praxis",
-    tool_name: "Bash",
-    tool_input: {
-      command: 'grep -rn "func withDeadline\\|func joinWithin" Services/ | cut -c1-170 | head -40',
-    },
-    is_error: false,
-    tool_response: {
-      stdout: "Services/TaskTimeout.swift:28:    _ = try? await group.next()",
-      stderr: "",
-      exit_code: 0,
-    },
-  });
-  assert.deepEqual(
-    quotedPipeGrep.output,
-    { continue: true },
-    "grep with quoted alternation pipe and cut must not false-fire swift_silent_try_question",
-  );
+  // 1. Clean-exit Bash grep/cat commands return { continue: true } immediately without scanning stdout
+  for (const [idx, cmd] of [
+    'grep -rn "func withDeadline\\|func joinWithin" Services/ | cut -c1-170 | head -40',
+    'L=/tmp/gate.log; grep "Expectation failed:" "$L" | sort | uniq -c | head -20',
+    "cat /tmp/f230b-red.log",
+  ].entries()) {
+    const res = await runHook(fixture, "PostToolUse", {
+      session_id: `sess-w2-${idx}`,
+      cwd: "/workspace/Projects/Praxis",
+      tool_name: "Bash",
+      tool_input: { command: cmd },
+      is_error: false,
+      tool_response: {
+        stdout:
+          "Services/TaskTimeout.swift:28:    _ = try? await group.next()\nExpectation failed: (count → 0) == 1\nverify_source_baseline.sh: FAIL: unregistered file",
+        stderr: "",
+        exit_code: 0,
+      },
+    });
+    assert.deepEqual(res.output, { continue: true });
+  }
 
-  // 2. Shell variable assignment prefix + grep + sort + uniq on a log file must not false-fire
-  const varAssignLog = await runHook(fixture, "PostToolUse", {
-    session_id: "sess-w2-2",
-    cwd: "/workspace/Projects/Praxis",
-    tool_name: "Bash",
-    tool_input: {
-      command: 'L=/tmp/gate.log; grep "Expectation failed:" "$L" | sort | uniq -c | head -20',
-    },
-    is_error: false,
-    tool_response: {
-      stdout: "   2 Expectation failed: (frame.width → 0.0) == 320.0",
-      stderr: "",
-      exit_code: 0,
-    },
-  });
-  assert.deepEqual(
-    varAssignLog.output,
-    { continue: true },
-    "variable assignment + grep/sort/uniq log inspection must not false-fire swift_testing_expectation_failed",
-  );
-
-  // 3. Read-only cat of a red test log with exit_code=0 must not false-fire test-failure rules
-  const catRedLog = await runHook(fixture, "PostToolUse", {
-    session_id: "sess-w2-3",
-    cwd: "/workspace/Projects/Praxis",
-    tool_name: "Bash",
-    tool_input: { command: "cat /tmp/f230b-red.log" },
-    is_error: false,
-    tool_response: {
-      stdout: "Expectation failed: (count → 0) == 1\nverify_source_baseline.sh: FAIL: unregistered file",
-      stderr: "",
-      exit_code: 0,
-    },
-  });
-  assert.deepEqual(
-    catRedLog.output,
-    { continue: true },
-    "read-only cat of a log file with exit_code=0 must not false-fire failure lessons",
-  );
-
-  // 4. Non-read-only sed -i edit followed by git diff STILL fires m:7a11e511 (true positive preserved)
-  const sedInPlaceDiff = await runHook(fixture, "PostToolUse", {
-    session_id: "sess-w2-4",
-    cwd: "/workspace/Projects/Praxis",
-    tool_name: "Bash",
-    tool_input: {
-      command: "sed -i '' -e 's/foo/bar/' Sources/Worker.swift && git diff -- Sources/Worker.swift | head -50",
-    },
-    is_error: false,
-    tool_response: {
-      stdout: "+    let result = try? decoder.decode(Entry.self, from: data)",
-      stderr: "",
-      exit_code: 0,
-    },
-  });
-  assert.match(
-    additionalContext(sedInPlaceDiff.output),
-    /m:7a11e511/,
-    "sed -i mutation followed by git diff must still fire swift_silent_try_question",
-  );
-
-  // 5. Scheduled / Self-monitor tick prompt skips UserPromptSubmit vault/daemon recall (no recall_pointer / memory_matches)
+  // 2. Scheduled / Self-monitor tick prompt skips UserPromptSubmit vault/daemon recall (no recall_pointer / memory_matches)
   const { writeVaultPage } = await import("../dist/vault.js");
   await writeVaultPage({
     vaultPath: fixture.vault,
@@ -334,5 +344,3 @@ test("Wave 1 & 2: expandTilde on MINNI_SOCKET_PATH, read-only Bash inspection wi
     "Self-monitor tick prompt must skip UserPromptSubmit vault/daemon recall",
   );
 });
-
-

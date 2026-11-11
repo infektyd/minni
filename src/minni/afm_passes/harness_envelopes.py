@@ -52,6 +52,15 @@ BLOCK_TAGS: Tuple[Dict[str, str], ...] = (
 #: prefixes are open ended on the right on purpose.
 SKIP_RULES: Tuple[Dict[str, str], ...] = (
     {"rule_id": "skip.task_notification", "prefix": "<task-notification", "subkind": "task_notification"},
+    {"rule_id": "skip.task_notification_block", "block_tag": "task-notification", "subkind": "task_notification"},
+    {"rule_id": "skip.system_message", "prefix": "<SYSTEM_MESSAGE", "subkind": "system_message"},
+    {
+        "rule_id": "skip.system_message_preamble",
+        "prefix": "The following is a <SYSTEM_MESSAGE>",
+        "subkind": "system_message",
+    },
+    {"rule_id": "skip.agent_message", "prefix": "[Message] timestamp=", "subkind": "system_message"},
+    {"rule_id": "skip.background_task", "prefix": "<background-task", "subkind": "background_task"},
     {"rule_id": "skip.side_sessions_event", "prefix": "<side-sessions-event>", "subkind": "side_sessions_event"},
     {"rule_id": "skip.ci_monitor_event", "prefix": "<ci-monitor-event>", "subkind": "ci_monitor_event"},
     {"rule_id": "skip.command_name", "prefix": "<command-name>", "subkind": "slash_command"},
@@ -256,7 +265,12 @@ def classify_prompt_envelope(text: Any) -> Dict[str, Any]:
         return result
 
     for rule in SKIP_RULES:
-        if stripped.startswith(rule["prefix"]):
+        matched = (
+            stripped.startswith(rule["prefix"])
+            if "prefix" in rule
+            else _strip_block_tag(stripped, rule["block_tag"])[1]
+        )
+        if matched:
             return {
                 "kind": "skip",
                 "subkind": rule["subkind"],

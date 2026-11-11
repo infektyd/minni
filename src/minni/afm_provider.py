@@ -40,12 +40,18 @@ class AFMResult:
     fallback_used: bool = False
 
 
+_OFF_ALIASES = frozenset({"off", "disabled", "none", "false", "0"})
+_RECOVERABLE_NATIVE_ERROR_KINDS = frozenset({"context_overflow", "guardrail", "refusal"})
+
+
 def resolve_afm_mode(value: Optional[str] = None) -> AFMMode:
     raw = (
         value
         if value is not None
         else os.environ.get("MINNI_AFM_PROVIDER_MODE", os.environ.get("MINNI_AFM_MODE", "bridge"))
     ).strip().lower()
+    if raw in _OFF_ALIASES:
+        return "off"
     return raw if raw in _VALID_MODES else "bridge"  # type: ignore[return-value]
 
 
@@ -707,15 +713,19 @@ def invoke_native_afm(operation: str, payload: Dict[str, Any], timeout: float = 
     for key in ("provider", "backend", "availability", "status"):
         if key in parsed and key not in data:
             data[key] = parsed[key]
+    if "errorKind" in parsed and "error_kind" not in data:
+        data["error_kind"] = parsed["errorKind"]
     if not data and isinstance(parsed, dict):
         data = {key: value for key, value in parsed.items() if key not in {"ok", "error"}}
     if parsed.get("ok") is False:
         error = parsed.get("error")
+        err_kind = str(data.get("error_kind") or "").strip().lower()
+        failure_status = err_kind if err_kind in _RECOVERABLE_NATIVE_ERROR_KINDS else "native_unavailable"
         return AFMResult(
             ok=False,
             data=data,
             provider="native",
-            status="native_unavailable",
+            status=failure_status,
             error=str(error) if error else "native AFM helper rejected request",
         )
     return AFMResult(ok=True, data=data, provider="native", status="native_available")

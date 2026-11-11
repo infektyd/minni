@@ -139,6 +139,51 @@ def is_audit_echo(text: str) -> bool:
     return bool(_AUDIT_HEADER_LINE.search(text) or _AUDIT_BARE_LINE.search(text))
 
 
+_INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]+`")
+_INTAKE_WRAPPER_LEAK_RE = re.compile(
+    r"(?im)(?:"
+    r"^\s*Created At:\s*\d{4}-\d{2}-\d{2}T"
+    r"|^\s*Completed At:\s*\d{4}-\d{2}-\d{2}T"
+    r"|^\s*The following is a <SYSTEM_MESSAGE>"
+    r"|^\s*</?(?:SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b"
+    r"|<(SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b[^>]*>[\s\S]*?</\1>"
+    r"|^\s*\[Message\]\s+timestamp="
+    r"|Test failure recovered after edit:\s*Created At:\s*\d{4}-\d{2}-\d{2}"
+    r")"
+)
+_BARE_INTAKE_CHATTER = frozenset(
+    {
+        "fix", "fixed", "done", "lgtm", "ok", "okay", "wip", "ack",
+        "thanks", "yes", "no", "pass", "passed", "green", "test",
+    }
+)
+
+
+def has_wrapper_leak(text: str) -> bool:
+    """True when ``text`` contains an unbackticked runtime wrapper block or header line."""
+    if not isinstance(text, str) or not text:
+        return False
+    scrubbed = _INLINE_CODE_SPAN_RE.sub(" ", text)
+    return bool(_INTAKE_WRAPPER_LEAK_RE.search(scrubbed))
+
+
+def intake_junk_reason(text: str) -> Optional[str]:
+    """Return a rejection reason for 1-word junk or wrapper leaks at intake."""
+    if not isinstance(text, str):
+        return "low_signal_junk"
+    stripped = text.strip()
+    if not stripped:
+        return "low_signal_junk"
+    if has_wrapper_leak(stripped):
+        return "wrapper_leak"
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_./'-]*", stripped)
+    if len(words) == 1:
+        only = words[0].lower().strip("._'-")
+        if only in _BARE_INTAKE_CHATTER or len(stripped) < 12:
+            return "low_signal_junk"
+    return None
+
+
 def _content_sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
@@ -724,6 +769,11 @@ def _scan_inbox(
             # the file.
             if is_audit_echo(cand):
                 skipped_by_kind["_audit_echo"] = skipped_by_kind.get("_audit_echo", 0) + 1
+                continue
+            junk = intake_junk_reason(cand)
+            if junk is not None:
+                key_label = f"_{junk}"
+                skipped_by_kind[key_label] = skipped_by_kind.get(key_label, 0) + 1
                 continue
             content = cand.strip()[:CONTENT_CAP]
             row = {

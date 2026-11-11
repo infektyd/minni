@@ -120,7 +120,9 @@ test(
     );
     assert.match(
       body.layer1_shelf.content,
-      /\[layer1 shelf: boot form, \d+ of 8692 chars; full file: layer1\/core\.md\]$/,
+      new RegExp(
+        `\\[layer1 shelf: boot form, \\d+ of ${LAYER1_SHELF_MAX_BYTES + overBy} chars; full file: layer1\\/core\\.md\\]$`,
+      ),
       "the boot form must end with the explicit boot-form marker",
     );
     assert.equal(

@@ -1,6 +1,8 @@
-// S2b (§6.3.4): PreToolUse context delivery on wires with preToolUseContext=true,
-// fallback to permissionDecision:"deny" on other wires or when MINNI_RECALL_GUARD_DELIVERY=deny
-// or MINNI_GUARD_V2=off, and 3-hit cap on context delivery.
+// Wave 1 (§2.1): Strictly non-blocking PreToolUse across ALL hosts.
+// Hooks NEVER emit permissionDecision:"deny", { decision: "deny" }, { permission: "deny" },
+// or throw a blocking Error on ANY host — even if MINNI_RECALL_GUARD_DELIVERY=deny or
+// MINNI_GUARD_V2=off is set. Wires with preToolUseContext=true attach additionalContext
+// (capped at 3 hits); other wires record non-blocking telemetry and return { continue: true }.
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -23,13 +25,14 @@ import {
 } from "../dist/hook-platform.js";
 import { GUARD_CONTEXT_MAX_HITS, preToolUseContext } from "../dist/recall-guard.js";
 import { readRecallState, writeRecallState } from "../dist/recall-state.js";
+import MinniKiloPlugin from "../kilo/minni-plugin.js";
 
 async function withVault(fn) {
   const root = await mkdtemp(path.join(os.tmpdir(), "minni-s2b-ctx-delivery-"));
   const vault = path.join(root, "claudecode-vault");
   await mkdir(vault, { recursive: true });
   try {
-    await fn({ vault });
+    await fn({ root, vault });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -87,7 +90,7 @@ test("claude-code emits additionalContext without permissionDecision, marks cons
   });
 });
 
-test("MINNI_RECALL_GUARD_DELIVERY=deny forces permissionDecision:deny even on claude-code", async () => {
+test("MINNI_RECALL_GUARD_DELIVERY=deny and MINNI_GUARD_V2=off NEVER produce permissionDecision:deny", async () => {
   await withVault(async ({ vault }) => {
     await writeRecallState(vault, {
       task_signature: "sig-deny-override",
@@ -115,59 +118,15 @@ test("MINNI_RECALL_GUARD_DELIVERY=deny forces permissionDecision:deny even on cl
         tool_name: "Grep",
         tool_input: { pattern: "foo" },
       });
-      assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
-      assert.match(out.hookSpecificOutput?.permissionDecisionReason ?? "", /Re-issue this exact call/);
-      assert.equal(out.hookSpecificOutput?.additionalContext, undefined);
+      assert.equal(out.continue, true);
+      assert.equal(out.hookSpecificOutput?.permissionDecision, undefined);
+      assert.match(out.hookSpecificOutput?.additionalContext ?? "", /\[\[wiki\/hit-1\]\]/);
     } finally {
       if (prev === undefined) delete process.env.MINNI_RECALL_GUARD_DELIVERY;
       else process.env.MINNI_RECALL_GUARD_DELIVERY = prev;
     }
-  });
-});
 
-test("codex, kilocode, and agy (geminiWire) deny once per arming and allow on second call; MINNI_GUARD_V2=off falls back to deny", async () => {
-  await withVault(async ({ vault }) => {
-    for (const [label, wire] of [
-      ["codex", codexWire],
-      ["kilocode", kilocodeWire],
-      ["agy", geminiWire],
-    ]) {
-      const sess = `sess-${label}`;
-      await writeRecallState(vault, {
-        task_signature: `sig-${label}`,
-        intent: "recall",
-        top_hits: FIVE_HITS.slice(0, 1),
-        top_score: 0.95,
-        session_id: sess,
-      });
-
-      const handlers = createHookHandlers({
-        agentId: label,
-        vaultPath: vault,
-        defaultWorkspaceId: "ws",
-        contextWindow: 200_000,
-        auditPrefix: `hook_${label}`,
-        hooksEnabled: true,
-        recallGuardMode: "soft",
-        wire,
-      });
-
-      const firstOut = await handlers.handlePreToolUse({
-        session_id: sess,
-        tool_name: "Read",
-        tool_input: { file_path: "/tmp/a.ts" },
-      });
-      assert.equal(firstOut.hookSpecificOutput?.permissionDecision, "deny", `${label} must deny on first call`);
-
-      const secondOut = await handlers.handlePreToolUse({
-        session_id: sess,
-        tool_name: "Read",
-        tool_input: { file_path: "/tmp/a.ts" },
-      });
-      assert.equal(secondOut.hookSpecificOutput, undefined, `${label} must allow on second call`);
-    }
-
-    // Now test MINNI_GUARD_V2=off via .runtime/flags.json on claudeCodeWire
+    // MINNI_GUARD_V2=off via .runtime/flags.json also stays strictly non-blocking
     await mkdir(path.join(vault, ".runtime"), { recursive: true });
     await writeFile(path.join(vault, ".runtime", "flags.json"), JSON.stringify({ MINNI_GUARD_V2: "off" }), "utf8");
     await writeRecallState(vault, {
@@ -190,11 +149,126 @@ test("codex, kilocode, and agy (geminiWire) deny once per arming and allow on se
       tool_name: "Read",
       tool_input: { file_path: "/tmp/a.ts" },
     });
-    assert.equal(v2OffOut.hookSpecificOutput?.permissionDecision, "deny");
+    assert.equal(v2OffOut.continue, true);
+    assert.equal(v2OffOut.hookSpecificOutput?.permissionDecision, undefined);
+    assert.match(v2OffOut.hookSpecificOutput?.additionalContext ?? "", /\[\[wiki\/hit-1\]\]/);
   });
 });
 
-test("grok-build, cursor, and unprofiled wires declare preToolUseContext=false, and cursor/gemini/grok adapters map preToolUseContext shape to allow", () => {
+test("Read, Grep, Glob, and Bash are NEVER denied across Claude Code, Gemini/Antigravity, Codex, Cursor, Grok, and KiloCode", async () => {
+  await withVault(async ({ root, vault }) => {
+    const prevDelivery = process.env.MINNI_RECALL_GUARD_DELIVERY;
+    const prevKiloVault = process.env.MINNI_KILOCODE_VAULT_PATH;
+    const prevHome = process.env.MINNI_HOME;
+    const prevSocket = process.env.MINNI_SOCKET_PATH;
+    process.env.MINNI_RECALL_GUARD_DELIVERY = "deny";
+    process.env.MINNI_KILOCODE_VAULT_PATH = vault;
+    process.env.MINNI_HOME = root;
+    process.env.MINNI_SOCKET_PATH = path.join(root, "missing.sock");
+
+    try {
+      const tools = [
+        ["Read", { file_path: "/tmp/a.ts" }],
+        ["Grep", { pattern: "needle" }],
+        ["Glob", { pattern: "**/*.ts" }],
+        ["Bash", { command: "rg needle ." }],
+      ];
+
+      const hosts = [
+        ["claude-code", claudeCodeWire],
+        ["gemini", geminiWire],
+        ["codex", codexWire],
+        ["cursor", cursorWire],
+        ["grok-build", grokBuildWire],
+        ["kilocode", kilocodeWire],
+      ];
+
+      for (const [hostLabel, wire] of hosts) {
+        for (const [toolName, toolInput] of tools) {
+          const sess = `sess-${hostLabel}-${toolName}`;
+          await writeRecallState(vault, {
+            task_signature: `sig-${hostLabel}-${toolName}`,
+            intent: "recall",
+            top_hits: FIVE_HITS.slice(0, 2),
+            top_score: 0.95,
+            session_id: sess,
+          });
+
+          const handlers = createHookHandlers({
+            agentId: hostLabel,
+            vaultPath: vault,
+            defaultWorkspaceId: "ws",
+            contextWindow: 200_000,
+            auditPrefix: `hook_${hostLabel}`,
+            hooksEnabled: true,
+            recallGuardMode: "strict",
+            wire,
+          });
+
+          const out = await handlers.handlePreToolUse({
+            session_id: sess,
+            tool_name: toolName,
+            tool_input: toolInput,
+          });
+
+          assert.equal(out.continue, true, `${hostLabel} ${toolName} must continue`);
+          assert.equal(
+            out.hookSpecificOutput?.permissionDecision,
+            undefined,
+            `${hostLabel} ${toolName} must never emit permissionDecision`,
+          );
+
+          if (wireCapabilities(wire).preToolUseContext) {
+            assert.match(out.hookSpecificOutput?.additionalContext ?? "", /\[\[wiki\/hit-1\]\]/);
+          } else {
+            assert.equal(out.hookSpecificOutput, undefined, `${hostLabel} non-context wire returns plain allow`);
+          }
+
+          if (hostLabel === "gemini") {
+            assert.deepEqual(adaptPreToolUseOutput(out), { decision: "allow" });
+          } else if (hostLabel === "cursor") {
+            assert.deepEqual(adaptCursorOutput("PreToolUse", out), { permission: "allow" });
+          } else if (hostLabel === "grok-build") {
+            assert.deepEqual(adaptGrokPreToolUseOutput(out), { decision: "allow" });
+          }
+        }
+      }
+
+      // Exercise real KiloCode plugin tool.execute.before bridge directly on Read/Grep/Glob/Bash:
+      // must never throw a blocking Error even with armed recall-state and MINNI_RECALL_GUARD_DELIVERY=deny.
+      const kiloPlugin = await MinniKiloPlugin({ directory: "/work/repo", client: {} });
+      for (const [toolName, args] of tools) {
+        const sess = `sess-kilo-live-${toolName}`;
+        await writeRecallState(vault, {
+          task_signature: `sig-kilo-live-${toolName}`,
+          intent: "recall",
+          top_hits: FIVE_HITS.slice(0, 1),
+          top_score: 0.95,
+          session_id: sess,
+        });
+        await assert.doesNotReject(
+          () =>
+            kiloPlugin["tool.execute.before"](
+              { sessionID: sess, tool: toolName },
+              { args },
+            ),
+          `KiloCode tool.execute.before must never throw on ${toolName}`,
+        );
+      }
+    } finally {
+      if (prevDelivery === undefined) delete process.env.MINNI_RECALL_GUARD_DELIVERY;
+      else process.env.MINNI_RECALL_GUARD_DELIVERY = prevDelivery;
+      if (prevKiloVault === undefined) delete process.env.MINNI_KILOCODE_VAULT_PATH;
+      else process.env.MINNI_KILOCODE_VAULT_PATH = prevKiloVault;
+      if (prevHome === undefined) delete process.env.MINNI_HOME;
+      else process.env.MINNI_HOME = prevHome;
+      if (prevSocket === undefined) delete process.env.MINNI_SOCKET_PATH;
+      else process.env.MINNI_SOCKET_PATH = prevSocket;
+    }
+  });
+});
+
+test("grok-build, cursor, and unprofiled wires declare preToolUseContext=false, and cursor/gemini/grok adapters map preToolUseContext and legacy deny shapes to allow", () => {
   assert.equal(wireCapabilities(grokBuildWire).preToolUseContext, false);
   assert.equal(wireCapabilities(cursorWire).preToolUseContext, false);
   const unprofiled = wireFor("unprofiled-test-host");

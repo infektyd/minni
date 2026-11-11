@@ -263,17 +263,24 @@ def test_provenance_claim_other_methods_unchanged():
     assert provenance_claim("search", {"agent": "codex"}) is None
 
 
-def test_server_ts_vault_index_doc_sends_agent_id():
-    """Regression pin on the plugin call site: the vault_index_doc RPC params
-    must carry agent_id (the field provenance_claim reads), not just agent."""
-    server_ts = (
-        Path(__file__).resolve().parents[1] / "plugins" / "minni" / "src" / "server.ts"
-    )
-    src = server_ts.read_text()
-    idx = src.find('"vault_index_doc"')
-    assert idx != -1, "vault_index_doc call site missing from server.ts"
-    window = src[idx : idx + 600]
-    assert "agent_id" in window, (
-        "server.ts must send agent_id in vault_index_doc params — `agent` alone "
-        "is not read by provenance_claim and degrades indexing to principal 'main'"
-    )
+def test_plugin_vault_index_doc_sends_agent_id():
+    """Regression pin on the plugin call site (`writeAndIndexVaultPage` in `vault.ts`):
+    every `vault_index_doc` RPC call site across `plugins/minni/src/*.ts` must
+    carry `agent_id` (the field provenance_claim reads), not just `agent`."""
+    src_dir = Path(__file__).resolve().parents[1] / "plugins" / "minni" / "src"
+    hits = 0
+    for ts_file in sorted(src_dir.glob("*.ts")):
+        src = ts_file.read_text(encoding="utf-8")
+        pos = 0
+        while True:
+            idx = src.find('"vault_index_doc"', pos)
+            if idx == -1:
+                break
+            hits += 1
+            window = src[idx : idx + 600]
+            assert "agent_id" in window, (
+                f"{ts_file.name} must send agent_id in vault_index_doc params — "
+                "`agent` alone is not read by provenance_claim and degrades indexing to principal 'main'"
+            )
+            pos = idx + len('"vault_index_doc"')
+    assert hits >= 1, "expected writeAndIndexVaultPage vault_index_doc call site in plugins/minni/src/"

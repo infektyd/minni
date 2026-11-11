@@ -104,17 +104,34 @@ class AfmProvider:
                 else ({"payload": request.payload} if request.native_operation is None else request.payload)
             )
             native = afm_provider.invoke_native_afm(operation, payload, timeout=request.timeout)
+            if (
+                not native.ok
+                and operation != "chat_completion"
+                and "unsupported native afm operation" in str(native.error or "").lower()
+            ):
+                native = afm_provider.invoke_native_afm(
+                    "chat_completion", {"payload": request.payload}, timeout=request.timeout
+                )
+            err_kind = (
+                str(native.data.get("error_kind") or "").strip().lower()
+                if isinstance(native.data, dict)
+                else ""
+            )
+            recoverable_content_trip = (
+                str(native.status or "").strip().lower() in {"context_overflow", "guardrail", "refusal"}
+                or err_kind in {"context_overflow", "guardrail", "refusal"}
+            )
             # Cache-poisoning guard: an ok response only counts as a generation
             # proof when it carries actual completion content — the same check
             # the probe applies; a contentless ok is neutral. A failed native
             # call still invalidates the cached probe (mirror of afm.ts
-            # callAfmJson); in auto mode the bridge fall-through below
-            # re-verifies on success.
+            # callAfmJson) unless it was a content-level overflow/guardrail/refusal;
+            # in auto mode the bridge fall-through below re-verifies on success.
             if native.ok and afm_provider._native_completion_content(native.data) is not None:
                 afm_provider.note_afm_generation_success(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
-            elif not native.ok:
+            elif not native.ok and not recoverable_content_trip:
                 afm_provider.note_afm_generation_failure(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL)
-            if native.ok or resolved == "native":
+            if native.ok or resolved == "native" or recoverable_content_trip:
                 return ProviderResult(
                     ok=native.ok,
                     data=native.data,

@@ -15,8 +15,7 @@ flowchart TD
       Host["Agent runtime host"]
       Hooks["Hook entrypoint — dist/hook.js<br/>SessionStart · UserPromptSubmit · PreToolUse<br/>PreCompact · PostCompact · Stop"]
       Plugin["MCP server — dist/server.js<br/>typed minni_* tools"]
-      Console["Web console — ui-server.ts<br/>Memory Board, HTTP on 127.0.0.1"]
-      CLI["minni CLI<br/>up · down · doctor · watch · wire"]
+      CLI["minni CLI<br/>up · down · doctor · status · watch · wire"]
     end
 
     subgraph Core["Daemon"]
@@ -45,9 +44,8 @@ flowchart TD
     Plugin --> Plans
     Plugin --> Team
     Plugin -->|vault_write| Vaults
-    Console -->|/api/* → daemon RPC| Daemon
-    Console -->|audit tail, sessions| Vaults
     CLI --> Daemon
+    CLI -->|watch tails log.md| Vaults
     Team -->|gate.shared, prepare_task| Daemon
     Plans -->|plan notes, _active_plan.json| Vaults
     Hooks -->|reads the active plan| Vaults

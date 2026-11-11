@@ -58,13 +58,13 @@ the first failing layer; everything below it will look broken too.
   `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock`, `MINNI_WORKSPACE_ID`.
 - Missing env = the platform may silently fall back to another agent's
   defaults. That is an identity-boundary failure, not a cosmetic one.
-- Current source registers **43 `minni_*` tools**, including **16
-  `minni_thread_*` tools** and candidate inspection/resolution. The eleven
-  deprecated `minni_plan_*` aliases were removed in v0.5.0; historical builds in
-  that alias window exposed 48 tools. Counts are a diagnostic clue, not proof of
-  a source revision. Compare the actual tool names and build provenance: an
-  older 37-tool payload lacks the current candidate/worker surface even if its
-  package version still says 0.5.0.
+- Current source registers **12 `minni_*` MCP tools** (`minni_recall`,
+  `minni_drill`, `minni_learn`, `minni_list_candidates`,
+  `minni_resolve_candidate`, `minni_status`, `minni_handoff_send`,
+  `minni_handoff_inbox`, `minni_thread_create`, `minni_thread_status`,
+  `minni_thread_update`, `minni_thread_scar`). Counts and tool names are
+  diagnostic checks: cutover's behavioral probe verifies `tools_count >= 12`,
+  and legacy 43-tool or 48-tool payloads indicate an un-refreshed plugin cache.
 
 ## Layer 4 — Hooks (per platform, shared semantics)
 

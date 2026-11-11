@@ -738,6 +738,8 @@ export interface BootCaptureInput {
   emitted: string;
   recall: JsonResult<RecallResponse>;
   identity: JsonResult<ReadContextResponse>;
+  /** Effective SessionStart inline char cap when dynamically raised for the Permanent Shelf. */
+  capChars?: number;
 }
 
 function bootRecallItems(capture: UseCapture, input: BootCaptureInput): SurfacedItem[] {
@@ -812,13 +814,17 @@ function bootLearningItems(capture: UseCapture, input: BootCaptureInput): Surfac
 /** SessionStart: one row per projected recall result and per boot learning. Never throws. */
 export function captureBootSurfacings(capture: UseCapture | undefined, input: BootCaptureInput): void {
   if (capture === undefined) return;
+  const effectiveCapture: UseCapture =
+    input.capChars !== undefined && input.capChars !== capture.capChars
+      ? { ...capture, capChars: input.capChars }
+      : capture;
   try {
-    record(capture, "boot_recall", bootRecallItems(capture, input), input.emitted);
+    record(effectiveCapture, "boot_recall", bootRecallItems(effectiveCapture, input), input.emitted);
   } catch {
     // Best effort, per channel.
   }
   try {
-    record(capture, "boot_recent_learnings", bootLearningItems(capture, input), input.emitted);
+    record(effectiveCapture, "boot_recent_learnings", bootLearningItems(effectiveCapture, input), input.emitted);
   } catch {
     // Best effort, per channel.
   }

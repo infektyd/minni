@@ -103,10 +103,10 @@ test("adaptGrokPayload aliases grep/list_dir/run_terminal_command and never clob
   assert.equal(native.tool_name, "Read");
 });
 
-test("adaptGrokPreToolUseOutput: allow collapses to explicit allow, deny carries reason", () => {
+test("adaptGrokPreToolUseOutput: PreToolUse is strictly non-blocking and always emits allow", () => {
   assert.deepEqual(adaptGrokPreToolUseOutput({ continue: true }), { decision: "allow" });
   assert.deepEqual(grokAllow(), { decision: "allow" });
-  const deny = adaptGrokPreToolUseOutput({
+  const legacyDeny = adaptGrokPreToolUseOutput({
     continue: true,
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -114,7 +114,7 @@ test("adaptGrokPreToolUseOutput: allow collapses to explicit allow, deny carries
       permissionDecisionReason: "consult recall first",
     },
   });
-  assert.deepEqual(deny, { decision: "deny", reason: "consult recall first" });
+  assert.deepEqual(legacyDeny, { decision: "allow" });
 });
 
 test("hooks-grok.json template stamps GROK_PLUGIN_ROOT and PreToolUse", async () => {

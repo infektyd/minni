@@ -85,6 +85,7 @@ if str(_ENGINE_DIR) not in sys.path:
 import minni.obs as obs                                                  # noqa: E402  # centralized logging + metrics counters
 from minni.config import DEFAULT_CONFIG          # noqa: E402
 from minni.db import MinniDB                                  # noqa: E402
+from minni.today_digest import refresh_today_digest_safe  # noqa: E402
 from minni.principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
     EffectivePrincipal,
     agent_scope_for,
@@ -104,11 +105,6 @@ from minni.minnid_runtime.afm import (  # noqa: E402
     maybe_archive_inbox_source as _runtime_maybe_archive_inbox_source,
     promote_candidate_durable as _runtime_promote_candidate_durable,
     reject_candidate_dedup as _runtime_reject_candidate_dedup,
-)
-from minni.minnid_runtime.ax import (  # noqa: E402
-    AXContext,
-    handle_ax_snapshot_get as _runtime_handle_ax_snapshot_get,
-    handle_ax_snapshot_store as _runtime_handle_ax_snapshot_store,
 )
 from minni.minnid_runtime.dispatch import DispatchContext, dispatch_request  # noqa: E402
 from minni.minnid_runtime.governance import (  # noqa: E402
@@ -195,6 +191,7 @@ from minni.minnid_runtime.transport import SOCKET_BODY_LIMIT as _SOCKET_BODY_LIM
 from minni.minnid_runtime.vault_index import (  # noqa: E402
     MAX_VAULT_PAGE_CHARS as _MAX_VAULT_PAGE_CHARS,
     VaultIndexContext,
+    handle_repo_map as _runtime_handle_repo_map,
     handle_vault_index_doc as _runtime_handle_vault_index_doc,
 )
 
@@ -369,7 +366,13 @@ def _durable_doc_path(
 _UNSET = object()
 
 
-def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) -> bool:
+def _index_durable_learning(
+    agent_id: str,
+    content: str,
+    key: str,
+    db=_UNSET,
+    workspace_id: str = "",
+) -> bool:
     """Semantically index a just-stored durable learning (FAIL-OPEN).
 
     Hook for BOTH durable-store socket paths (_resolve_candidate(accept) and
@@ -441,6 +444,28 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
         from minni.durable_projection import durable_metadata
 
         metadata = durable_metadata(content)
+        resolved_ws = str(workspace_id or "").strip()
+        if not resolved_ws and isinstance(key, str) and key.startswith("learning:"):
+            try:
+                lid_int = int(key.split(":", 1)[1])
+                with db.cursor() as c:
+                    l_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+                    }
+                    if "workspace_id" in l_cols:
+                        lrow = c.execute(
+                            "SELECT workspace_id FROM learnings WHERE learning_id = ?",
+                            (lid_int,),
+                        ).fetchone()
+                        if lrow is not None:
+                            resolved_ws = str(
+                                (lrow["workspace_id"] if hasattr(lrow, "keys") else lrow[0]) or ""
+                            ).strip()
+            except Exception:
+                pass
+        if resolved_ws:
+            metadata["workspace_id"] = resolved_ws
         result = engine.index_durable_document(
             content=content,
             path=_durable_doc_path(
@@ -458,6 +483,9 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
             agent_id, exc,
         )
         return False
+
+
+_ORIG_INDEX_DURABLE_LEARNING = _index_durable_learning
 
 
 def _purge_durable_learning(agent_id: str, content: str, db=_UNSET) -> None:
@@ -481,6 +509,7 @@ def _purge_durable_learning(agent_id: str, content: str, db=_UNSET) -> None:
             )
             return
 
+        from minni.minnid_runtime.graph_adapters import canonical_store_id
         from minni.retrieval import RetrievalEngine
 
         try:
@@ -491,6 +520,12 @@ def _purge_durable_learning(agent_id: str, content: str, db=_UNSET) -> None:
 
         if store_db_path is not None and store_db_path == default_db_path:
             engine = _lazy_retrieval()
+            if (
+                isinstance(engine, RetrievalEngine)
+                and getattr(engine, "db", None) is not None
+                and canonical_store_id(engine.db) != canonical_store_id(db)
+            ):
+                engine = RetrievalEngine(db, db.config)
         else:
             engine = RetrievalEngine(db, db.config)
 
@@ -525,6 +560,51 @@ def _purge_durable_learning(agent_id: str, content: str, db=_UNSET) -> None:
             "learnings lifecycle stands, doc-search stays stale until reindex",
             agent_id, exc,
         )
+
+
+def _resolve_store_retrieval_engine(db):
+    """Return a real RetrievalEngine bound to ``db``, or None if unavailable/mocked."""
+    if db is _UNSET or db is None:
+        return None
+    if _index_durable_learning is not _ORIG_INDEX_DURABLE_LEARNING:
+        return None
+    try:
+        from minni.minnid_runtime.graph_adapters import canonical_store_id
+        from minni.retrieval import RetrievalEngine
+
+        try:
+            store_db_path = os.path.abspath(db.config.db_path)
+        except Exception:
+            store_db_path = None
+        default_db_path = os.path.abspath(DEFAULT_CONFIG.db_path)
+        if store_db_path is not None and store_db_path == default_db_path:
+            engine = _lazy_retrieval()
+            if (
+                not isinstance(engine, RetrievalEngine)
+                or getattr(engine, "db", None) is None
+                or canonical_store_id(engine.db) != canonical_store_id(db)
+            ):
+                engine = RetrievalEngine(db, db.config)
+        else:
+            engine = RetrievalEngine(db, db.config)
+        if not isinstance(engine, RetrievalEngine):
+            return None
+        return engine
+    except Exception:
+        return None
+
+
+def _schedule_store_refresh_retry(db) -> None:
+    """Record a shared-index refresh retry token for ``db`` (no vector payloads)."""
+    try:
+        key = os.path.abspath(
+            getattr(getattr(db, "config", None), "db_path", None)
+            or DEFAULT_CONFIG.db_path
+        )
+    except Exception:
+        key = os.path.abspath(DEFAULT_CONFIG.db_path)
+    with _backfill_shared_refresh_lock:
+        _backfill_shared_refresh_pending[key] = object()
 
 
 def _lazy_episodic():
@@ -842,6 +922,8 @@ def _governance_context() -> GovernanceContext:
         increment_request_count=_increment_governance_request_count,
         sovereign_db=MinniDB,
         notify_candidate_staged=_notify_consolidation_trigger,
+        resolve_retrieval_engine=_resolve_store_retrieval_engine,
+        on_refresh_retry=_schedule_store_refresh_retry,
         logger=logger,
     )
 
@@ -920,6 +1002,9 @@ def _afm_context() -> AFMContext:
         record_latency=_record_latency,
         maybe_archive_inbox_source=_maybe_archive_inbox_source,
         index_durable_learning=_index_durable_learning,
+        purge_durable_learning=_purge_durable_learning,
+        resolve_retrieval_engine=_resolve_store_retrieval_engine,
+        on_refresh_retry=_schedule_store_refresh_retry,
         increment_request_count=_increment_ops_request_count,
         writeback_ref=lambda: _writeback,
         sovereign_db=MinniDB,
@@ -1173,6 +1258,11 @@ def _vault_watch_sweep_once() -> dict:
                 break
     except Exception:
         logger.exception("Vault watch: shared vault sweep failed")
+    refresh_today_digest_safe(
+        daemon_running=True,
+        db_path=getattr(DEFAULT_CONFIG, "db_path", None),
+        min_interval_sec=60.0,
+    )
     return stats
 
 
@@ -1785,24 +1875,6 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
     return _runtime_resolve_candidate(params, request_id, _governance_context())
 
 
-def _ax_context() -> AXContext:
-    return AXContext(
-        make_error=_make_error,
-        make_response=_make_response,
-        handler_principal=_handler_principal,
-        lazy_writeback=_lazy_writeback,
-        logger=logger,
-    )
-
-
-def _handle_ax_snapshot_store(params: dict, request_id: Any) -> dict:
-    return _runtime_handle_ax_snapshot_store(params, request_id, _ax_context())
-
-
-def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
-    return _runtime_handle_ax_snapshot_get(params, request_id, _ax_context())
-
-
 def _vault_index_context() -> VaultIndexContext:
     return VaultIndexContext(
         make_error=_make_error,
@@ -1820,6 +1892,10 @@ def _vault_index_context() -> VaultIndexContext:
 
 def _handle_vault_index_doc(params: dict, request_id: Any) -> dict:
     return _runtime_handle_vault_index_doc(params, request_id, _vault_index_context())
+
+
+def _handle_repo_map(params: dict, request_id: Any) -> dict:
+    return _runtime_handle_repo_map(params, request_id, _vault_index_context())
 
 
 def _handle_cache_reload(params: dict, request_id: Any) -> dict:
@@ -1867,10 +1943,9 @@ _METHODS: Dict[str, callable] = {
     "stage_candidate":        _stage_candidate,
     "list_candidates":        _list_candidates,
     "resolve_candidate":      _resolve_candidate,
-    "ax_snapshot_store":      _handle_ax_snapshot_store,
-    "ax_snapshot_get":        _handle_ax_snapshot_get,
     # M-4 fix: vault_write now triggers immediate semantic indexing via this RPC.
     "vault_index_doc":        _handle_vault_index_doc,
+    "repo_map":               _handle_repo_map,
     "status":                 _handle_status,
     "health_report":          _handle_health_report,
     "hygiene_report":         _handle_hygiene_report,

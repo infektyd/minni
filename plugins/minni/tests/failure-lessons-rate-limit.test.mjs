@@ -18,9 +18,13 @@ test("failure lessons fire at most once per (session, lesson) until a session re
   const payload = {
     session_id: "sess-rl-1",
     tool_name: "Bash",
-    tool_input: { command: "swift test | tail -n 10" },
-    is_error: false,
-    tool_response: '✘ Test "alpha" failed\nExpectation failed: x == y',
+    tool_input: { command: "swift test" },
+    is_error: true,
+    tool_response: {
+      stdout: '✘ Test "alpha" failed\nExpectation failed: x == y',
+      stderr: "",
+      exit_code: 1,
+    },
   };
 
   // 1st firing in sess-rl-1 surfaces the lesson and records a failure_lesson row.

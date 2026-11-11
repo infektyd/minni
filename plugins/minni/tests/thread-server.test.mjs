@@ -1,15 +1,11 @@
-// Task 6: typed MCP worker surface. These tests exercise
-// minni_thread_ready/assign/claim/worker_update/events over the REAL MCP
-// server (stdio, same pattern as server-minni-recall-339.test.mjs and
-// learn-gate-review-followups.test.mjs's fake-daemon test) rather than the
-// underlying thread-worker.ts functions directly (already covered by
-// thread-worker.test.mjs/thread-events.test.mjs). A fake gate daemon answers
-// every gate.shared RPC with { ok: true } so requireSharedGate passes
-// through to the handler under test.
+// Wave 1 v1 MCP surface E2E + Thread server journal/security invariants.
+// Exercises the exact 12 v1 MCP tools over the REAL spawned MCP server (stdio)
+// backed by a fake Unix-socket daemon handling gate.shared, daemon.handoff,
+// minni_list_pending_handoffs, and minni_ack_handoff.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,17 +13,35 @@ import test from "node:test";
 import {
   createPlan,
   findPlanNote,
-  historyPathFor,
   journalPathFor,
   persistPlan,
   rehydratePlan,
 } from "../dist/plan.js";
+import { readThreadEvents } from "../dist/thread-events.js";
 import { DEFAULT_AGENT_ID } from "../dist/config.js";
 
 const SERVER_PATH = new URL("../dist/server.js", import.meta.url).pathname;
 const SRC_PATH = new URL("../src/server.ts", import.meta.url);
 
-async function startFakeGateDaemon(socketPath) {
+const EXPECTED_12_V1_TOOLS = [
+  "minni_recall",
+  "minni_drill",
+  "minni_learn",
+  "minni_list_candidates",
+  "minni_resolve_candidate",
+  "minni_status",
+  "minni_handoff_send",
+  "minni_handoff_inbox",
+  "minni_thread_create",
+  "minni_thread_status",
+  "minni_thread_update",
+  "minni_thread_scar",
+];
+
+async function startFakeDaemon(socketPath, homeDir) {
+  const rpcLog = [];
+  const handoffs = new Map();
+
   const daemon = net.createServer((socket) => {
     let buffer = "";
     socket.on("data", (chunk) => {
@@ -38,14 +52,120 @@ async function startFakeGateDaemon(socketPath) {
         buffer = buffer.slice(nl + 1);
         if (!line.trim()) continue;
         const request = JSON.parse(line);
+        const { id, method, params = {} } = request;
+        rpcLog.push({ method, params });
+
+        if (method === "daemon.handoff") {
+          const packet = params.packet ?? {};
+          const lease_id = packet.lease_id ?? `lease-${handoffs.size + 1}`;
+          const expires_at =
+            packet.expires_at ?? new Date(Date.now() + 86_400_000).toISOString();
+          const packetPath = path.join(homeDir, `${lease_id}.packet.json`);
+          void writeFile(packetPath, JSON.stringify(packet, null, 2), "utf8")
+            .then(() => {
+              handoffs.set(lease_id, {
+                lease_id,
+                from_agent: params.from_agent ?? packet.from_agent ?? null,
+                to_agent: params.to_agent ?? packet.to_agent ?? null,
+                task: packet.task ?? "",
+                expires_at,
+                path: packetPath,
+                acked: false,
+                ack_status: null,
+              });
+              socket.write(
+                `${JSON.stringify({
+                  jsonrpc: "2.0",
+                  id,
+                  result: {
+                    ok: true,
+                    delivered: true,
+                    status: "ok",
+                    lease_id,
+                    expires_at,
+                  },
+                })}\n`,
+              );
+            })
+            .catch((err) => {
+              socket.write(
+                `${JSON.stringify({
+                  jsonrpc: "2.0",
+                  id,
+                  error: { code: -32000, message: String(err) },
+                })}\n`,
+              );
+            });
+          continue;
+        }
+
+        if (method === "minni_list_pending_handoffs") {
+          const targetAgent = params.agent_id;
+          const pending = [...handoffs.values()].filter(
+            (h) => !h.acked && (!targetAgent || h.to_agent === targetAgent),
+          );
+          socket.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: { ok: true, handoffs: pending },
+            })}\n`,
+          );
+          continue;
+        }
+
+        if (method === "minni_ack_handoff") {
+          const item = handoffs.get(params.lease_id);
+          if (!item) {
+            socket.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id,
+                error: { code: -32004, message: `unknown lease: ${params.lease_id}` },
+              })}\n`,
+            );
+            continue;
+          }
+          item.acked = true;
+          item.ack_status = params.status ?? "accepted";
+          socket.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: {
+                ok: true,
+                lease_id: item.lease_id,
+                status: item.ack_status,
+              },
+            })}\n`,
+          );
+          continue;
+        }
+
+        if (method.startsWith("agent_ping")) {
+          socket.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              error: { code: -32601, message: `Retired RPC: ${method}` },
+            })}\n`,
+          );
+          continue;
+        }
+
         socket.write(
-          `${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { ok: true } })}\n`,
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            result: { ok: true, results: [] },
+          })}\n`,
         );
       }
     });
   });
+
   await new Promise((resolve) => daemon.listen(socketPath, resolve));
-  return daemon;
+  return { daemon, rpcLog, handoffs };
 }
 
 async function withMcpSession(t, fn) {
@@ -53,7 +173,7 @@ async function withMcpSession(t, fn) {
   const home = path.join(root, "home");
   await mkdir(home, { recursive: true });
   const socketPath = path.join(home, "minnid.sock");
-  const daemon = await startFakeGateDaemon(socketPath);
+  const { daemon, rpcLog, handoffs } = await startFakeDaemon(socketPath, home);
   t.after(() => daemon.close());
 
   const child = spawn(process.execPath, [SERVER_PATH], {
@@ -106,7 +226,7 @@ async function withMcpSession(t, fn) {
       });
     });
 
-  const call = async (name, args) => {
+  const callRaw = async (name, args) => {
     const id = nextId++;
     send({
       jsonrpc: "2.0",
@@ -121,7 +241,24 @@ async function withMcpSession(t, fn) {
     if (reply.result?.isError) {
       throw new Error(`${name}: ${reply.result.content?.[0]?.text}`);
     }
-    return JSON.parse(reply.result.content[0].text);
+    const text = reply.result.content[0].text;
+    return {
+      text,
+      bytes: Buffer.byteLength(text, "utf8"),
+      data: JSON.parse(text),
+    };
+  };
+
+  const call = async (name, args) => (await callRaw(name, args)).data;
+
+  const listTools = async () => {
+    const id = nextId++;
+    send({ jsonrpc: "2.0", id, method: "tools/list", params: {} });
+    const reply = await awaitResponse(id);
+    if (reply.error) {
+      throw new Error(`tools/list: ${JSON.stringify(reply.error)}`);
+    }
+    return reply.result.tools;
   };
 
   send({
@@ -138,7 +275,17 @@ async function withMcpSession(t, fn) {
   send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
   try {
-    return await fn({ root, vaultPath: root, call, send, awaitResponse });
+    return await fn({
+      root,
+      vaultPath: root,
+      call,
+      callRaw,
+      listTools,
+      rpcLog,
+      handoffs,
+      send,
+      awaitResponse,
+    });
   } finally {
     await rm(root, { recursive: true, force: true }).catch(() => {});
   }
@@ -146,255 +293,231 @@ async function withMcpSession(t, fn) {
 
 async function seedPlan(vaultPath, slices) {
   const created = await createPlan(
-    { goal: "Task 6 typed worker surface", slices, vaultPath },
+    { goal: "Wave 1 v1 thread surface", slices, vaultPath },
     { vaultPath },
   );
   return created.plan.plan_id;
 }
 
-test("minni_thread_assign -> claim -> worker_update completes a slice end to end", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [
-      { id: "research", title: "Research the approach" },
-    ]);
+async function readOrderedJournal(vaultPath, planId, sinceSeq = 0, limit = 200) {
+  const notePath = await findPlanNote(vaultPath, planId);
+  assert.ok(notePath, `expected plan note for ${planId}`);
+  const journalPath = journalPathFor(notePath, planId);
+  return readThreadEvents(journalPath, sinceSeq, limit);
+}
 
-    await call("minni_thread_assign", {
-      plan_id,
-      slice_id: "research",
-      worker_agent_id: "worker-a",
-    });
+test("Wave 1 E2E: tools/list registers the exact 12 v1 MCP tools and nothing else", async (t) => {
+  await withMcpSession(t, async ({ listTools }) => {
+    const tools = await listTools();
+    assert.deepEqual(
+      tools.map((tool) => tool.name),
+      EXPECTED_12_V1_TOOLS,
+    );
+  });
+});
 
-    const claim = await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "research",
-      worker_agent_id: "worker-a",
-      idempotency_key: "claim-research-1",
+test("Wave 1 E2E: minni_handoff_send + minni_handoff_inbox handle self and cross-agent handoffs in <1 KB without agent_ping diversion", async (t) => {
+  await withMcpSession(t, async ({ callRaw, rpcLog }) => {
+    // 1. Self-handoff (to_agent omitted -> defaults to DEFAULT_AGENT_ID)
+    const selfSend = await callRaw("minni_handoff_send", {
+      task: "Continue Wave 1 verification in the next session",
+      summary: "All 12 MCP tools wired; verify final test suite",
+      files: ["plugins/minni/src/server.ts", "plugins/minni/src/plan.ts"],
+      next_steps: ["Run npm test", "Run pytest"],
+      open_questions: ["Should we prune stale branches after attest?"],
     });
-    assert.ok(claim.token, "claim must return a one-time token");
-    assert.equal(claim.slice_id, "research");
-    assert.equal(claim.worker_agent_id, "worker-a");
+    assert.ok(
+      selfSend.bytes < 1024,
+      `minni_handoff_send receipt must be < 1024 bytes, got ${selfSend.bytes}`,
+    );
+    assert.equal(selfSend.data.status, "ok");
+    assert.equal(selfSend.data.from_agent, DEFAULT_AGENT_ID);
+    assert.equal(selfSend.data.to_agent, DEFAULT_AGENT_ID);
+    assert.equal(typeof selfSend.data.lease_id, "string");
+    assert.equal(typeof selfSend.data.expires_at, "string");
+
+    // 2. Cross-agent handoff with "ping ... question" text must NEVER divert to agent_ping
+    const crossSend = await callRaw("minni_handoff_send", {
+      to_agent: "codex",
+      task: "ping codex with a question: should we merge Slice 1B now?",
+      summary: "Cross-agent review handoff",
+    });
+    assert.ok(
+      crossSend.bytes < 1024,
+      `cross-agent minni_handoff_send receipt must be < 1024 bytes, got ${crossSend.bytes}`,
+    );
+    assert.equal(crossSend.data.status, "ok");
+    assert.equal(crossSend.data.from_agent, DEFAULT_AGENT_ID);
+    assert.equal(crossSend.data.to_agent, "codex");
     assert.equal(
-      claim.filePath,
-      undefined,
-      "claim response must never leak the secret envelope's file path",
-    );
-    assert.deepEqual(
-      Object.keys(claim).sort(),
-      [
-        "claim_id",
-        "expires_at",
-        "generation",
-        "plan_id",
-        "rev",
-        "slice_id",
-        "token",
-        "worker_agent_id",
-      ].sort(),
-      "claim response must be exactly ThreadClaimResponse, nothing more",
+      rpcLog.some((entry) => entry.method.includes("ping")),
+      false,
+      "minni_handoff_send must never divert to retired agent_ping RPCs",
     );
 
-    const started = await call("minni_thread_worker_update", {
-      plan_id,
-      slice_id: "research",
-      worker_agent_id: "worker-a",
-      claim_token: claim.token,
-      idempotency_key: "start-research-1",
-      action: "start",
-    });
-    assert.equal(started.slice.status, "in_progress");
-
-    const done = await call("minni_thread_worker_update", {
-      plan_id,
-      slice_id: "research",
-      worker_agent_id: "worker-a",
-      claim_token: claim.token,
-      idempotency_key: "done-research-1",
-      action: "complete",
-      evidence: "Verified against docs/source-a.md and docs/source-b.md",
-    });
-    assert.equal(done.slice.status, "done");
-
-    // Task 6 followup regression: "complete" clears the live claim once it
-    // durably lands, so an identical retry has no live claim left to
-    // authenticate the same token against — the OLD code threw "claim scope
-    // mismatch" here instead of replaying. The private worker-update
-    // receipt (keyed by plan/slice/worker/idempotency, holding a token
-    // digest and the original public response) is what a retry
-    // authenticates against instead.
-    const eventsBeforeRetry = await call("minni_thread_events", {
-      plan_id,
-      since_seq: 0,
-      limit: 200,
-    });
-    const retried = await call("minni_thread_worker_update", {
-      plan_id,
-      slice_id: "research",
-      worker_agent_id: "worker-a",
-      claim_token: claim.token,
-      idempotency_key: "done-research-1",
-      action: "complete",
-      evidence: "Verified against docs/source-a.md and docs/source-b.md",
-    });
-    assert.deepEqual(
-      retried,
-      done,
-      "an identical retry after completion must replay the exact original response",
+    // 3. Listing pending inbox without ack leaves item pending and hydrates packet preview
+    const listOnly = await callRaw("minni_handoff_inbox", {});
+    assert.equal(listOnly.data.status, "ok");
+    assert.equal(listOnly.data.count, 1);
+    assert.equal(listOnly.data.acked_count, undefined);
+    assert.equal(listOnly.data.handoffs[0].lease_id, selfSend.data.lease_id);
+    assert.equal(
+      listOnly.data.handoffs[0].summary,
+      "All 12 MCP tools wired; verify final test suite",
     );
-    const eventsAfterRetry = await call("minni_thread_events", {
-      plan_id,
-      since_seq: 0,
-      limit: 200,
-    });
-    assert.deepEqual(
-      eventsAfterRetry.events,
-      eventsBeforeRetry.events,
-      "a same-key retry must never append a new journal event",
-    );
-    assert.equal(eventsAfterRetry.next_seq, eventsBeforeRetry.next_seq);
-
-    // A wrong token against the same idempotency key must fail typed — the
-    // receipt authenticates the retry via a timing-safe token digest, not
-    // by trusting the idempotency key alone.
-    const wrongToken = await call("minni_thread_worker_update", {
-      plan_id,
-      slice_id: "research",
-      worker_agent_id: "worker-a",
-      claim_token: "wrong-token-does-not-match-the-original",
-      idempotency_key: "done-research-1",
-      action: "complete",
-      evidence: "Verified against docs/source-a.md and docs/source-b.md",
-    });
-    assert.equal(wrongToken.status, "error");
-    assert.match(wrongToken.error, /claim token mismatch/);
-
-    // The same idempotency key reused for a DIFFERENT action is a genuine
-    // identity conflict, not a replay — it must also fail typed.
-    const conflictingAction = await call("minni_thread_worker_update", {
-      plan_id,
-      slice_id: "research",
-      worker_agent_id: "worker-a",
-      claim_token: claim.token,
-      idempotency_key: "done-research-1",
-      action: "start",
-    });
-    assert.equal(conflictingAction.status, "error");
-    assert.match(
-      conflictingAction.error,
-      /idempotency key .* already bound to a different operation/,
-    );
-
-    const eventsAfterConflicts = await call("minni_thread_events", {
-      plan_id,
-      since_seq: 0,
-      limit: 200,
-    });
-    assert.deepEqual(
-      eventsAfterConflicts.events,
-      eventsBeforeRetry.events,
-      "a rejected wrong-token or conflicting-action call must never append a new journal event either",
-    );
-  });
-});
-
-test("minni_thread_assign stamps the server-side orchestrator actor on slice.assigned, never the assignment target worker", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [
-      { id: "research", title: "Research the approach" },
+    assert.deepEqual(listOnly.data.handoffs[0].files, [
+      "plugins/minni/src/server.ts",
+      "plugins/minni/src/plan.ts",
     ]);
 
-    await call("minni_thread_assign", {
-      plan_id,
-      slice_id: "research",
-      worker_agent_id: "worker-a",
-      // Even if a caller tries to smuggle an actor-shaped field alongside
-      // the declared schema, zod's default "strip unknown keys" behavior
-      // must drop it before it ever reaches assignSlice.
-      actor_agent_id: "attempted-model-supplied-actor",
-      agent_id: "attempted-model-supplied-actor",
+    // 4. Listing with ack: true reads AND clears all pending items for this agent in one call
+    const readAndClear = await callRaw("minni_handoff_inbox", {
+      ack: true,
+      note: "Picked up cleanly in follow-up session",
     });
+    assert.equal(readAndClear.data.status, "ok");
+    assert.equal(readAndClear.data.count, 1);
+    assert.equal(readAndClear.data.acked_count, 1);
+    assert.equal(readAndClear.data.handoffs[0].ack_status, "accepted");
 
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
-    const assigned = events.events.find((e) => e.kind === "slice.assigned");
-    assert.ok(assigned, "expected a slice.assigned ordered event");
-    assert.equal(assigned.actor, DEFAULT_AGENT_ID);
-    assert.notEqual(assigned.actor, "worker-a");
-    assert.notEqual(assigned.actor, "attempted-model-supplied-actor");
+    const afterClear = await callRaw("minni_handoff_inbox", {});
+    assert.equal(afterClear.data.count, 0);
 
-    const baseline = events.events.find((e) => e.kind === "state.baseline");
-    assert.ok(baseline, "expected a state.baseline ordered event");
-    assert.equal(baseline.actor, DEFAULT_AGENT_ID);
+    // 5. Direct single-lease acknowledgment with explicit rejection status
+    const secondSelf = await callRaw("minni_handoff_send", {
+      task: "Stale follow-up task",
+    });
+    const directAck = await callRaw("minni_handoff_inbox", {
+      lease_id: secondSelf.data.lease_id,
+      status: "rejected_stale",
+      note: "Already superseded by newer slice",
+    });
+    assert.equal(directAck.data.status, "rejected_stale");
+    assert.equal(directAck.data.lease_id, secondSelf.data.lease_id);
+    assert.equal(directAck.data.acked, true);
+
+    const afterDirectAck = await callRaw("minni_handoff_inbox", {});
+    assert.equal(afterDirectAck.data.count, 0);
   });
 });
 
-test("minni_thread_ready reflects claim state and defaults plan_id to the active plan", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
+test("Wave 1 E2E: 4 Thread tools stay <2 KB (<1 KB for scar) even on a >54 KB PlanArtifact and support inline activate", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, callRaw }) => {
+    const heavySlices = Array.from({ length: 15 }, (_, idx) => ({
+      id: `s${idx + 1}`,
+      title: `Slice ${idx + 1}: consolidate subsystem surface #${idx + 1}`,
+      gate: `npm --prefix plugins/minni test -- slice-${idx + 1}`,
+      evidence: `Initial seeded context ${idx + 1}: ${"E".repeat(2200)}`,
+    }));
 
-    // createPlan auto-activates — plan_id is intentionally omitted here to
-    // exercise the same id-less default every other optional-plan_id Thread
-    // tool already honors (resolvePlanIdOrActive).
-    const readyBeforeClaim = await call("minni_thread_ready", {});
-    assert.deepEqual(readyBeforeClaim.ready.map((s) => s.id), ["alpha"]);
-
-    await call("minni_thread_assign", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
+    const created = await callRaw("minni_thread_create", {
+      goal: "Consolidate MCP surface and keep all thread tool responses strictly under 2 KB",
+      constraints: ["Never exceed 2 KB response budget", "Preserve full plan on disk"],
+      slices: heavySlices,
+      activate: true,
     });
-    await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-      idempotency_key: "claim-alpha-1",
-    });
-
-    const readyAfterClaim = await call("minni_thread_ready", { plan_id });
-    assert.deepEqual(
-      readyAfterClaim.ready.map((s) => s.id),
-      [],
-      "a live-claimed slice must not still be reported ready",
+    assert.ok(
+      created.bytes < 2048,
+      `minni_thread_create response must be < 2048 bytes, got ${created.bytes}`,
     );
+    assert.equal(created.data.active, true);
+    assert.equal(created.data.scar_tissue, undefined);
+    assert.equal(created.data.slices.length, 15);
+    const plan_id = created.data.plan_id;
+
+    // Grow the persisted PlanArtifact well past 54 KB with 25 large scars
+    for (let i = 1; i <= 25; i++) {
+      const scarRes = await callRaw("minni_thread_scar", {
+        plan_id,
+        slice_id: `s${((i - 1) % 15) + 1}`,
+        kind: "failed_command",
+        signal: `scar-signal-${i}-${"S".repeat(600)}`,
+        resolution: `scar-resolution-${i}-${"R".repeat(600)}`,
+      });
+      assert.ok(
+        scarRes.bytes < 1024,
+        `minni_thread_scar response must be < 1024 bytes, got ${scarRes.bytes}`,
+      );
+      assert.equal(scarRes.data.scar_count, i);
+      assert.ok(
+        scarRes.data.scar.signal.length <= 200,
+        `scar signal preview must be <= 200 chars, got ${scarRes.data.scar.signal.length}`,
+      );
+      assert.equal(scarRes.data.plan, undefined);
+    }
+
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    assert.ok(notePath);
+    const noteStat = await stat(notePath);
+    assert.ok(
+      noteStat.size > 54 * 1024,
+      `persisted plan note should exceed 54 KB for stress proof, got ${noteStat.size} bytes`,
+    );
+
+    // minni_thread_status must stay < 2048 bytes and cap each scar string to <= 160 chars
+    const statusRes = await callRaw("minni_thread_status", { plan_id });
+    assert.ok(
+      statusRes.bytes < 2048,
+      `minni_thread_status response must be < 2048 bytes on >54 KB plan, got ${statusRes.bytes}`,
+    );
+    assert.equal(statusRes.data.active, true);
+    assert.ok(Array.isArray(statusRes.data.view.scars));
+    assert.ok(statusRes.data.view.scars.length > 0);
+    for (const scarLine of statusRes.data.view.scars) {
+      assert.ok(
+        scarLine.length <= 160,
+        `compactPlanView scar line must be <= 160 chars, got ${scarLine.length}`,
+      );
+    }
+
+    // minni_thread_update defaults compact to true (< 2048 bytes, no full plan dump)
+    const updateDefault = await callRaw("minni_thread_update", {
+      plan_id,
+      slice_id: "s1",
+      status: "done",
+      evidence: `Verified s1 with huge evidence payload: ${"V".repeat(1500)}`,
+    });
+    assert.ok(
+      updateDefault.bytes < 2048,
+      `default minni_thread_update response must be < 2048 bytes, got ${updateDefault.bytes}`,
+    );
+    assert.equal(updateDefault.data.plan, undefined);
+    assert.equal(updateDefault.data.updated_slice.id, "s1");
+    assert.equal(updateDefault.data.updated_slice.status, "done");
+    assert.ok(updateDefault.data.updated_slice.evidence.length <= 240);
+    for (const scarLine of updateDefault.data.scars) {
+      assert.ok(scarLine.length <= 160);
+    }
+
+    // Inline deactivate & re-activate via minni_thread_update
+    const deactivated = await callRaw("minni_thread_update", {
+      plan_id,
+      activate: false,
+    });
+    assert.ok(deactivated.bytes < 2048);
+    assert.equal(deactivated.data.active, false);
+    const statusAfterDeactivate = await callRaw("minni_thread_status", { plan_id });
+    assert.equal(statusAfterDeactivate.data.active, false);
+
+    const reactivated = await callRaw("minni_thread_update", {
+      plan_id,
+      activate: true,
+    });
+    assert.ok(reactivated.bytes < 2048);
+    assert.equal(reactivated.data.active, true);
+
+    // Explicit opt-in include_full_plan: true still returns the full persisted PlanArtifact
+    const updateFull = await callRaw("minni_thread_update", {
+      plan_id,
+      slice_id: "s2",
+      status: "done",
+      evidence: "Verified s2 with opt-in full plan",
+      include_full_plan: true,
+    });
+    assert.ok(updateFull.data.plan);
+    assert.equal(updateFull.data.plan.scar_tissue.length, 25);
   });
 });
-
-test("minni_thread_events is journal-backed and its cursor excludes seq at or below since_seq", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
-
-    await call("minni_thread_assign", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-    });
-    await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-      idempotency_key: "claim-alpha-2",
-    });
-
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
-    assert.ok(events.events.length > 0, "expected at least one ordered event");
-    const kinds = events.events.map((e) => e.kind);
-    assert.ok(kinds.includes("slice.assigned"), `expected slice.assigned in ${kinds}`);
-    assert.ok(kinds.includes("slice.claimed"), `expected slice.claimed in ${kinds}`);
-    assert.equal(events.next_seq, events.events.at(-1).seq);
-
-    const cursor = await call("minni_thread_events", { plan_id, since_seq: events.next_seq });
-    assert.deepEqual(cursor.events, [], "cursor read must exclude seq at or below since_seq");
-    assert.equal(cursor.next_seq, events.next_seq);
-  });
-});
-
-// Final-fix Important finding 2: structural/legacy orchestrator mutations
-// (minni_thread_update/scar/replan/restore) previously never touched the
-// ordered cursor at all — a caller consuming minni_thread_events had no way
-// to see a status change, scar, replan, or restore alongside slice.*/claim
-// events. These tests prove: (1) each of the four kinds appears via
-// minni_thread_events in order with a server-stamped actor, (2) ready.changed
-// is coalesced for update/replan/restore but never for scar, (3) reconcile-
-// before/append-after crash-gap semantics apply to these tools too, and (4)
-// no evidence/scar text/token/path ever leaks into an ordered payload.
 
 test("minni_thread_update appends an ordered status_changed mirror with the server actor and coalesces ready.changed", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
@@ -403,8 +526,12 @@ test("minni_thread_update appends an ordered status_changed mirror with the serv
       { id: "b", title: "Slice B", depends_on: ["a"] },
     ]);
 
-    const before = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
-    assert.equal(before.events.length, 0, "no ordered events exist before the first orchestrator mutation");
+    const before = await readOrderedJournal(vaultPath, plan_id, 0, 50);
+    assert.equal(
+      before.events.length,
+      0,
+      "no ordered events exist before the first orchestrator mutation",
+    );
 
     await call("minni_thread_update", {
       plan_id,
@@ -413,7 +540,7 @@ test("minni_thread_update appends an ordered status_changed mirror with the serv
       evidence: "Verified against docs/source-a.md",
     });
 
-    const after = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
+    const after = await readOrderedJournal(vaultPath, plan_id, 0, 50);
     const kinds = after.events.map((e) => e.kind);
     assert.ok(kinds.includes("state.baseline"), `expected state.baseline in ${kinds}`);
 
@@ -432,8 +559,12 @@ test("minni_thread_update appends an ordered status_changed mirror with the serv
     assert.ok(readyChanged, "expected a coalesced ready.changed event when b becomes ready");
     assert.deepEqual(readyChanged.payload, { slices: [{ id: "b", title: "Slice B" }] });
 
-    const cursor = await call("minni_thread_events", { plan_id, since_seq: after.next_seq });
-    assert.deepEqual(cursor.events, [], "cursor read must exclude seq at or below since_seq for these mirrored kinds too");
+    const cursor = await readOrderedJournal(vaultPath, plan_id, after.next_seq, 50);
+    assert.deepEqual(
+      cursor.events,
+      [],
+      "cursor read must exclude seq at or below since_seq for mirrored kinds",
+    );
   });
 });
 
@@ -448,7 +579,7 @@ test("minni_thread_scar appends an ordered scar_added mirror without emitting re
       resolution: "sentinel-scar-resolution-do-not-leak-4b1a",
     });
 
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
+    const events = await readOrderedJournal(vaultPath, plan_id, 0, 50);
     const kinds = events.events.map((e) => e.kind);
     const scarAdded = events.events.find((e) => e.kind === "scar_added");
     assert.ok(scarAdded, `expected an ordered scar_added event, got kinds: ${kinds}`);
@@ -463,77 +594,6 @@ test("minni_thread_scar appends an ordered scar_added mirror without emitting re
       false,
       "a scar never changes the ready set and must never emit ready.changed",
     );
-  });
-});
-
-test("minni_thread_replan appends an ordered replan mirror and coalesces ready.changed when supersession frees a dependent", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [
-      { id: "a", title: "Slice A" },
-      { id: "b", title: "Slice B", depends_on: ["a"] },
-    ]);
-
-    const readyBefore = await call("minni_thread_ready", { plan_id });
-    assert.deepEqual(readyBefore.ready.map((s) => s.id), ["a"]);
-
-    await call("minni_thread_replan", { plan_id, drop_slice_ids: ["a"] });
-
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
-    const kinds = events.events.map((e) => e.kind);
-    const replanEvent = events.events.find((e) => e.kind === "replan");
-    assert.ok(replanEvent, `expected an ordered replan event, got kinds: ${kinds}`);
-    assert.equal(replanEvent.actor, DEFAULT_AGENT_ID);
-    assert.ok(
-      replanEvent.payload?.depends_on_superseded,
-      `expected depends_on_superseded in the replan payload, got: ${JSON.stringify(replanEvent)}`,
-    );
-
-    const readyChanged = events.events.find((e) => e.kind === "ready.changed");
-    assert.ok(readyChanged, "expected a coalesced ready.changed event when b's dependency is superseded");
-    assert.deepEqual(readyChanged.payload, { slices: [{ id: "b", title: "Slice B" }] });
-
-    const readyAfter = await call("minni_thread_ready", { plan_id });
-    assert.deepEqual(readyAfter.ready.map((s) => s.id), ["b"]);
-  });
-});
-
-test("minni_thread_restore appends an ordered restored mirror reflecting the ready-set delta", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [
-      { id: "a", title: "Slice A" },
-      { id: "b", title: "Slice B", depends_on: ["a"] },
-    ]);
-
-    const doneA = await call("minni_thread_update", {
-      plan_id,
-      slice_id: "a",
-      status: "done",
-      evidence: "Verified against docs/source-a.md",
-    });
-    const revAfterADone = doneA.plan.rev;
-    // b is ready now that a is done.
-
-    await call("minni_thread_replan", { plan_id, drop_slice_ids: ["b"] });
-    const readyAfterDrop = await call("minni_thread_ready", { plan_id });
-    assert.deepEqual(readyAfterDrop.ready.map((s) => s.id), []);
-
-    await call("minni_thread_restore", { plan_id, rev: revAfterADone });
-
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
-    const kinds = events.events.map((e) => e.kind);
-    const restoredEvent = events.events.find((e) => e.kind === "restored");
-    assert.ok(restoredEvent, `expected an ordered restored event, got kinds: ${kinds}`);
-    assert.equal(restoredEvent.actor, DEFAULT_AGENT_ID);
-    assert.deepEqual(restoredEvent.payload, { from_rev: revAfterADone });
-
-    const readyChangedEvents = events.events.filter((e) => e.kind === "ready.changed");
-    assert.ok(
-      readyChangedEvents.some((e) => e.payload?.slices?.some((s) => s.id === "b")),
-      "expected restore's ready.changed to show b becoming ready again",
-    );
-
-    const readyAfterRestore = await call("minni_thread_ready", { plan_id });
-    assert.deepEqual(readyAfterRestore.ready.map((s) => s.id), ["b"]);
   });
 });
 
@@ -555,19 +615,25 @@ test("minni_thread_update recovers a note-ahead-of-journal gap via state.recover
       evidence: "blocked for recovery check",
     });
 
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const events = await readOrderedJournal(vaultPath, plan_id, 0, 200);
     const kinds = events.events.map((e) => e.kind);
     const recovered = events.events.find((e) => e.kind === "state.recovered");
     assert.ok(recovered, `expected a state.recovered event, got kinds: ${kinds}`);
     assert.equal(recovered.rev, planAhead.rev);
-    assert.ok(events.events.some((e) => e.kind === "status_changed" && e.payload?.to === "blocked"));
+    assert.ok(
+      events.events.some((e) => e.kind === "status_changed" && e.payload?.to === "blocked"),
+    );
   });
 });
 
 test("minni_thread_scar recovers a note-ahead-of-journal gap via state.recovered", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
-    await call("minni_thread_scar", { plan_id, kind: "dead_end", signal: "first scar before gap" });
+    await call("minni_thread_scar", {
+      plan_id,
+      kind: "dead_end",
+      signal: "first scar before gap",
+    });
 
     const notePath = await findPlanNote(vaultPath, plan_id);
     const planBeforeGap = await rehydratePlan(notePath);
@@ -575,9 +641,13 @@ test("minni_thread_scar recovers a note-ahead-of-journal gap via state.recovered
     await persistPlan(planBeforeGap, { vaultPath, notePath });
     const planAhead = await rehydratePlan(notePath);
 
-    await call("minni_thread_scar", { plan_id, kind: "failed_command", signal: "second scar after gap" });
+    await call("minni_thread_scar", {
+      plan_id,
+      kind: "failed_command",
+      signal: "second scar after gap",
+    });
 
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const events = await readOrderedJournal(vaultPath, plan_id, 0, 200);
     const kinds = events.events.map((e) => e.kind);
     const recovered = events.events.find((e) => e.kind === "state.recovered");
     assert.ok(recovered, `expected a state.recovered event, got kinds: ${kinds}`);
@@ -586,63 +656,7 @@ test("minni_thread_scar recovers a note-ahead-of-journal gap via state.recovered
   });
 });
 
-test("minni_thread_replan recovers a note-ahead-of-journal gap via state.recovered", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
-    await call("minni_thread_replan", { plan_id, add_slices: [{ title: "Slice B" }] });
-
-    const notePath = await findPlanNote(vaultPath, plan_id);
-    const planBeforeGap = await rehydratePlan(notePath);
-    planBeforeGap.next_action = "simulate note-ahead crash gap";
-    await persistPlan(planBeforeGap, { vaultPath, notePath });
-    const planAhead = await rehydratePlan(notePath);
-
-    await call("minni_thread_replan", { plan_id, add_slices: [{ title: "Slice C" }] });
-
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
-    const kinds = events.events.map((e) => e.kind);
-    const recovered = events.events.find((e) => e.kind === "state.recovered");
-    assert.ok(recovered, `expected a state.recovered event, got kinds: ${kinds}`);
-    assert.equal(recovered.rev, planAhead.rev);
-    assert.equal(events.events.filter((e) => e.kind === "replan").length, 2);
-  });
-});
-
-test("minni_thread_restore recovers a note-ahead-of-journal gap via state.recovered", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
-    const doneA = await call("minni_thread_update", {
-      plan_id,
-      slice_id: "a",
-      status: "done",
-      evidence: "Verified against docs/source-a.md",
-    });
-    const targetRev = doneA.plan.rev;
-    await call("minni_thread_update", {
-      plan_id,
-      slice_id: "a",
-      status: "blocked",
-      evidence: "reopen for restore recovery test",
-    });
-
-    const notePath = await findPlanNote(vaultPath, plan_id);
-    const planBeforeGap = await rehydratePlan(notePath);
-    planBeforeGap.next_action = "simulate note-ahead crash gap";
-    await persistPlan(planBeforeGap, { vaultPath, notePath });
-    const planAhead = await rehydratePlan(notePath);
-
-    await call("minni_thread_restore", { plan_id, rev: targetRev });
-
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
-    const kinds = events.events.map((e) => e.kind);
-    const recovered = events.events.find((e) => e.kind === "state.recovered");
-    assert.ok(recovered, `expected a state.recovered event, got kinds: ${kinds}`);
-    assert.equal(recovered.rev, planAhead.rev);
-    assert.ok(events.events.some((e) => e.kind === "restored"));
-  });
-});
-
-test("journal-ahead-of-note blocks minni_thread_update, scar, replan, and restore as thread_inconsistent", async (t) => {
+test("journal-ahead-of-note blocks minni_thread_update and minni_thread_scar as thread_inconsistent", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
     const notePath = await findPlanNote(vaultPath, plan_id);
@@ -652,15 +666,17 @@ test("journal-ahead-of-note blocks minni_thread_update, scar, replan, and restor
     await writeFile(
       journalPath,
       `# Minni Plan Journal\n\n## events\n${JSON.stringify({
-        thread_event_batch: [{
-          seq: 99,
-          rev: plan.rev + 5,
-          event_id: "ahead",
-          idempotency_key: "ahead",
-          actor: "test",
-          kind: "slice.completed",
-          at: new Date().toISOString(),
-        }],
+        thread_event_batch: [
+          {
+            seq: 99,
+            rev: plan.rev + 5,
+            event_id: "ahead",
+            idempotency_key: "ahead",
+            actor: "test",
+            kind: "slice.completed",
+            at: new Date().toISOString(),
+          },
+        ],
       })}\n`,
       "utf8",
     );
@@ -676,11 +692,6 @@ test("journal-ahead-of-note blocks minni_thread_update, scar, replan, and restor
         operation: "plan.scar",
         args: { kind: "dead_end", signal: "must not commit" },
       },
-      {
-        name: "minni_thread_replan",
-        operation: "plan.replan",
-        args: { add_slices: [{ title: "Slice C" }] },
-      },
     ]) {
       const result = await call(tool.name, { plan_id, ...tool.args });
       assert.equal(result.status, "error", `${tool.name}: ${JSON.stringify(result)}`);
@@ -688,16 +699,10 @@ test("journal-ahead-of-note blocks minni_thread_update, scar, replan, and restor
       assert.equal(result.code, "THREAD_INCONSISTENT");
       assert.match(result.error, /thread_inconsistent/);
     }
-    // minni_thread_restore pre-existing behavior (unrelated to this fix):
-    // it wraps every thrown error from its withThreadLock body — including
-    // "revision not found" — into a soft { error } result rather than an
-    // MCP-level isError response, so it never rejects via call().
-    const restoreResult = await call("minni_thread_restore", { plan_id, rev: plan.rev });
-    assert.match(restoreResult.error, /thread_inconsistent/);
   });
 });
 
-test("no evidence, scar text, claim token, or private path leaks into ordered payloads from update/scar/replan/restore", async (t) => {
+test("no evidence, scar text, claim token, or private path leaks into ordered payloads from update or scar", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [
       { id: "a", title: "Slice A" },
@@ -707,7 +712,7 @@ test("no evidence, scar text, claim token, or private path leaks into ordered pa
     const SENTINEL_SIGNAL = "sentinel-signal-4b1a-do-not-leak";
     const SENTINEL_RESOLUTION = "sentinel-resolution-77aa-do-not-leak";
 
-    const doneA = await call("minni_thread_update", {
+    await call("minni_thread_update", {
       plan_id,
       slice_id: "a",
       status: "done",
@@ -719,13 +724,15 @@ test("no evidence, scar text, claim token, or private path leaks into ordered pa
       signal: SENTINEL_SIGNAL,
       resolution: SENTINEL_RESOLUTION,
     });
-    await call("minni_thread_replan", { plan_id, add_slices: [{ title: "Slice C" }] });
-    await call("minni_thread_restore", { plan_id, rev: doneA.plan.rev });
 
-    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const events = await readOrderedJournal(vaultPath, plan_id, 0, 200);
     const serialized = JSON.stringify(events.events);
     for (const sentinel of [SENTINEL_EVIDENCE, SENTINEL_SIGNAL, SENTINEL_RESOLUTION]) {
-      assert.doesNotMatch(serialized, new RegExp(sentinel), `ordered payloads leaked sentinel text: ${sentinel}`);
+      assert.doesNotMatch(
+        serialized,
+        new RegExp(sentinel),
+        `ordered payloads leaked sentinel text: ${sentinel}`,
+      );
     }
     assert.doesNotMatch(
       serialized,
@@ -740,128 +747,6 @@ test("no evidence, scar text, claim token, or private path leaks into ordered pa
   });
 });
 
-test("minni_thread_claim surfaces a typed domain error instead of a transport crash", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
-
-    const result = await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-      idempotency_key: "unassigned-claim",
-    });
-    assert.equal(result.status, "error");
-    assert.equal(result.operation, "plan.claim");
-    assert.match(result.error, /assigned/i);
-    assert.equal(result.filePath, undefined);
-    assert.equal(result.notePath, undefined);
-  });
-});
-
-test("minni_thread_worker_update history-append error never leaks the vault note path", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
-    await call("minni_thread_assign", {
-      plan_id,
-      slice_id: "a",
-      worker_agent_id: "worker-a",
-    });
-    const claim = await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "a",
-      worker_agent_id: "worker-a",
-      idempotency_key: "claim-for-path-leak",
-    });
-    assert.ok(
-      claim.token,
-      `claim must return a token before the history-append probe, got ${JSON.stringify(claim)}`,
-    );
-    const started = await call("minni_thread_worker_update", {
-      plan_id,
-      slice_id: "a",
-      worker_agent_id: "worker-a",
-      claim_token: claim.token,
-      idempotency_key: "start-history-eisdir",
-      action: "start",
-    });
-    assert.equal(started.slice.status, "in_progress");
-    const notePath = await findPlanNote(vaultPath, plan_id);
-    assert.ok(notePath, "seeded plan must have a vault note");
-    const historyFile = historyPathFor(notePath);
-    await rm(historyFile, { force: true });
-    await mkdir(historyFile);
-
-    const result = await call("minni_thread_worker_update", {
-      plan_id,
-      slice_id: "a",
-      worker_agent_id: "worker-a",
-      claim_token: claim.token,
-      idempotency_key: "complete-history-eisdir",
-      action: "complete",
-      evidence: "Completed despite a broken history append",
-    });
-    assert.equal(result.status, "error");
-    assert.equal(result.operation, "plan.worker_update");
-    assert.equal(result.code, "PLAN_HISTORY_APPEND_FAILED");
-    assert.equal(result.notePath, undefined);
-    assert.equal(result.filePath, undefined);
-    assert.match(result.error, /note committed at rev/);
-    assert.match(result.error, /EISDIR/);
-    assert.equal(
-      result.error.includes(notePath),
-      false,
-      "model-facing MCP error must not embed PlanHistoryAppendError.notePath",
-    );
-    assert.equal(
-      result.error.includes(historyFile),
-      false,
-      "model-facing MCP error must not embed the history file path from a real Node EISDIR",
-    );
-    assert.doesNotMatch(
-      JSON.stringify(result),
-      /wiki\/artifacts/,
-      "model-facing MCP error payload must not contain a vault artifacts path",
-    );
-    assert.equal(
-      JSON.stringify(result).includes(historyFile),
-      false,
-      "model-facing MCP JSON must not embed the history file path",
-    );
-  });
-});
-
-test("minni_thread_claim EISDIR journal is a typed MCP error, not a path-bearing transport crash", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
-    const notePath = await findPlanNote(vaultPath, plan_id);
-    assert.ok(notePath, "seeded plan must have a vault note");
-    const journalPath = journalPathFor(notePath, plan_id);
-    await rm(journalPath, { force: true });
-    await mkdir(journalPath);
-
-    const result = await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "a",
-      worker_agent_id: "worker-a",
-      idempotency_key: "claim-eisdir-journal",
-    });
-    assert.equal(result.status, "error");
-    assert.equal(result.operation, "plan.claim");
-    assert.equal(result.code, "THREAD_JOURNAL_UNREADABLE");
-    assert.match(result.error, /EISDIR|unreadable/);
-    assert.equal(result.error.includes(journalPath), false);
-    assert.equal(result.error.includes(notePath), false);
-    assert.equal(result.journalPath, undefined);
-    assert.equal(result.notePath, undefined);
-    assert.equal(result.filePath, undefined);
-    assert.doesNotMatch(
-      JSON.stringify(result),
-      /wiki\/artifacts/,
-      "model-facing claim error must not embed a vault artifacts path",
-    );
-  });
-});
-
 test("minni_thread_status EISDIR journal does not leak a vault path as a transport crash", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
@@ -872,7 +757,11 @@ test("minni_thread_status EISDIR journal does not leak a vault path as a transpo
     await mkdir(journalPath);
 
     const result = await call("minni_thread_status", { plan_id });
-    assert.equal(typeof result.error, "undefined", `status must not fail at plan-note discovery: ${JSON.stringify(result)}`);
+    assert.equal(
+      typeof result.error,
+      "undefined",
+      `status must not fail at plan-note discovery: ${JSON.stringify(result)}`,
+    );
     assert.ok(result.view, "status must still resolve the plan note beside an unreadable journal");
     assert.equal(result.rev !== undefined, true);
     assert.equal(
@@ -888,69 +777,6 @@ test("minni_thread_status EISDIR journal does not leak a vault path as a transpo
   });
 });
 
-test("minni_thread_events fails closed on an unreadable journal instead of an empty cursor", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
-    const notePath = await findPlanNote(vaultPath, plan_id);
-    assert.ok(notePath, "seeded plan must have a vault note");
-    const journalPath = journalPathFor(notePath, plan_id);
-    await rm(journalPath, { force: true });
-    await mkdir(journalPath);
-
-    const result = await call("minni_thread_events", {
-      plan_id,
-      since_seq: 0,
-      limit: 50,
-    });
-    assert.notEqual(
-      result.status,
-      undefined,
-      "unreadable journal must not look like a successful empty cursor",
-    );
-    assert.equal(result.status, "error");
-    assert.equal(result.operation, "plan.events");
-    assert.equal(Array.isArray(result.events), false);
-    assert.match(result.error, /EISDIR|unreadable/);
-    assert.equal(result.error.includes(journalPath), false);
-    assert.equal(result.error.includes(notePath), false);
-    assert.equal(result.journalPath, undefined);
-    assert.doesNotMatch(
-      JSON.stringify(result),
-      /wiki\/artifacts/,
-      "model-facing events error must not embed the journal path",
-    );
-  });
-});
-
-test("minni_thread_restore catch never forwards a path-bearing Error.message", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
-    const notePath = await findPlanNote(vaultPath, plan_id);
-    assert.ok(notePath, "seeded plan must have a vault note");
-    const journalPath = journalPathFor(notePath, plan_id);
-    await rm(journalPath, { force: true });
-    await mkdir(journalPath);
-
-    const result = await call("minni_thread_restore", {
-      plan_id,
-      rev: 1,
-    });
-    assert.equal(typeof result.error, "string");
-    assert.equal(result.error.includes(notePath), false);
-    assert.equal(result.error.includes(journalPath), false);
-    assert.doesNotMatch(
-      JSON.stringify(result),
-      /wiki\/artifacts/,
-      "restore catch must not embed a vault artifacts path",
-    );
-  });
-});
-
-// Cassandra PR #371 round 4: update/scar/replan write the ordered journal via
-// prepareThreadMutation / appendJournal / appendJournalLine but were not
-// wrapped in threadWorkerErrorResult. A raw Node EISDIR/EACCES from those
-// writes becomes a transport-level isError whose .message embeds the vault
-// journal path. Sanitizer unit tests never ran on this MCP path.
 const ORCHESTRATOR_JOURNAL_MUTATIONS = [
   {
     name: "minni_thread_update",
@@ -962,14 +788,12 @@ const ORCHESTRATOR_JOURNAL_MUTATIONS = [
     operation: "plan.scar",
     args: { kind: "dead_end", signal: "must not leak a journal path" },
   },
-  {
-    name: "minni_thread_replan",
-    operation: "plan.replan",
-    args: { add_slices: [{ title: "Slice C" }] },
-  },
 ];
 
-function assertPathFreeOrchestratorJournalError(result, { name, operation, journalPath, notePath }) {
+function assertPathFreeOrchestratorJournalError(
+  result,
+  { name, operation, journalPath, notePath },
+) {
   assert.equal(
     result.status,
     "error",
@@ -989,7 +813,7 @@ function assertPathFreeOrchestratorJournalError(result, { name, operation, journ
   );
 }
 
-test("minni_thread_update/scar/replan EISDIR journal is a typed MCP error, not a path-bearing transport crash", async (t) => {
+test("minni_thread_update and minni_thread_scar EISDIR journal is a typed MCP error, not a path-bearing transport crash", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     for (const tool of ORCHESTRATOR_JOURNAL_MUTATIONS) {
       const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
@@ -1011,7 +835,7 @@ test("minni_thread_update/scar/replan EISDIR journal is a typed MCP error, not a
   });
 });
 
-test("minni_thread_update/scar/replan EACCES journal append is a typed MCP error, not a path-bearing transport crash", async (t) => {
+test("minni_thread_update and minni_thread_scar EACCES journal append is a typed MCP error, not a path-bearing transport crash", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     for (const tool of ORCHESTRATOR_JOURNAL_MUTATIONS) {
       const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
@@ -1035,169 +859,6 @@ test("minni_thread_update/scar/replan EACCES journal append is a typed MCP error
   });
 });
 
-test("minni_thread_update/scar/replan funnel journal I/O failures through threadWorkerErrorResult", async () => {
-  const source = await readFile(SRC_PATH, "utf8");
-  for (const { name, operation } of ORCHESTRATOR_JOURNAL_MUTATIONS) {
-    const block = toolBlock(source, name);
-    assert.match(
-      block,
-      /try \{/,
-      `${name} must catch journal I/O instead of leaking a raw JSON-RPC error`,
-    );
-    assert.match(
-      block,
-      new RegExp(`threadWorkerErrorResult\\(\\s*"${operation.replace(".", "\\.")}"`),
-      `${name} must sanitize throws through threadWorkerErrorResult("${operation}")`,
-    );
-  }
-});
-
-test("minni_thread_worker_update rejects an empty idempotency_key before it reaches thread-worker", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call, send, awaitResponse }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
-    await call("minni_thread_assign", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-    });
-    const claim = await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-      idempotency_key: "claim-alpha-3",
-    });
-
-    const id = 9001;
-    send({
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: {
-        name: "minni_thread_worker_update",
-        arguments: {
-          plan_id,
-          slice_id: "alpha",
-          worker_agent_id: "worker-a",
-          claim_token: claim.token,
-          idempotency_key: "",
-          action: "start",
-        },
-      },
-    });
-    const reply = await awaitResponse(id);
-    assert.equal(
-      reply.result?.isError,
-      true,
-      `an empty idempotency_key must be rejected at the schema layer, not reach thread-worker: ${JSON.stringify(reply)}`,
-    );
-    assert.match(
-      reply.result.content[0].text,
-      /idempotency_key/,
-      "the validation error must name the offending field",
-    );
-  });
-});
-
-test("minni_thread_worker_update and minni_thread_claim reject a whitespace-only idempotency_key at the SDK layer", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call, send, awaitResponse }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
-    await call("minni_thread_assign", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-    });
-
-    const claimId = 9101;
-    send({
-      jsonrpc: "2.0",
-      id: claimId,
-      method: "tools/call",
-      params: {
-        name: "minni_thread_claim",
-        arguments: {
-          plan_id,
-          slice_id: "alpha",
-          worker_agent_id: "worker-a",
-          idempotency_key: "   ",
-        },
-      },
-    });
-    const claimReply = await awaitResponse(claimId);
-    assert.equal(
-      claimReply.result?.isError,
-      true,
-      `a whitespace-only idempotency_key must be rejected before reaching thread-worker: ${JSON.stringify(claimReply)}`,
-    );
-
-    const claim = await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-      idempotency_key: "claim-alpha-blank-check",
-    });
-
-    const updateId = 9102;
-    send({
-      jsonrpc: "2.0",
-      id: updateId,
-      method: "tools/call",
-      params: {
-        name: "minni_thread_worker_update",
-        arguments: {
-          plan_id,
-          slice_id: "alpha",
-          worker_agent_id: "worker-a",
-          claim_token: claim.token,
-          idempotency_key: "\t\n ",
-          action: "start",
-        },
-      },
-    });
-    const updateReply = await awaitResponse(updateId);
-    assert.equal(
-      updateReply.result?.isError,
-      true,
-      `a whitespace-only idempotency_key must be rejected before reaching thread-worker: ${JSON.stringify(updateReply)}`,
-    );
-  });
-});
-
-test("minni_thread_worker_update's discriminated union strips fields that do not belong to the given action, never applies them", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
-    await call("minni_thread_assign", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-    });
-    const claim = await call("minni_thread_claim", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-      idempotency_key: "claim-alpha-4",
-    });
-
-    // "start" declares no evidence field. The discriminated union's "start"
-    // branch is a closed z.object({action: literal("start")}), so zod strips
-    // evidence rather than smuggling it into the persisted slice.
-    const started = await call("minni_thread_worker_update", {
-      plan_id,
-      slice_id: "alpha",
-      worker_agent_id: "worker-a",
-      claim_token: claim.token,
-      idempotency_key: "mismatched-action-fields",
-      action: "start",
-      evidence: "must be stripped, not attached to the start action",
-    });
-    assert.equal(started.slice.status, "in_progress");
-    assert.equal(
-      started.slice.evidence,
-      undefined,
-      "a stray evidence field alongside action:start must never reach the persisted slice",
-    );
-  });
-});
-
 function toolBlock(source, toolName) {
   const start = source.indexOf(`server.registerTool(\n  "${toolName}"`);
   assert.notEqual(start, -1, `${toolName} registration not found`);
@@ -1205,146 +866,35 @@ function toolBlock(source, toolName) {
   return source.slice(start, next === -1 ? undefined : next);
 }
 
-test("minni_thread_worker_update schema exposes no topology, assignment, or force field", async () => {
+test("minni_thread_status, minni_thread_update, and minni_thread_scar funnel errors through threadWorkerErrorResult and never accept vaultPath", async () => {
   const source = await readFile(SRC_PATH, "utf8");
-  const block = toolBlock(source, "minni_thread_worker_update");
-  const schemaStart = block.indexOf("inputSchema:");
-  const handlerStart = block.indexOf("async (");
-  const schema = block.slice(schemaStart, handlerStart);
-
-  for (const forbidden of [
-    "depends_on",
-    "dependency",
-    "\\bgate\\s*:",
-    "assigned_to",
-    "assignee",
-    "constraints",
-    "sibling",
-    "\\bforce\\b",
-    "force_reason",
-    "\\breplan\\b",
-    "new_slices",
-    "add_slices",
-    "drop_slice_ids",
-    "z\\.record",
+  for (const { name, operation } of [
+    { name: "minni_thread_status", operation: "plan.status" },
+    ...ORCHESTRATOR_JOURNAL_MUTATIONS,
   ]) {
-    assert.doesNotMatch(
-      schema,
-      new RegExp(forbidden),
-      `minni_thread_worker_update schema must not expose ${forbidden}`,
-    );
-  }
-  assert.match(
-    schema,
-    /idempotency_key:\s*nonBlankIdempotencyKey/,
-    "idempotency_key must be the shared, whitespace-rejecting schema",
-  );
-  assert.match(
-    source,
-    /const nonBlankIdempotencyKey\s*=\s*z\s*\n?\s*\.string\(\)\s*\n?\s*\.min\(1\)\s*\n?\s*\.refine\(/,
-    "the shared idempotency_key schema must reject whitespace-only values, not just length 0",
-  );
-});
-
-test("minni_thread_worker_update validates action as a real discriminated union and never spreads the raw request", async () => {
-  const source = await readFile(SRC_PATH, "utf8");
-  // The discriminated union is a module-scoped const consumed by (not
-  // inlined into) the tool block, so this checks the whole file rather than
-  // just the registerTool block.
-  assert.match(
-    source,
-    /workerUpdateActionSchema\s*=\s*z\.discriminatedUnion\(\s*"action"/,
-    "must validate action as a discriminated union, not a loosely-typed object",
-  );
-  const block = toolBlock(source, "minni_thread_worker_update");
-  assert.doesNotMatch(
-    block,
-    /updateClaimedSlice\(\{\s*\n\s*\.\.\./,
-    "must not spread the raw parsed request into thread-worker's updateClaimedSlice",
-  );
-});
-
-test("every Task 6 worker tool resolves plan_id server-side and never accepts a caller-supplied vault path", async () => {
-  const source = await readFile(SRC_PATH, "utf8");
-  for (const toolName of [
-    "minni_thread_ready",
-    "minni_thread_assign",
-    "minni_thread_claim",
-    "minni_thread_worker_update",
-    "minni_thread_events",
-  ]) {
-    const block = toolBlock(source, toolName);
+    const block = toolBlock(source, name);
     const schemaStart = block.indexOf("inputSchema:");
     const handlerStart = block.indexOf("async (");
     const schema = block.slice(schemaStart, handlerStart);
-    assert.doesNotMatch(schema, /vaultPath|vault_path/, `${toolName} must not accept a caller-supplied vault path`);
+    assert.doesNotMatch(
+      schema,
+      /vaultPath|vault_path/,
+      `${name} must not accept a caller-supplied vault path`,
+    );
     assert.match(
       block,
       /resolvePlanTarget\(planIdInput\)/,
-      `${toolName} must resolve plan_id through the shared, server-pinned resolvePlanTarget helper`,
+      `${name} must resolve plan_id through server-pinned resolvePlanTarget`,
+    );
+    assert.match(
+      block,
+      /try \{/,
+      `${name} must catch journal/storage I/O instead of leaking a raw JSON-RPC error`,
+    );
+    assert.match(
+      block,
+      new RegExp(`threadWorkerErrorResult\\(\\s*"${operation.replace(".", "\\.")}"`),
+      `${name} must sanitize throws through threadWorkerErrorResult("${operation}")`,
     );
   }
-});
-
-test("Class D: minni_thread_update bounds scar_tissue and non-target slice evidence in response and supports compact mode while persisting full plan", async (t) => {
-  await withMcpSession(t, async ({ vaultPath, call }) => {
-    const slices = Array.from({ length: 12 }, (_, idx) => ({
-      id: `s${idx + 1}`,
-      title: `Slice ${idx + 1}`,
-    }));
-    const plan_id = await seedPlan(vaultPath, slices);
-
-    for (let i = 1; i <= 10; i++) {
-      await call("minni_thread_scar", {
-        plan_id,
-        kind: "dead_end",
-        signal: `scar-${i}-${"x".repeat(400)}`,
-        resolution: `res-${i}-${"y".repeat(400)}`,
-      });
-    }
-
-    for (let i = 1; i <= 8; i++) {
-      await call("minni_thread_update", {
-        plan_id,
-        slice_id: `s${i}`,
-        status: "done",
-        evidence: `Verified s${i}: ${"E".repeat(600)}`,
-      });
-    }
-
-    const resDefault = await call("minni_thread_update", {
-      plan_id,
-      slice_id: "s9",
-      status: "done",
-      evidence: `Verified s9 target evidence: ${"T".repeat(300)}`,
-    });
-
-    assert.ok(resDefault.updated_slice, "response should include updated_slice");
-    assert.equal(resDefault.updated_slice.id, "s9");
-    assert.ok(
-      resDefault.plan.scar_tissue.length <= 5,
-      `default minni_thread_update response must cap plan.scar_tissue to <= 5 entries, got ${resDefault.plan.scar_tissue.length}`,
-    );
-    assert.equal(resDefault.plan.scar_tissue_total, 10);
-
-    const resCompact = await call("minni_thread_update", {
-      plan_id,
-      slice_id: "s10",
-      status: "done",
-      evidence: "Verified s10 in compact mode against src/server.ts",
-      compact: true,
-    });
-    assert.equal(resCompact.plan, undefined, "compact: true must omit full plan object");
-    assert.equal(resCompact.updated_slice.id, "s10");
-    assert.equal(resCompact.updated_slice.status, "done");
-
-    const resFull = await call("minni_thread_update", {
-      plan_id,
-      slice_id: "s11",
-      status: "done",
-      evidence: "Verified s11 with include_full_plan: true",
-      include_full_plan: true,
-    });
-    assert.equal(resFull.plan.scar_tissue.length, 10, "include_full_plan: true must return all 10 scars");
-  });
 });

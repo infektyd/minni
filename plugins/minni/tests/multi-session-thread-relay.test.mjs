@@ -63,7 +63,7 @@ async function startFakeDaemon(socketPath) {
   return daemon;
 }
 
-async function spawnHostMcpSession(t, { home, socketPath, vaultPath }) {
+async function spawnHostMcpSession(t, { home, socketPath, vaultPath, agentId = "claude-code" }) {
   const hostScript = [
     'const { spawn } = require("node:child_process");',
     "const child = spawn(process.execPath, [process.argv[1]], { stdio: 'inherit' });",
@@ -77,7 +77,8 @@ async function spawnHostMcpSession(t, { home, socketPath, vaultPath }) {
       MINNI_SOCKET_PATH: socketPath,
       MINNI_VAULT_PATH: vaultPath,
       MINNI_CLAUDECODE_VAULT_PATH: vaultPath,
-      MINNI_AGENT_ID: "claude-code",
+      MINNI_CODEX_VAULT_PATH: vaultPath,
+      MINNI_AGENT_ID: agentId,
       CLAUDE_CODE_SESSION_ID: "",
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -189,7 +190,7 @@ test(
       sessionId: sessionB,
     });
 
-    // 1. serverA creates planA (automatically activated for sessionA); serverB attaches via minni_thread_activate
+    // 1. serverA creates planA (automatically activated for sessionA); serverB attaches via minni_thread_update({ activate: true })
     const created = await serverA.callToolJson("minni_thread_create", {
       goal: "Shared Multi-Session Plan",
       slices: [
@@ -200,42 +201,27 @@ test(
     const planA = created.plan_id;
     assert.ok(planA, `serverA must create planA, got: ${JSON.stringify(created)}`);
 
-    const activatedB = await serverB.callToolJson("minni_thread_activate", {
+    const activatedB = await serverB.callToolJson("minni_thread_update", {
       plan_id: planA,
+      activate: true,
     });
-    assert.equal(activatedB.active, planA);
+    assert.equal(activatedB.active, true);
+    assert.equal(activatedB.plan_id, planA);
 
-    // 2. Assign, claim, start, and complete slice s1 as worker "codex"
-    await serverA.callToolJson("minni_thread_assign", {
-      plan_id: planA,
-      slice_id: "s1",
-      worker_agent_id: "codex",
+    // 2. Worker MCP session ("codex") completes slice s1 via minni_thread_update
+    const serverWorker = await spawnHostMcpSession(t, {
+      home,
+      socketPath,
+      vaultPath: vault,
+      agentId: "codex",
     });
-    const claimed = await serverA.callToolJson("minni_thread_claim", {
+    const completedS1 = await serverWorker.callToolJson("minni_thread_update", {
       plan_id: planA,
       slice_id: "s1",
-      worker_agent_id: "codex",
-      idempotency_key: "claim-s1-key",
-    });
-    assert.ok(claimed.token, `expected claimed.token, got: ${JSON.stringify(claimed)}`);
-
-    await serverA.callToolJson("minni_thread_worker_update", {
-      plan_id: planA,
-      slice_id: "s1",
-      worker_agent_id: "codex",
-      claim_token: claimed.token,
-      idempotency_key: "start-s1-key",
-      action: "start",
-    });
-    await serverA.callToolJson("minni_thread_worker_update", {
-      plan_id: planA,
-      slice_id: "s1",
-      worker_agent_id: "codex",
-      claim_token: claimed.token,
-      idempotency_key: "complete-s1-key",
-      action: "complete",
+      status: "done",
       evidence: "s1 finished by codex worker",
     });
+    assert.equal(completedS1.updated_slice?.status, "done");
 
     const handlers = createHookHandlers({
       agentId: "claude-code",
@@ -260,9 +246,9 @@ test(
     assert.ok(
       Array.isArray(bodyA1.pending_attention) &&
         bodyA1.pending_attention.some(
-          (item) => item.kind === "slice.completed" && item.slice_id === "s1",
+          (item) => item.kind === "status_changed" && item.slice_id === "s1",
         ),
-      `sessionA must receive slice.completed for s1, got: ${JSON.stringify(bodyA1.pending_attention)}`,
+      `sessionA must receive status_changed for s1, got: ${JSON.stringify(bodyA1.pending_attention)}`,
     );
 
     // Verify sessionA's cursor is now caught up (a second UPS on sessionA has no pending_attention)
@@ -279,7 +265,7 @@ test(
       "sessionA must not re-receive already-confirmed notifications",
     );
 
-    // 4. Assert: sessionB runs UserPromptSubmit and STILL receives slice.completed for s1!
+    // 4. Assert: sessionB runs UserPromptSubmit and STILL receives status_changed for s1!
     discardDeliveryCommits();
     const upsB1 = await handlers.handleUserPromptSubmit({
       session_id: sessionB,
@@ -290,9 +276,9 @@ test(
     assert.ok(
       Array.isArray(bodyB1.pending_attention) &&
         bodyB1.pending_attention.some(
-          (item) => item.kind === "slice.completed" && item.slice_id === "s1",
+          (item) => item.kind === "status_changed" && item.slice_id === "s1",
         ),
-      `sessionB must still receive slice.completed for s1 after sessionA confirmed it! Got: ${JSON.stringify(bodyB1.pending_attention)}`,
+      `sessionB must still receive status_changed for s1 after sessionA confirmed it! Got: ${JSON.stringify(bodyB1.pending_attention)}`,
     );
 
     // 5. Next (Q2 = Option A): serverA records a scar on planA via minni_thread_scar
@@ -334,52 +320,54 @@ test(
     );
 
     // 7. Regression check (Finding 2):
-    // - serverA calls minni_thread_replan (stamps actor_session_key and auto-acks for sessionA).
+    // - serverA calls minni_thread_update on s2 (stamps actor_session_key and auto-acks for sessionA).
     // - Before sessionB runs UserPromptSubmit, serverB records its own scar via minni_thread_scar.
-    //   serverB's auto-ack of its own scar must NOT wipe out serverA's unconfirmed replan notification in sessionB's queue!
-    const replanRes = await serverA.callToolJson("minni_thread_replan", {
+    //   serverB's auto-ack of its own scar must NOT wipe out serverA's unconfirmed status_changed notification in sessionB's queue!
+    const updateS2Res = await serverA.callToolJson("minni_thread_update", {
       plan_id: planA,
-      reason: "split s2 into verification sub-steps",
-      add_slices: [{ id: "s3", title: "Sub-step S3" }],
+      slice_id: "s2",
+      status: "in_progress",
     });
-    assert.ok(replanRes.rev >= 3, `expected replan rev >= 3, got: ${JSON.stringify(replanRes)}`);
+    assert.ok(updateS2Res.rev >= 3, `expected update rev >= 3, got: ${JSON.stringify(updateS2Res)}`);
 
     const scarBRes = await serverB.callToolJson("minni_thread_scar", {
       plan_id: planA,
       kind: "dead_end",
       signal: "sessionB noted local dead_end",
-      resolution: "preserve sibling replan event in queue",
+      resolution: "preserve sibling status_changed event in queue",
     });
     assert.ok(scarBRes.rev >= 4);
 
-    // sessionA must NOT self-notify on its own replan, bit SHOULD receive sessionB's scar_added
+    // sessionA must NOT self-notify on its own status_changed, but SHOULD receive sessionB's scar_added
     discardDeliveryCommits();
     const upsAfterReplanA = await handlers.handleUserPromptSubmit({
       session_id: sessionA,
-      prompt: "sessionA turn after replan and sessionB scar",
+      prompt: "sessionA turn after s2 update and sessionB scar",
     });
     await runDeliveryCommits();
     const bodyAfterReplanA = extractEnvelopeBody(upsAfterReplanA);
     assert.ok(
       Array.isArray(bodyAfterReplanA.pending_attention) &&
         bodyAfterReplanA.pending_attention.some((item) => item.kind === "scar_added") &&
-        !bodyAfterReplanA.pending_attention.some((item) => item.kind === "replan"),
-      `sessionA must auto-ack its own replan while receiving sessionB's scar_added! Got: ${JSON.stringify(bodyAfterReplanA.pending_attention)}`,
+        !bodyAfterReplanA.pending_attention.some((item) => item.kind === "status_changed"),
+      `sessionA must auto-ack its own status_changed while receiving sessionB's scar_added! Got: ${JSON.stringify(bodyAfterReplanA.pending_attention)}`,
     );
 
-    // sessionB must receive sessionA's replan (not wiped by sessionB's subsequent scar auto-ack) and NOT self-notify on its own scar
+    // sessionB must receive sessionA's status_changed (not wiped by sessionB's subsequent scar auto-ack) and NOT self-notify on its own scar
     discardDeliveryCommits();
     const upsAfterReplanB = await handlers.handleUserPromptSubmit({
       session_id: sessionB,
-      prompt: "sessionB turn after sessionA replan and own scar",
+      prompt: "sessionB turn after sessionA s2 update and own scar",
     });
     await runDeliveryCommits();
     const bodyAfterReplanB = extractEnvelopeBody(upsAfterReplanB);
     assert.ok(
       Array.isArray(bodyAfterReplanB.pending_attention) &&
-        bodyAfterReplanB.pending_attention.some((item) => item.kind === "replan") &&
+        bodyAfterReplanB.pending_attention.some(
+          (item) => item.kind === "status_changed" && item.slice_id === "s2",
+        ) &&
         !bodyAfterReplanB.pending_attention.some((item) => item.kind === "scar_added"),
-      `sessionB must receive sessionA's replan and auto-ack its own scar! Got: ${JSON.stringify(bodyAfterReplanB.pending_attention)}`,
+      `sessionB must receive sessionA's status_changed and auto-ack its own scar! Got: ${JSON.stringify(bodyAfterReplanB.pending_attention)}`,
     );
   },
 );

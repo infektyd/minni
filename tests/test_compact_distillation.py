@@ -275,10 +275,7 @@ def test_distill_in_txn_canonicalizes_alias_wanted_against_leftover_gemini(
     monkeypatch.setattr(mod, "_fills_for_file", lambda db, principal, inbox_file: [])
 
     db_obj, cfg = _make_db(tmp_path)
-    leftover = (
-        "Compaction summary — Key technical concepts: "
-        "race on bootout after launchctl error 5"
-    )
+    leftover = "race on bootout after launchctl error 5"
     derived = json.dumps(
         {
             "source": "inbox",

@@ -1960,7 +1960,6 @@ test("every production Thread read-modify-write path enters the shared lock", as
   for (const name of [
     "minni_thread_update",
     "minni_thread_scar",
-    "minni_thread_replan",
   ]) {
     assert.match(
       handlerBlock(name),
@@ -1968,24 +1967,12 @@ test("every production Thread read-modify-write path enters the shared lock", as
       `${name} must use the strict lock-before-rehydrate helper`,
     );
   }
-  // status shares the locked expiry sweep with events/ready — that helper
-  // enters withThreadPlanLock internally; do not require a second direct lock.
+  // status shares the locked expiry sweep — that helper enters
+  // withThreadPlanLock internally; do not require a second direct lock.
   assert.match(
     handlerBlock("minni_thread_status"),
     /synchronizeExpiredClaims/,
     "minni_thread_status must run the shared expiry sweep (lock + rehydrate)",
-  );
-  assert.match(
-    handlerBlock("minni_thread_events"),
-    /synchronizeExpiredClaims/,
-    "minni_thread_events must run the shared expiry sweep before the cursor read",
-  );
-  const restoreBlock = handlerBlock("minni_thread_restore");
-  assert.match(restoreBlock, /withThreadLock/);
-  assert.ok(
-    restoreBlock.indexOf("withThreadLock") <
-      restoreBlock.indexOf("rehydratePlan(notePath)"),
-    "restore must acquire the Thread lock before strict rehydration",
   );
   const resolveViewStart = planSource.indexOf(
     "export async function resolveActivePlanView",

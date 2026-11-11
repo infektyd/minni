@@ -12,6 +12,7 @@ process.env.MINNI_SOCKET_PATH = path.join(HERMETIC_HOME, "run", "nonexistent-min
 
 const { learnMemory, recallMemory } = await import("../dist/daemon_transport.js");
 const { createHookHandlers, isSubstantiveRecallPrompt } = await import("../dist/hook-handlers.js");
+const { claudeCodeWire } = await import("../dist/hook-platform.js");
 const { executeLearnPipeline, isSessionStatusChatter } = await import("../dist/jev-harvest.js");
 const { ensureVault, writeVaultPage } = await import("../dist/vault.js");
 const { readRecallState, writeRecallState } = await import("../dist/recall-state.js");
@@ -258,8 +259,17 @@ test("Pillar 5: handleSessionStart and handleUserPromptSubmit pass passive: true
 
     requests.length = 0;
 
-    // Also verify SubagentStart passive recall
-    await handlers.handlePreToolUse({
+    // Also verify SubagentStart passive recall (on a SubagentStart-capable wire per BUG-41)
+    const subHandlers = createHookHandlers({
+      agentId: "claude-code",
+      vaultPath: vault,
+      defaultWorkspaceId: "ws-rev6",
+      hooksEnabled: true,
+      runtime: "claude-code",
+      auditPrefix: "hook_claude",
+      wire: claudeCodeWire,
+    });
+    await subHandlers.handlePreToolUse({
       session_id: "sess-p5",
       tool_name: "Agent",
       tool_use_id: "toolu_rev6_sub",
@@ -268,7 +278,7 @@ test("Pillar 5: handleSessionStart and handleUserPromptSubmit pass passive: true
         prompt: "inspect recall_score_observations in recall.py",
       },
     });
-    await handlers.handleSubagentStart({
+    await subHandlers.handleSubagentStart({
       session_id: "sess-p5",
       agent_id: "subagent-rev6",
       agent_type: "Explore",

@@ -138,6 +138,13 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
             and _trigger_exists(conn, "trg_episodic_fts_update")
             and _trigger_exists(conn, "trg_episodic_fts_delete")
         )
+    if version == 25:
+        return (
+            _column_exists(conn, "documents", "workspace_id")
+            and _column_exists(conn, "learnings", "workspace_id")
+        )
+    if version == 26:
+        return _table_exists(conn, "repo_map_cards")
     return True
 
 
@@ -231,7 +238,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             conn.execute("BEGIN IMMEDIATE")
             for version, filepath in items:
                 logger.info("  Applying migration %03d: %s", version, os.path.basename(filepath))
-                if version >= 21 and not _migration_021_base_tables_present(conn):
+                if 21 <= version <= 24 and not _migration_021_base_tables_present(conn):
                     # Non-destructive partial-schema guard: 021's ALTERs would
                     # otherwise succeed against a base table that exists
                     # (contradiction_log) while stamping a REFERENCES clause to
@@ -243,6 +250,16 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                     # schema (db._init_schema) has supplied the tables.
                     logger.warning(
                         "Migration %03d: base tables incomplete — skipping "
+                        "statements (non-destructive); migration stays pending and "
+                        "will retry once the base schema is supplied",
+                        version,
+                    )
+                    continue
+                if version in (25, 26) and not (
+                    _table_exists(conn, "documents") and _table_exists(conn, "learnings")
+                ):
+                    logger.warning(
+                        "Migration %03d: documents/learnings tables incomplete — skipping "
                         "statements (non-destructive); migration stays pending and "
                         "will retry once the base schema is supplied",
                         version,
