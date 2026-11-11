@@ -102,8 +102,11 @@ def ensure_canonical_learning_node(
     }
     has_doc_ws = "workspace_id" in doc_cols
     effective_ws = str(workspace_id or meta.get("workspace_id") or "").strip()
+    ws_select_sql = ", workspace_id" if has_doc_ws else ""
     row = cur.execute(
-        "SELECT doc_id, agent, page_status, privacy_level, superseded_by FROM documents WHERE path = ?", (path,)
+        f"SELECT doc_id, agent, page_status, privacy_level, superseded_by{ws_select_sql}"
+        " FROM documents WHERE path = ?",
+        (path,),
     ).fetchone()
     if row is None:
         if has_doc_ws:
@@ -161,11 +164,27 @@ def ensure_canonical_learning_node(
             )
             return None
         _reconcile_new_active_mapping(cur, row, learning_id, agent_id, content, meta, path)
-        if has_doc_ws and effective_ws and effective_ws != "default":
+        target_ws: Optional[str] = None
+        if has_doc_ws:
+            existing_ws = str(row[5] or "").strip()
+            wildcard_ws = {"", "default", "global", "*"}
+            if existing_ws in ("global", "*"):
+                target_ws = existing_ws
+            elif effective_ws in ("global", "*"):
+                target_ws = effective_ws
+            elif (
+                existing_ws not in wildcard_ws
+                and effective_ws not in wildcard_ws
+                and existing_ws != effective_ws
+            ):
+                target_ws = "global"
+            elif effective_ws and effective_ws != "default":
+                target_ws = effective_ws
+        if target_ws is not None:
             cur.execute(
                 "UPDATE documents SET memory_kind = 'learning', memory_uri = ?, workspace_id = ?"
                 " WHERE doc_id = ?",
-                (f"learning://{learning_id}", effective_ws, doc_id),
+                (f"learning://{learning_id}", target_ws, doc_id),
             )
         else:
             cur.execute(

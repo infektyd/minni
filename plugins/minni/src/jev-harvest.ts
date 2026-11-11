@@ -111,16 +111,67 @@ export interface JevHarvestResult {
 // Telemetry Masking (Invariant 2: Self-Echo Suppression)
 // ---------------------------------------------------------------------------
 
+const AGY_GENERIC_HEADER_RE =
+  /(?:^|\n)[ \t]*Created At:\s*\d{4}-\d{2}-\d{2}T[^\n]*(?:\n[ \t]*Completed At:\s*\d{4}-\d{2}-\d{2}T[^\n]*)?[ \t]*(?=\n|$)/gi;
+const COMPLETED_AT_LINE_RE = /(?:^|\n)[ \t]*Completed At:\s*\d{4}-\d{2}-\d{2}T[^\n]*[ \t]*(?=\n|$)/gi;
+const SYSTEM_MESSAGE_PREAMBLE_RE =
+  /(?:^|\n)[ \t]*The following is a <SYSTEM_MESSAGE>[^\n]*[ \t]*(?=\n|$)/gi;
+const WRAPPER_TAG_BLOCKS_RE =
+  /<(SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b[^>]*>[\s\S]*?<\/\1>/gi;
+const UNCLOSED_WRAPPER_TAG_LINE_RE =
+  /(?:^|\n)[ \t]*<\/?(?:SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b[^\n]*(?=\n|$)/gi;
+const AGENT_MESSAGE_LINE_RE = /(?:^|\n)[ \t]*\[Message\]\s+timestamp=[^\n]*(?=\n|$)/gi;
+const BARE_HARVEST_CHATTER_RE =
+  /^\s*(?:fix(?:ed)?|done|lgtm|ok(?:ay)?|wip|ack|thanks|yes|no|pass(?:ed)?|green)\W*$/i;
+
+/**
+ * Strip runtime/tool wrapper headers and system/task envelopes before screening
+ * or harvesting candidate learnings.
+ */
+export function stripHarvestWrappers(text: string): string {
+  if (!text) return "";
+  // Strip preamble lines referencing `<SYSTEM_MESSAGE>` BEFORE block tag matching
+  // so `<SYSTEM_MESSAGE\b[^>]*>[\s\S]*?<\/SYSTEM_MESSAGE>` cannot match mid-preamble.
+  let current = text
+    .replace(SYSTEM_MESSAGE_PREAMBLE_RE, "")
+    .replace(AGY_GENERIC_HEADER_RE, "")
+    .replace(COMPLETED_AT_LINE_RE, "")
+    .replace(AGENT_MESSAGE_LINE_RE, "");
+  // Multi-pass unwrap for nested <SYSTEM_MESSAGE> / <MINNI_ENVELOPE> / task blocks
+  for (let pass = 0; pass < 3; pass++) {
+    const next = current.replace(WRAPPER_TAG_BLOCKS_RE, "");
+    if (next === current) break;
+    current = next;
+  }
+  return current
+    .replace(SYSTEM_MESSAGE_PREAMBLE_RE, "")
+    .replace(AGY_GENERIC_HEADER_RE, "")
+    .replace(COMPLETED_AT_LINE_RE, "")
+    .replace(AGENT_MESSAGE_LINE_RE, "")
+    .replace(UNCLOSED_WRAPPER_TAG_LINE_RE, "")
+    .trim();
+}
+
+function hasMinimumHarvestSubstance(text: string): boolean {
+  const cleaned = stripHarvestWrappers(text);
+  if (!cleaned || BARE_HARVEST_CHATTER_RE.test(cleaned)) return false;
+  const nonWsChars = cleaned.replace(/\s+/g, "").length;
+  const tokens = cleaned.match(/[A-Za-z0-9][A-Za-z0-9_./'-]*/g) ?? [];
+  return nonWsChars >= 15 && tokens.length >= 4;
+}
+
 /**
  * Mask all Minni telemetry, Evidence envelopes, and audit log lines before
  * trigger detection to eliminate self-echo feedback loops.
  */
 export function maskTelemetry(text: string): string {
   if (!text) return "";
-  const result = text
-    .replace(/<EVIDENCE\b[^>]*>[\s\S]*?<\/EVIDENCE>/gi, "")
-    .replace(/<minni:context\b[^>]*>[\s\S]*?<\/minni:context>/gi, "")
-    .replace(/<minni:packet\b[^>]*>[\s\S]*?<\/minni:packet>/gi, "");
+  const result = stripHarvestWrappers(
+    text
+      .replace(/<EVIDENCE\b[^>]*>[\s\S]*?<\/EVIDENCE>/gi, "")
+      .replace(/<minni:context\b[^>]*>[\s\S]*?<\/minni:context>/gi, "")
+      .replace(/<minni:packet\b[^>]*>[\s\S]*?<\/minni:packet>/gi, ""),
+  );
 
   const lines = result.split("\n");
   const filteredLines: string[] = [];
@@ -528,8 +579,9 @@ export function screenTranscriptChunk(
     // 1. Operator Directives (strictly human input, excluding raw /boost, /apex, or # DIRECTIVE: task briefs)
     if (isHumanTypedInput(entry, resolvedOptions)) {
       if (
-        entryText.length >= 10 &&
+        entryText.length >= 15 &&
         entryText.length <= 2000 &&
+        hasMinimumHarvestSubstance(entryText) &&
         DIRECTIVE_PATTERN.test(entryText)
       ) {
         triggers.push({
@@ -551,7 +603,8 @@ export function screenTranscriptChunk(
       for (let j = i + 1; j < entries.length && j <= i + 5; j++) {
         const nextEntry = entries[j];
         const nextTool = String(nextEntry.tool_name || nextEntry.type || "");
-        if (EDIT_TOOL_PATTERN.test(nextTool) || extractEntryText(nextEntry).toLowerCase().includes("fix")) {
+        const nextEntryText = maskTelemetry(extractEntryText(nextEntry));
+        if (EDIT_TOOL_PATTERN.test(nextTool) || nextEntryText.toLowerCase().includes("fix")) {
           editIndex = j;
           break;
         }
@@ -561,17 +614,21 @@ export function screenTranscriptChunk(
         for (let k = editIndex + 1; k < entries.length && k <= editIndex + 5; k++) {
           const passEntry = entries[k];
           const passText = maskTelemetry(extractEntryText(passEntry));
-          if (TEST_PASS_PATTERN.test(passText)) {
-            triggers.push({
-              kind: "test_insight",
-              triggerText: `Test failure recovered after edit: ${passText.slice(0, 100)}`,
-              contextWindow: [
-                entryText.slice(0, 300),
-                extractEntryText(entries[editIndex]).slice(0, 300),
-                passText.slice(0, 300),
-              ],
-              timestamp: asString(passEntry.timestamp) || new Date().toISOString(),
-            });
+          const editText = maskTelemetry(extractEntryText(entries[editIndex]));
+          if (passText && TEST_PASS_PATTERN.test(passText)) {
+            const contextWindow = [
+              entryText.slice(0, 300),
+              editText.slice(0, 300),
+              passText.slice(0, 300),
+            ].filter((part) => part.trim().length > 0);
+            if (hasMinimumHarvestSubstance(contextWindow.join("\n"))) {
+              triggers.push({
+                kind: "test_insight",
+                triggerText: `Test failure recovered after edit: ${passText.slice(0, 100)}`,
+                contextWindow,
+                timestamp: asString(passEntry.timestamp) || new Date().toISOString(),
+              });
+            }
             i = k; // Jump past this sequence
             break;
           }
@@ -592,12 +649,17 @@ export function screenTranscriptChunk(
           !TOOL_ERROR_PATTERN.test(recText) &&
           recText.length > 0
         ) {
-          triggers.push({
-            kind: "scar",
-            triggerText: `Tool error resolved by recovery command: ${entryText.slice(0, 80)}`,
-            contextWindow: [entryText.slice(0, 300), recText.slice(0, 300)],
-            timestamp: asString(recoveryEntry.timestamp) || new Date().toISOString(),
-          });
+          const contextWindow = [entryText.slice(0, 300), recText.slice(0, 300)].filter(
+            (part) => part.trim().length > 0,
+          );
+          if (hasMinimumHarvestSubstance(contextWindow.join("\n"))) {
+            triggers.push({
+              kind: "scar",
+              triggerText: `Tool error resolved by recovery command: ${entryText.slice(0, 80)}`,
+              contextWindow,
+              timestamp: asString(recoveryEntry.timestamp) || new Date().toISOString(),
+            });
+          }
           i = j; // Jump past
           break;
         }
@@ -658,14 +720,36 @@ export async function extractJevLearning(
   trigger: JevTrigger,
   extractor?: (trigger: JevTrigger, contextText: string) => Promise<JevLearnPayload | undefined>,
 ): Promise<JevLearnPayload | undefined> {
-  const contextText = trigger.contextWindow.join("\n---\n");
+  const cleanWindow = trigger.contextWindow
+    .map((part) => maskTelemetry(part))
+    .filter((part) => part.trim().length > 0);
+  const cleanTriggerText = maskTelemetry(trigger.triggerText);
+  const contextText = cleanWindow.join("\n---\n");
 
-  if (isPromptDispatchBlock(trigger.triggerText) || isPromptDispatchBlock(contextText)) {
+  if (!contextText || !hasMinimumHarvestSubstance(contextText)) {
+    return undefined;
+  }
+
+  if (isPromptDispatchBlock(cleanTriggerText) || isPromptDispatchBlock(contextText)) {
     return undefined;
   }
 
   if (extractor) {
-    return extractor(trigger, contextText);
+    const custom = await extractor(
+      { ...trigger, triggerText: cleanTriggerText, contextWindow: cleanWindow },
+      contextText,
+    );
+    if (!custom) return undefined;
+    const cleanedTitle = stripHarvestWrappers(custom.title).replace(/\s+/g, " ").trim();
+    const cleanedContent = stripHarvestWrappers(custom.content);
+    if (!hasMinimumHarvestSubstance(cleanedContent) || isSessionStatusChatter(cleanedContent)) {
+      return undefined;
+    }
+    return {
+      ...custom,
+      title: cleanedTitle || custom.title,
+      content: cleanedContent,
+    };
   }
 
   // Try calling typesafe-mcp CLI if present on host
@@ -688,10 +772,15 @@ export async function extractJevLearning(
     });
     const parsed = JSON.parse(stdout);
     if (parsed.status === "ok" && parsed.values) {
-      const rawTitle = String(parsed.values.title?.value || trigger.triggerText.slice(0, 60));
-      const title = rawTitle.replace(/\s+/g, " ").trim();
-      const content = parsed.values.content?.value || trigger.triggerText;
-      if (isPromptDispatchBlock(title) || isPromptDispatchBlock(String(content))) {
+      const rawTitle = String(parsed.values.title?.value || cleanTriggerText.slice(0, 60));
+      const title = stripHarvestWrappers(rawTitle).replace(/\s+/g, " ").trim();
+      const content = stripHarvestWrappers(String(parsed.values.content?.value || cleanTriggerText));
+      if (
+        !hasMinimumHarvestSubstance(content) ||
+        isSessionStatusChatter(content) ||
+        isPromptDispatchBlock(title) ||
+        isPromptDispatchBlock(content)
+      ) {
         return undefined;
       }
       const category = normalizeJevCategory(parsed.values.category?.value, trigger.kind);
@@ -715,20 +804,25 @@ export async function extractJevLearning(
 
   switch (trigger.kind) {
     case "operator_directive":
-      title = trigger.triggerText.split(/[.\n]/)[0].replace(/\s+/g, " ").slice(0, 60).trim();
-      content = trigger.triggerText;
+      title = cleanTriggerText.split(/[.\n]/)[0].replace(/\s+/g, " ").slice(0, 60).trim();
+      content = cleanTriggerText;
       category = "preference";
       break;
     case "test_insight":
       title = "Test fix insight";
-      content = trigger.contextWindow.join("\n");
+      content = cleanWindow.join("\n");
       category = "pattern";
       break;
     case "scar":
       title = "Tool error recovery";
-      content = trigger.contextWindow.join("\n");
+      content = cleanWindow.join("\n");
       category = "fix";
       break;
+  }
+
+  content = stripHarvestWrappers(content);
+  if (!hasMinimumHarvestSubstance(content) || isSessionStatusChatter(content)) {
+    return undefined;
   }
 
   return {

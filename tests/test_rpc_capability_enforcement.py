@@ -125,18 +125,10 @@ def test_cross_agent_search_allowed_with_wildcard_cap(monkeypatch, tmp_path):
 
 def test_learn_uses_stamped_principal_not_wire_agent(monkeypatch, tmp_path):
     db_obj = _patch_db(monkeypatch, tmp_path)
-    captured = {}
-
-    def _fake_detect_contradictions(**kwargs):
-        captured.update(kwargs)
-        return []
-
     monkeypatch.setattr(
         minnid,
         "_lazy_writeback",
-        lambda: types.SimpleNamespace(
-            db=db_obj, detect_contradictions=_fake_detect_contradictions
-        ),
+        lambda: types.SimpleNamespace(db=db_obj),
     )
     # learn is a WRITE op requiring the "learn" cap; stamped principal overrides wire agent_id.
     _stamp(monkeypatch, "codex", ["read", "learn"])
@@ -150,7 +142,6 @@ def test_learn_uses_stamped_principal_not_wire_agent(monkeypatch, tmp_path):
     assert "error" not in resp, resp
     result = resp.get("result", {})
     assert result.get("principal") == "codex"
-    assert captured.get("agent_id") == "codex"
     with db_obj.cursor() as c:
         row = c.execute(
             "SELECT principal FROM candidate_packets WHERE candidate_id = ?",

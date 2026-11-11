@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -14,6 +15,7 @@ from minni.durability import durability_of
 from minni.durable_projection import (
     evict_learning_to_cold_archive,
     find_near_duplicate_active_learning,
+    projection_row_closed,
 )
 
 
@@ -33,8 +35,48 @@ def find_near_duplicate_learning_ids(
         embedding=embedding,
     )
 from minni.graph_commit import ensure_canonical_learning_node
+from minni.graph_coordinator import (
+    GraphCommitAborted,
+    LearningFields,
+    commit_prepared_learning,
+)
+
+_HARD_GRAPH_ABORT_CODES = frozenset(
+    {
+        "canonical_restricted",
+        "principal_mismatch",
+        "store_binding_mismatch",
+        "store_binding_invalid",
+        "payload_tampered",
+        "bad_payload",
+        "bad_principal",
+        "learning_field_invalid",
+        "learning_field_unavailable",
+        "supersedes_missing",
+    }
+)
+
+
+class _LearnRejected(Exception):
+    def __init__(self, response: dict) -> None:
+        super().__init__("learn rejected")
+        self.response = response
 from minni.migrations import _candidate_status_check_allows_dns_log_only
-from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
+from minni.minnid_runtime.graph_adapters import (
+    apply_fallback_graph_edges,
+    collect_superseded_purge_targets,
+    finalize_governed_promotion,
+    linked_learning_ids_for_edges,
+    prepare_governed_promotion,
+)
+
+_ORIG_ENSURE_CANONICAL_LEARNING_NODE = ensure_canonical_learning_node
+from minni.principal import (
+    EffectivePrincipal,
+    can_read_document,
+    is_operator_principal,
+    validate_agent_id,
+)
 from minni.safety import is_instruction_like
 
 from .redaction import redact_value
@@ -105,6 +147,8 @@ class GovernanceContext:
     increment_request_count: Callable[[], None] | None = None
     sovereign_db: Callable[..., Any] = MinniDB
     notify_candidate_staged: Optional[Callable[[], None]] = None
+    resolve_retrieval_engine: Optional[Callable[[Any], Any]] = None
+    on_refresh_retry: Optional[Callable[[Any], None]] = None
     logger: logging.Logger = logger
 
 
@@ -248,34 +292,17 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
     try:
         wb = context.lazy_writeback()
 
-        if not force and contradicts_id is None:
-            check_text = assertion or extract_assertion(content)
-            try:
-                # R5: scope contradiction detection to the caller's own agent.
-                # A global (agent_id=None) scan returned full cross-agent
-                # content/assertion/agent_id, letting a caller probe and
-                # exfiltrate other agents' durable learnings by crafting an
-                # assertion. The learn write is same-agent, so same-agent scoping
-                # loses no legitimate signal.
-                candidates = wb.detect_contradictions(
-                    content_or_assertion=check_text,
-                    agent_id=agent_id,
-                )
-            except Exception as exc:
-                context.logger.warning(
-                    "learn: contradiction detection failed (%s) - proceeding with write",
-                    exc,
-                )
-                candidates = []
-
-            if candidates:
-                return context.make_response({
-                    "status": "contradiction",
-                    "candidates": candidates,
-                }, request_id)
-
         if not force:
             return stage_candidate(params, request_id, context)
+
+        from minni.afm_passes.inbox_ingest import has_wrapper_leak
+
+        if has_wrapper_leak(content):
+            return context.make_error(
+                -32602,
+                "learn content rejected (wrapper_leak)",
+                request_id,
+            )
 
         if not is_operator_principal(principal):
             return context.make_error(
@@ -302,29 +329,18 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         _have_hash_col = ensure_content_hash_column(wb.db)
         _chash = _content_hash(content)
 
-        emb_bytes = None
-        if wb.model:
-            try:
-                from minni.models import get_embedder_lock
-
-                embedding_started_at = time.perf_counter()
-                with get_embedder_lock():
-                    emb = wb.model.encode(content, show_progress_bar=False).astype(np.float32)
-                emb_bytes = emb.tobytes()
-                context.record_latency("embedding", time.perf_counter() - embedding_started_at)
-            except Exception as exc:
-                context.logger.warning("learn: embedding failed (%s) - storing without embedding", exc)
-
         if category not in CATEGORIES:
             category = "general"
 
-        with wb.db.cursor() as c:
+        ws = normalize_workspace_scope(params.get("workspace_id"), default="default")
+
+        with wb.db.cursor() as c_pre:
             if not supersedes and contradicts_id is None:
-                existing = find_active_learning_by_hash(c, _chash, agent_id)
+                existing = find_active_learning_by_hash(c_pre, _chash, agent_id)
                 if existing is not None:
                     existing_lid = int(existing["learning_id"])
                     if _have_hash_col:
-                        c.execute(
+                        c_pre.execute(
                             "UPDATE learnings SET content_hash = ? "
                             "WHERE learning_id = ? AND content_hash IS NULL",
                             (_chash, existing_lid),
@@ -339,97 +355,298 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                         },
                         request_id,
                     )
+            has_ws_col = _learnings_has_workspace_col(c_pre)
 
-            ws = normalize_workspace_scope(params.get("workspace_id"), default="default")
-            _cols = (
-                "agent_id, category, content, source_doc_ids, source_query, "
-                "confidence, embedding, created_at, "
-                "assertion, applies_when, evidence_doc_ids, contradicts_id, status"
-            )
-            _vals = [
-                agent_id,
-                category,
-                content,
-                None,
-                params.get("source_query"),
-                params.get("confidence", 1.0),
-                emb_bytes,
-                now,
-                assertion,
-                applies_when,
-                doc_ids_json,
-                contradicts_id,
-                "active",
-            ]
-            if _have_hash_col:
-                _cols += ", content_hash"
-                _vals.append(_chash)
-            if _learnings_has_workspace_col(c):
-                _cols += ", workspace_id"
-                _vals.append(ws)
-            c.execute(
-                f"INSERT INTO learnings ({_cols}) VALUES ({', '.join('?' * len(_vals))})",
-                _vals,
-            )
-            lid = c.lastrowid
+        plan = prepare_governed_promotion(
+            wb.db,
+            author_agent=agent_id,
+            workspace_id=ws,
+            caller_principal=principal,
+            content=content,
+            category=category,
+            learning_fields=LearningFields(
+                source_query=params.get("source_query"),
+                evidence_doc_ids=doc_ids_json,
+                confidence=params.get("confidence", 1.0),
+                assertion=assertion,
+                applies_when=applies_when,
+                contradicts_id=contradicts_id,
+                supersedes=supersedes,
+                content_hash=_chash if _have_hash_col else None,
+                status="active",
+                workspace_id=ws if has_ws_col else None,
+            ),
+            vault_path=getattr(wb.config, "vault_path", None),
+            resolve_retrieval_engine=context.resolve_retrieval_engine,
+            on_refresh_retry=context.on_refresh_retry,
+            allow_adapter=(ensure_canonical_learning_node is _ORIG_ENSURE_CANONICAL_LEARNING_NODE),
+        )
 
-            if supersedes:
-                c.execute(
-                    "UPDATE learnings SET superseded_by = ? WHERE learning_id = ?",
-                    (lid, supersedes),
+        emb_bytes = None
+        if plan.prepared is not None and plan.prepared.learning_vector is not None:
+            emb_bytes = plan.prepared.learning_vector
+        elif wb.model:
+            try:
+                from minni.models import get_embedder_lock
+
+                embedding_started_at = time.perf_counter()
+                with get_embedder_lock():
+                    emb = wb.model.encode(content, show_progress_bar=False).astype(np.float32)
+                emb_bytes = emb.tobytes()
+                context.record_latency("embedding", time.perf_counter() - embedding_started_at)
+            except Exception as exc:
+                context.logger.warning("learn: embedding failed (%s) - storing without embedding", exc)
+
+        commit_res = None
+        superseded_docs: list[tuple[str, str]] = []
+        try:
+            with wb.db.transaction() as c:
+                if supersedes:
+                    srow = c.execute(
+                        "SELECT 1 FROM learnings WHERE learning_id = ?",
+                        (supersedes,),
+                    ).fetchone()
+                    if srow is None:
+                        raise _LearnRejected(
+                            context.make_error(
+                                -32001, f"learning_not_found: {supersedes}", request_id
+                            )
+                        )
+                if not supersedes and contradicts_id is None:
+                    existing = find_active_learning_by_hash(c, _chash, agent_id)
+                    if existing is not None:
+                        existing_lid = int(existing["learning_id"])
+                        if _have_hash_col:
+                            c.execute(
+                                "UPDATE learnings SET content_hash = ? "
+                                "WHERE learning_id = ? AND content_hash IS NULL",
+                                (_chash, existing_lid),
+                            )
+                        return context.make_response(
+                            {
+                                "status": "ok",
+                                "learning_id": existing_lid,
+                                "agent_id": agent_id,
+                                "category": existing.get("category") or category,
+                                "deduplicated": True,
+                            },
+                            request_id,
+                        )
+
+                committed_edges: list[Any] = []
+                graph_superseded_lids: list[int] = []
+                if (
+                    plan.prepared is not None
+                    and ensure_canonical_learning_node is _ORIG_ENSURE_CANONICAL_LEARNING_NODE
+                ):
+                    c.execute("SAVEPOINT minni_graph_commit")
+                    try:
+                        commit_res = commit_prepared_learning(
+                            c, plan.prepared, db=wb.db, principal=plan.graph_principal
+                        )
+                        c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                    except GraphCommitAborted as abort:
+                        c.execute("ROLLBACK TO SAVEPOINT minni_graph_commit")
+                        c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                        if abort.code in _HARD_GRAPH_ABORT_CODES:
+                            err_code = (
+                                -32001
+                                if abort.code == "supersedes_missing"
+                                else (
+                                    -32004
+                                    if abort.code in ("canonical_restricted", "principal_mismatch")
+                                    else -32602
+                                )
+                            )
+                            raise _LearnRejected(
+                                context.make_error(
+                                    err_code, f"{abort.code}: {abort}", request_id
+                                )
+                            )
+                        context.logger.warning(
+                            "learn: graph commit aborted (%s: %s); falling back to direct canonical commit",
+                            abort.code,
+                            abort,
+                        )
+                        commit_res = None
+
+                if commit_res is not None:
+                    lid = commit_res.learning_id
+                    canonical_doc_id = commit_res.doc_id
+                    committed_edges.extend(commit_res.edges)
+                    graph_superseded_lids.extend(commit_res.superseded_learning_ids)
+                    if plan.fallback_edges is not None and not committed_edges:
+                        fb_edges, fb_sup = apply_fallback_graph_edges(
+                            c,
+                            plan.fallback_edges,
+                            graph_principal=plan.graph_principal,
+                            workspace_id=ws,
+                            new_learning_id=lid,
+                            new_doc_id=canonical_doc_id,
+                            now=now,
+                        )
+                        committed_edges.extend(fb_edges)
+                        graph_superseded_lids.extend(fb_sup)
+                else:
+                    _cols = (
+                        "agent_id, category, content, source_doc_ids, source_query, "
+                        "confidence, embedding, created_at, "
+                        "assertion, applies_when, evidence_doc_ids, contradicts_id, status"
+                    )
+                    _vals = [
+                        agent_id,
+                        category,
+                        content,
+                        None,
+                        params.get("source_query"),
+                        params.get("confidence", 1.0),
+                        emb_bytes,
+                        now,
+                        assertion,
+                        applies_when,
+                        doc_ids_json,
+                        contradicts_id,
+                        "active",
+                    ]
+                    if _have_hash_col:
+                        _cols += ", content_hash"
+                        _vals.append(_chash)
+                    if _learnings_has_workspace_col(c):
+                        _cols += ", workspace_id"
+                        _vals.append(ws)
+                    c.execute(
+                        f"INSERT INTO learnings ({_cols}) VALUES ({', '.join('?' * len(_vals))})",
+                        _vals,
+                    )
+                    lid = c.lastrowid
+
+                    canonical_doc_id = ensure_canonical_learning_node(
+                        c,
+                        learning_id=lid,
+                        agent_id=agent_id,
+                        content=content,
+                        vault_path=wb.config.vault_path,
+                        created_at=now,
+                        workspace_id=ws,
+                    )
+                    if canonical_doc_id is not None:
+                        post_doc = c.execute(
+                            "SELECT page_status, privacy_level FROM documents WHERE doc_id = ?",
+                            (canonical_doc_id,),
+                        ).fetchone()
+                        if post_doc is not None and projection_row_closed(
+                            post_doc["page_status"], post_doc["privacy_level"]
+                        ):
+                            raise _LearnRejected(
+                                context.make_error(
+                                    -32004,
+                                    "canonical_restricted: canonical node is lifecycle-closed/restricted",
+                                    request_id,
+                                )
+                            )
+                    fb_edges, fb_sup = apply_fallback_graph_edges(
+                        c,
+                        plan.fallback_edges,
+                        graph_principal=plan.graph_principal,
+                        workspace_id=ws,
+                        new_learning_id=lid,
+                        new_doc_id=canonical_doc_id,
+                        now=now,
+                    )
+                    committed_edges.extend(fb_edges)
+                    graph_superseded_lids.extend(fb_sup)
+
+                    if supersedes:
+                        c.execute(
+                            "UPDATE learnings SET superseded_by = ? WHERE learning_id = ?",
+                            (lid, supersedes),
+                        )
+
+                if supersedes and canonical_doc_id is not None:
+                    try:
+                        sup_doc = c.execute(
+                            "SELECT doc_id FROM learning_documents WHERE learning_id = ? ORDER BY doc_id LIMIT 1",
+                            (int(supersedes),),
+                        ).fetchone()
+                        if sup_doc is not None:
+                            sup_doc_id = int(
+                                sup_doc["doc_id"] if hasattr(sup_doc, "keys") else sup_doc[0]
+                            )
+                            if sup_doc_id != int(canonical_doc_id):
+                                ml_cols = {
+                                    r["name"] if hasattr(r, "keys") else r[1]
+                                    for r in c.execute("PRAGMA table_info(memory_links)").fetchall()
+                                }
+                                if "edge_status" in ml_cols:
+                                    c.execute(
+                                        """INSERT INTO memory_links
+                                           (source_doc_id, target_doc_id, link_type, weight, created_at,
+                                            confidence, inference_method, model_id, prompt_version,
+                                            inference_run_id, evidence_json, inferred_at, edge_status)
+                                           VALUES (?, ?, 'updates', 1.0, ?, 1.0, 'explicit_supersedes',
+                                                   'explicit', 'v1', 'explicit', '{"explicit":true}', ?, 'active')
+                                           ON CONFLICT(source_doc_id, target_doc_id, link_type) DO NOTHING""",
+                                        (int(canonical_doc_id), sup_doc_id, now, now),
+                                    )
+                    except Exception:
+                        pass
+
+                wb.add_derived_from_edges(
+                    learning_id=lid,
+                    agent_id=agent_id,
+                    category=category,
+                    content=content,
+                    evidence_doc_ids=evidence_doc_ids,
+                    created_at=now,
+                    _cursor=c,
+                    canonical_doc_id=canonical_doc_id,
                 )
 
-            # Coordinated canonical commit: canonical node + join + explicit
-            # edges share this cursor block, so a mid-commit failure rolls the
-            # learning back too. No edge inference is invoked (activation gate).
-            canonical_doc_id = ensure_canonical_learning_node(
-                c,
-                learning_id=lid,
-                agent_id=agent_id,
-                content=content,
-                vault_path=wb.config.vault_path,
-                created_at=now,
-                workspace_id=ws,
-            )
+                linked_lids = linked_learning_ids_for_edges(
+                    c, committed_edges, exclude_learning_id=lid
+                )
+                sup_targets = list(graph_superseded_lids)
+                if supersedes and int(supersedes) not in sup_targets:
+                    sup_targets.append(int(supersedes))
+                superseded_docs.extend(
+                    collect_superseded_purge_targets(c, sup_targets, agent_id)
+                )
 
-            wb.add_derived_from_edges(
-                learning_id=lid,
-                agent_id=agent_id,
-                category=category,
-                content=content,
-                evidence_doc_ids=evidence_doc_ids,
-                created_at=now,
-                _cursor=c,
-                canonical_doc_id=canonical_doc_id,
-            )
-
-            near_dups = find_near_duplicate_active_learning(
-                c,
-                agent_id=agent_id,
-                category=category,
-                content=content,
-                exclude_learning_id=lid,
-                embedding=emb_bytes,
-            )
-            for dup_lid in near_dups:
-                if supersedes and int(dup_lid) == int(supersedes):
-                    continue
-                dup_row = c.execute(
-                    "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
-                    (dup_lid,),
-                ).fetchone()
-                dup_agent = str(dup_row["agent_id"]) if dup_row and "agent_id" in dup_row.keys() else agent_id
-                dup_content = str(dup_row["content"]) if dup_row and "content" in dup_row.keys() else f"learning:{dup_lid}"
-                evict_learning_to_cold_archive(
+                near_dups = find_near_duplicate_active_learning(
                     c,
-                    None,
-                    dup_lid,
-                    reason=f"superseded_near_duplicate_by:{lid}",
-                    db_path=getattr(wb.config, "db_path", None),
-                    vault_path=getattr(wb.config, "vault_path", None),
+                    agent_id=agent_id,
+                    category=category,
+                    content=content,
+                    exclude_learning_id=lid,
+                    embedding=emb_bytes,
                 )
+                for dup_lid in near_dups:
+                    if supersedes and int(dup_lid) == int(supersedes):
+                        continue
+                    if int(dup_lid) in linked_lids or int(dup_lid) in graph_superseded_lids:
+                        continue
+                    dup_row = c.execute(
+                        "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
+                        (dup_lid,),
+                    ).fetchone()
+                    dup_agent = str(dup_row["agent_id"]) if dup_row and "agent_id" in dup_row.keys() else agent_id
+                    dup_content = str(dup_row["content"]) if dup_row and "content" in dup_row.keys() else f"learning:{dup_lid}"
+                    evict_learning_to_cold_archive(
+                        c,
+                        None,
+                        dup_lid,
+                        reason=f"superseded_near_duplicate_by:{lid}",
+                        db_path=getattr(wb.config, "db_path", None),
+                        vault_path=getattr(wb.config, "vault_path", None),
+                    )
+                    superseded_docs.append((dup_agent, dup_content))
+        except _LearnRejected as rejected:
+            return rejected.response
+
+        for sup_agent, sup_content in superseded_docs:
+            if sup_content:
                 try:
-                    context.purge_durable_learning(dup_agent, dup_content, db=wb.db)
+                    context.purge_durable_learning(sup_agent, sup_content, db=wb.db)
                 except Exception:
                     pass
 
@@ -441,9 +658,18 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         if wb.config.writeback_enabled:
             wb._write_to_disk(lid, agent_id, category, content, now, workspace_id=ws)
 
-        indexed = _call_index_durable_learning(
-            context, agent_id, content, key=f"learning:{lid}", db=wb.db, workspace_id=ws
-        )
+        if commit_res is not None:
+            indexed = finalize_governed_promotion(
+                plan, commit_res, content=content, workspace_id=ws
+            )
+            if not indexed:
+                indexed = _call_index_durable_learning(
+                    context, agent_id, content, key=f"learning:{lid}", db=wb.db, workspace_id=ws
+                )
+        else:
+            indexed = _call_index_durable_learning(
+                context, agent_id, content, key=f"learning:{lid}", db=wb.db, workspace_id=ws
+            )
 
         result = {
             "status": "ok",
@@ -722,6 +948,259 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         return context.make_error(-32000, f"Resolve contradiction error: {exc}", request_id)
 
 
+_GRAPH_SUBSCRIBE_PAGE = 32
+_GRAPH_SUBSCRIBE_MAX_EVENTS = 32
+
+
+def _graph_contradiction_events_for_reads(
+    cursor: Any,
+    *,
+    agent_id: str,
+    event_since: float,
+    read_since: Optional[float],
+    principal: EffectivePrincipal,
+    workspace: Optional[str] = None,
+) -> tuple[list[dict], dict]:
+    """Page unresolved graph contradiction_log rows via learning_reads.
+
+    Bounded keyset pages, bounded metadata IN lists, cached authorization.
+    Duplicate pairs are skipped. Denied counterparts do not consume the
+    result cap. Exhausted page/time budget sets incomplete rather than
+    dropping already-authorized events.
+    """
+    from minni.request_deadline import RequestDeadlineExceeded, check_deadline
+
+    work = {
+        "log_rows_seen": 0,
+        "auth_checks": 0,
+        "pages": 0,
+        "incomplete": False,
+    }
+    clauses = [
+        "cl.resolution_status = 'unresolved'",
+        "cl.detected_at >= ?",
+        "lr.agent_id = ?",
+        "cl.source_doc_id IS NOT NULL",
+        "cl.target_doc_id IS NOT NULL",
+    ]
+    base_params: list = [event_since, agent_id]
+    if read_since is not None:
+        clauses.append("lr.read_at >= ?")
+        base_params.append(read_since)
+    where_sql = " AND ".join(clauses)
+    principal_ws = str(getattr(principal, "workspace_id", "default") or "default").strip() or "default"
+    if principal_ws not in ("default", "*"):
+        effective_ws = principal_ws
+    elif workspace:
+        effective_ws = normalize_workspace_scope(workspace, default="default")
+    else:
+        effective_ws = principal_ws
+    events: list[dict] = []
+    meta_by_id: dict[int, dict] = {}
+    auth_cache: dict[int, bool] = {}
+    pair_seen: set = set()
+    seen_logs: set = set()
+    cursor_ts = float(event_since)
+    cursor_id = 0
+    has_doc_ws_col: Optional[bool] = None
+
+    def _expired() -> bool:
+        try:
+            check_deadline()
+        except RequestDeadlineExceeded:
+            return True
+        except Exception:
+            return False
+        return False
+
+    def _readable(doc_id: Any) -> Optional[bool]:
+        try:
+            key = int(doc_id)
+        except (TypeError, ValueError):
+            return False
+        cached = auth_cache.get(key)
+        if cached is not None:
+            return cached
+        if _expired():
+            work["incomplete"] = True
+            return None
+        meta = meta_by_id.get(key)
+        work["auth_checks"] += 1
+        allowed = False
+        if meta is not None:
+            try:
+                allowed = bool(can_read_document(principal, effective_ws, meta))
+            except Exception:
+                allowed = False
+        auth_cache[key] = allowed
+        if _expired():
+            work["incomplete"] = True
+        return allowed
+
+    while len(events) < _GRAPH_SUBSCRIBE_MAX_EVENTS:
+        if _expired():
+            work["incomplete"] = True
+            break
+        params = list(base_params) + [cursor_ts, cursor_ts, cursor_id, _GRAPH_SUBSCRIBE_PAGE]
+        try:
+            page = cursor.execute(
+                f"""
+                SELECT DISTINCT
+                       cl.id AS log_id,
+                       cl.memory_a_id,
+                       cl.source_doc_id,
+                       cl.target_doc_id,
+                       cl.confidence,
+                       cl.detection_method,
+                       cl.edge_run_id,
+                       cl.detected_at
+                FROM contradiction_log cl
+                JOIN learning_documents ld
+                  ON ld.doc_id IN (cl.source_doc_id, cl.target_doc_id)
+                JOIN learning_reads lr
+                  ON lr.learning_id = ld.learning_id
+                WHERE {where_sql}
+                  AND (cl.detected_at > ?
+                       OR (cl.detected_at = ? AND cl.id > ?))
+                ORDER BY cl.detected_at ASC, cl.id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        except RequestDeadlineExceeded:
+            work["incomplete"] = True
+            break
+        except sqlite3.OperationalError:
+            work["incomplete"] = True
+            break
+        except Exception:
+            work["incomplete"] = True
+            break
+        work["pages"] += 1
+        if not page:
+            break
+        needed: list[int] = []
+        parsed = []
+        for row in page:
+            work["log_rows_seen"] += 1
+            try:
+                source_id = int(row["source_doc_id"])
+                target_id = int(row["target_doc_id"])
+                log_id = int(row["log_id"])
+            except (TypeError, ValueError):
+                continue
+            if log_id in seen_logs:
+                continue
+            pair_key = (
+                (source_id, target_id) if source_id <= target_id
+                else (target_id, source_id)
+            )
+            if pair_key in pair_seen:
+                continue
+            parsed.append((row, source_id, target_id, pair_key, log_id))
+            if source_id not in meta_by_id:
+                needed.append(source_id)
+            if target_id not in meta_by_id:
+                needed.append(target_id)
+        last = page[-1]
+        cursor_ts = float(last["detected_at"] or cursor_ts)
+        cursor_id = int(last["log_id"])
+        fresh = []
+        seen_need = set()
+        for doc_id in needed:
+            if doc_id in meta_by_id or doc_id in seen_need:
+                continue
+            seen_need.add(doc_id)
+            fresh.append(doc_id)
+        for offset in range(0, len(fresh), _GRAPH_SUBSCRIBE_PAGE):
+            if _expired():
+                work["incomplete"] = True
+                break
+            chunk = fresh[offset:offset + _GRAPH_SUBSCRIBE_PAGE]
+            marks = ",".join("?" * len(chunk))
+            try:
+                if has_doc_ws_col is None:
+                    doc_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in cursor.execute("PRAGMA table_info(documents)").fetchall()
+                    }
+                    has_doc_ws_col = "workspace_id" in doc_cols
+                ws_col_sql = ", workspace_id" if has_doc_ws_col else ""
+                for doc in cursor.execute(
+                    f"""SELECT doc_id, path, agent, privacy_level, page_status,
+                               page_type, memory_kind{ws_col_sql}
+                        FROM documents WHERE doc_id IN ({marks})""",
+                    chunk,
+                ).fetchall():
+                    meta_entry = {
+                        "doc_id": doc["doc_id"],
+                        "path": doc["path"],
+                        "agent": doc["agent"],
+                        "privacy_level": doc["privacy_level"],
+                        "page_status": doc["page_status"],
+                        "page_type": doc["page_type"],
+                        "memory_kind": doc["memory_kind"],
+                    }
+                    if has_doc_ws_col:
+                        meta_entry["workspace_id"] = doc["workspace_id"]
+                    meta_by_id[int(doc["doc_id"])] = meta_entry
+            except RequestDeadlineExceeded:
+                work["incomplete"] = True
+                break
+            except sqlite3.OperationalError:
+                work["incomplete"] = True
+                break
+            except Exception:
+                work["incomplete"] = True
+                break
+        if work["incomplete"] and not parsed:
+            break
+        stop = False
+        for row, source_id, target_id, pair_key, log_id in parsed:
+            if len(events) >= _GRAPH_SUBSCRIBE_MAX_EVENTS:
+                work["incomplete"] = True
+                stop = True
+                break
+            pair_seen.add(pair_key)
+            seen_logs.add(log_id)
+            source_ok = _readable(source_id)
+            if source_ok is None:
+                stop = True
+                break
+            target_ok = _readable(target_id)
+            if target_ok is None:
+                stop = True
+                break
+            if not source_ok or not target_ok:
+                continue
+            confidence = row["confidence"]
+            try:
+                confidence = float(confidence) if confidence is not None else None
+            except (TypeError, ValueError):
+                confidence = None
+            if confidence is not None and not math.isfinite(confidence):
+                confidence = None
+            events.append({
+                "event_id": f"graph:{log_id}",
+                "kind": "graph",
+                "source_doc_id": source_id,
+                "target_doc_id": target_id,
+                "memory_a_id": row["memory_a_id"],
+                "confidence": confidence,
+                "detection_method": row["detection_method"],
+                "created_at": row["detected_at"],
+            })
+        if stop:
+            break
+        if len(page) < _GRAPH_SUBSCRIBE_PAGE:
+            break
+        if len(events) >= _GRAPH_SUBSCRIBE_MAX_EVENTS:
+            work["incomplete"] = True
+            break
+    _graph_contradiction_events_for_reads.last_work = work  # type: ignore[attr-defined]
+    return events, work
+
+
 def handle_subscribe_contradictions(params: dict, request_id: Any, context: GovernanceContext) -> dict:
     """Return contradiction events for learnings recently read by an agent.
 
@@ -825,6 +1304,14 @@ def handle_subscribe_contradictions(params: dict, request_id: Any, context: Gove
                 "SELECT COUNT(*) AS n FROM learning_reads WHERE agent_id = ?",
                 (agent_id,),
             ).fetchone()["n"]
+            graph_events, graph_work = _graph_contradiction_events_for_reads(
+                c,
+                agent_id=agent_id,
+                event_since=event_since,
+                read_since=read_since,
+                principal=principal,
+                workspace=params.get("workspace_id") or params.get("workspace"),
+            )
         events = [
             {
                 "event_id": row["event_id"],
@@ -835,18 +1322,29 @@ def handle_subscribe_contradictions(params: dict, request_id: Any, context: Gove
             }
             for row in rows
         ]
+        events.extend(graph_events)
+        events.sort(key=lambda item: (item.get("created_at") or 0, str(item.get("event_id"))))
+        graph_incomplete = bool(graph_work.get("incomplete"))
+        if events:
+            status = "matched"
+        elif graph_incomplete:
+            status = "checked_incomplete"
+        else:
+            status = "checked_no_match"
+        checked = {
+            "contradiction_events_for_agent_reads": agent_events,
+            "learning_reads_for_agent": reads_for_agent,
+            "event_window_days": event_window_days,
+            "read_window_hours": read_window_hours,
+            "since_ts": since_ts,
+            "event_since": event_since,
+            "graph_scan_incomplete": graph_incomplete,
+        }
         return context.make_response({
             "agent_id": agent_id,
             "events": events,
-            "status": "matched" if events else "checked_no_match",
-            "checked": {
-                "contradiction_events_for_agent_reads": agent_events,
-                "learning_reads_for_agent": reads_for_agent,
-                "event_window_days": event_window_days,
-                "read_window_hours": read_window_hours,
-                "since_ts": since_ts,
-                "event_since": event_since,
-            },
+            "status": status,
+            "checked": checked,
         }, request_id)
     except Exception as exc:
         context.logger.exception("subscribe_contradictions failed")
@@ -1145,6 +1643,15 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     if not content:
         return context.make_error(-32602, "content is required", request_id)
     stored_content = content[:200000]
+    from minni.afm_passes.inbox_ingest import intake_junk_reason
+
+    junk_reason = intake_junk_reason(stored_content)
+    if junk_reason is not None:
+        return context.make_error(
+            -32602,
+            f"candidate rejected at intake ({junk_reason})",
+            request_id,
+        )
 
     now = time.time()
     ws = normalize_workspace_scope(params.get("workspace_id"), default="default")
@@ -1228,6 +1735,9 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
         lid = None
         chash = None
         emb_bytes = None
+        plan = None
+        commit_res = None
+        superseded_docs: list[tuple[str, str]] = []
         if auto_accept:
             try:
                 from minni.afm_passes.consolidation import (
@@ -1250,6 +1760,27 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         stored_content, show_progress_bar=False
                     ).astype(np.float32)
                 emb_bytes = emb.tobytes()
+                with db.cursor() as c_pre:
+                    has_ws_col = _learnings_has_workspace_col(c_pre)
+                plan = prepare_governed_promotion(
+                    db,
+                    author_agent=principal.agent_id,
+                    workspace_id=ws,
+                    caller_principal=principal,
+                    content=stored_content,
+                    category=category,
+                    learning_fields=LearningFields(
+                        content_hash=chash,
+                        status="active",
+                        workspace_id=ws if has_ws_col else None,
+                    ),
+                    vault_path=getattr(wb.config, "vault_path", None),
+                    resolve_retrieval_engine=context.resolve_retrieval_engine,
+                    on_refresh_retry=context.on_refresh_retry,
+                    allow_adapter=(
+                        ensure_canonical_learning_node is _ORIG_ENSURE_CANONICAL_LEARNING_NODE
+                    ),
+                )
             except Exception as exc:
                 context.logger.warning(
                     "auto_accept_own: could not prepare the durable write (%s); "
@@ -1258,6 +1789,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 auto_accept = False
                 chash = None
                 emb_bytes = None
+                plan = None
                 withheld = list(withheld) + ["durable-write preparation failed"]
 
         def _stage_proposal(c):
@@ -1336,45 +1868,123 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         auto_accept = False
                         withheld = ["duplicate of an existing learning"]
                 if auto_accept:
-                    if _learnings_has_workspace_col(c):
-                        c.execute(
-                            """
-                            INSERT INTO learnings
-                            (agent_id, category, content, created_at, embedding,
-                             content_hash, status, workspace_id)
-                            VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-                            """,
-                            (
-                                principal.agent_id, category, stored_content, now,
-                                emb_bytes, chash, ws,
-                            ),
-                        )
+                    commit_res = None
+                    committed_edges: list[Any] = []
+                    graph_superseded_lids: list[int] = []
+                    if (
+                        plan is not None
+                        and plan.prepared is not None
+                        and ensure_canonical_learning_node is _ORIG_ENSURE_CANONICAL_LEARNING_NODE
+                    ):
+                        c.execute("SAVEPOINT minni_graph_commit")
+                        try:
+                            commit_res = commit_prepared_learning(
+                                c, plan.prepared, db=db, principal=plan.graph_principal
+                            )
+                            c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                        except GraphCommitAborted as abort:
+                            c.execute("ROLLBACK TO SAVEPOINT minni_graph_commit")
+                            c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                            if abort.code in _HARD_GRAPH_ABORT_CODES:
+                                raise _CanonicalCommitFailed(abort)
+                            context.logger.warning(
+                                "auto_accept_own: graph commit aborted (%s: %s); falling back to direct canonical commit",
+                                abort.code,
+                                abort,
+                            )
+                            commit_res = None
+                        except Exception as exc:
+                            c.execute("ROLLBACK TO SAVEPOINT minni_graph_commit")
+                            c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                            raise _CanonicalCommitFailed(exc)
+
+                    if commit_res is not None:
+                        lid = commit_res.learning_id
+                        canonical_doc_id = commit_res.doc_id
+                        committed_edges.extend(commit_res.edges)
+                        graph_superseded_lids.extend(commit_res.superseded_learning_ids)
+                        if plan.fallback_edges is not None and not committed_edges:
+                            fb_edges, fb_sup = apply_fallback_graph_edges(
+                                c,
+                                plan.fallback_edges,
+                                graph_principal=plan.graph_principal,
+                                workspace_id=ws,
+                                new_learning_id=lid,
+                                new_doc_id=canonical_doc_id,
+                                now=now,
+                            )
+                            committed_edges.extend(fb_edges)
+                            graph_superseded_lids.extend(fb_sup)
                     else:
-                        c.execute(
-                            """
-                            INSERT INTO learnings
-                            (agent_id, category, content, created_at, embedding,
-                             content_hash, status)
-                            VALUES (?, ?, ?, ?, ?, ?, 'active')
-                            """,
-                            (
-                                principal.agent_id, category, stored_content, now,
-                                emb_bytes, chash,
-                            ),
-                        )
-                    lid = c.lastrowid
-                    try:
-                        ensure_canonical_learning_node(
-                            c,
-                            learning_id=lid,
-                            agent_id=principal.agent_id,
-                            content=stored_content,
-                            vault_path=wb.config.vault_path,
-                            created_at=now,
-                            workspace_id=ws,
-                        )
-                    except Exception as exc:
-                        raise _CanonicalCommitFailed(exc)
+                        if _learnings_has_workspace_col(c):
+                            c.execute(
+                                """
+                                INSERT INTO learnings
+                                (agent_id, category, content, created_at, embedding,
+                                 content_hash, status, workspace_id)
+                                VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+                                """,
+                                (
+                                    principal.agent_id, category, stored_content, now,
+                                    emb_bytes, chash, ws,
+                                ),
+                            )
+                        else:
+                            c.execute(
+                                """
+                                INSERT INTO learnings
+                                (agent_id, category, content, created_at, embedding,
+                                 content_hash, status)
+                                VALUES (?, ?, ?, ?, ?, ?, 'active')
+                                """,
+                                (
+                                    principal.agent_id, category, stored_content, now,
+                                    emb_bytes, chash,
+                                ),
+                            )
+                        lid = c.lastrowid
+                        try:
+                            canonical_doc_id = ensure_canonical_learning_node(
+                                c,
+                                learning_id=lid,
+                                agent_id=principal.agent_id,
+                                content=stored_content,
+                                vault_path=wb.config.vault_path,
+                                created_at=now,
+                                workspace_id=ws,
+                            )
+                        except Exception as exc:
+                            raise _CanonicalCommitFailed(exc)
+                        if canonical_doc_id is not None:
+                            post_doc = c.execute(
+                                "SELECT page_status, privacy_level FROM documents WHERE doc_id = ?",
+                                (canonical_doc_id,),
+                            ).fetchone()
+                            if post_doc is not None and projection_row_closed(
+                                post_doc["page_status"], post_doc["privacy_level"]
+                            ):
+                                raise _CanonicalCommitFailed(
+                                    RuntimeError("canonical node is lifecycle-closed/restricted")
+                                )
+                        if plan is not None and plan.fallback_edges is not None:
+                            fb_edges, fb_sup = apply_fallback_graph_edges(
+                                c,
+                                plan.fallback_edges,
+                                graph_principal=plan.graph_principal,
+                                workspace_id=ws,
+                                new_learning_id=lid,
+                                new_doc_id=canonical_doc_id,
+                                now=now,
+                            )
+                            committed_edges.extend(fb_edges)
+                            graph_superseded_lids.extend(fb_sup)
+
+                    linked_lids = linked_learning_ids_for_edges(
+                        c, committed_edges, exclude_learning_id=lid
+                    )
+                    superseded_docs.extend(
+                        collect_superseded_purge_targets(c, graph_superseded_lids, principal.agent_id)
+                    )
                     near_dups = find_near_duplicate_active_learning(
                         c,
                         agent_id=principal.agent_id,
@@ -1384,6 +1994,8 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         embedding=emb_bytes,
                     )
                     for dup_lid in near_dups:
+                        if int(dup_lid) in linked_lids or int(dup_lid) in graph_superseded_lids:
+                            continue
                         dup_row = c.execute(
                             "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
                             (dup_lid,),
@@ -1406,10 +2018,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                             db_path=getattr(wb.config, "db_path", None),
                             vault_path=getattr(wb.config, "vault_path", None),
                         )
-                        try:
-                            context.purge_durable_learning(dup_agent, dup_content, db=wb.db)
-                        except Exception:
-                            pass
+                        superseded_docs.append((dup_agent, dup_content))
                     c.execute(
                         """
                         UPDATE candidate_packets
@@ -1435,16 +2044,51 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             )
             auto_accept = False
             lid = None
+            commit_res = None
+            superseded_docs = []
             withheld = list(withheld) + ["canonical commit failed"]
             with db.transaction() as c2:
                 cid = _stage_proposal(c2)
 
+        for sup_agent, sup_content in superseded_docs:
+            if sup_content:
+                try:
+                    context.purge_durable_learning(sup_agent, sup_content, db=db)
+                except Exception:
+                    pass
+
         indexed_ok = True
         if lid is not None:
-            indexed_ok = settle_accepted_candidate(
-                context, db, cid, principal.agent_id, stored_content, lid,
-                workspace_id=ws,
-            )
+            try:
+                if getattr(getattr(wb, "config", None), "writeback_enabled", False) and hasattr(
+                    wb, "_write_to_disk"
+                ):
+                    wb._write_to_disk(
+                        lid, principal.agent_id, category, stored_content, now, workspace_id=ws
+                    )
+            except Exception:
+                pass
+            if commit_res is not None and plan is not None:
+                indexed_ok = finalize_governed_promotion(
+                    plan, commit_res, content=stored_content, workspace_id=ws
+                )
+                if not indexed_ok:
+                    indexed_ok = settle_accepted_candidate(
+                        context, db, cid, principal.agent_id, stored_content, lid,
+                        workspace_id=ws,
+                    )
+                else:
+                    try:
+                        context.maybe_archive_inbox_source(db, cid)
+                    except Exception as exc:
+                        context.logger.warning(
+                            "candidate=%s inbox archive failed (%s; non-fatal)", cid, exc,
+                        )
+            else:
+                indexed_ok = settle_accepted_candidate(
+                    context, db, cid, principal.agent_id, stored_content, lid,
+                    workspace_id=ws,
+                )
             context.logger.warning(
                 "AUTO_ACCEPT_OWN candidate=%s learning=%s principal=%s "
                 "(operator-enabled; resolved_by=%s) (G15 audit)",
@@ -1724,6 +2368,89 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         deduplicated_accept = False
         author_agent = principal.agent_id
         superseded_docs: list[tuple[str, str]] = []
+        plan = None
+        commit_res = None
+        pre_snapshot: tuple[str, str, str, str] | None = None
+        if new_status == "accepted":
+            try:
+                from minni.afm_passes.consolidation import content_hash as _pre_content_hash
+                from minni.afm_passes.inbox_ingest import _canonical_principal as _pre_canon
+                from minni.writeback import CATEGORIES as _PRE_CATEGORIES
+
+                with db.cursor() as c_pre:
+                    c_pre.execute(
+                        "SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,)
+                    )
+                    pre_row = c_pre.fetchone()
+                    if pre_row:
+                        pre_d = dict(pre_row)
+                        pre_owner = str(pre_d.get("principal") or "")
+                        pre_author = pre_owner or principal.agent_id
+                        pre_content = str(pre_d.get("content") or "")
+                        pre_instr = bool(int(pre_d.get("instruction_like") or 0)) or is_instruction_like(
+                            pre_content
+                        )
+                        pre_raw_cat = str(
+                            pre_d.get("category") or params.get("category") or "general"
+                        ).strip().lower()
+                        pre_cat = (
+                            pre_raw_cat if pre_raw_cat in _PRE_CATEGORIES else "general"
+                        )
+                        pre_ws = (
+                            str(pre_d.get("workspace_id") or "default").strip()
+                            or "default"
+                        )
+                        pre_cols = {
+                            r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                            for r in c_pre.execute("PRAGMA table_info(learnings)").fetchall()
+                        }
+                        pre_ok = (
+                            pre_d.get("status") == "proposed"
+                            and (
+                                _pre_canon(pre_owner) == _pre_canon(principal.agent_id)
+                                or explicitly_allowed_operator(principal)
+                            )
+                            and (
+                                not pre_instr
+                                or explicitly_allowed_accept_flagged(principal)
+                            )
+                            and (
+                                is_operator_principal(principal)
+                                or explicitly_allowed_operator(principal)
+                            )
+                        )
+                    else:
+                        pre_ok = False
+                if pre_ok and pre_content.strip():
+                    pre_has_hash = "content_hash" in pre_cols
+                    pre_has_status = "status" in pre_cols
+                    pre_has_ws = "workspace_id" in pre_cols
+                    plan = prepare_governed_promotion(
+                        db,
+                        author_agent=pre_author,
+                        workspace_id=pre_ws,
+                        caller_principal=principal,
+                        content=pre_content,
+                        category=pre_cat,
+                        learning_fields=LearningFields(
+                            content_hash=_pre_content_hash(pre_content) if pre_has_hash else None,
+                            status="active" if pre_has_status else None,
+                            workspace_id=pre_ws if pre_has_ws else None,
+                        ),
+                        vault_path=getattr(getattr(db, "config", None), "vault_path", None),
+                        resolve_retrieval_engine=context.resolve_retrieval_engine,
+                        on_refresh_retry=context.on_refresh_retry,
+                        allow_adapter=(
+                            ensure_canonical_learning_node
+                            is _ORIG_ENSURE_CANONICAL_LEARNING_NODE
+                        ),
+                    )
+                    pre_snapshot = (pre_content, pre_author, pre_ws, pre_cat)
+            except Exception as exc:
+                context.logger.debug("resolve_candidate: Phase-A prepare skipped (%s)", exc)
+                plan = None
+                pre_snapshot = None
+
         with db.transaction() as c:
             c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,))
             row = c.fetchone()
@@ -1805,7 +2532,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
             if new_status == "accepted":
                 from minni.afm_passes.consolidation import (
                     content_hash as _content_hash,
-                    find_active_learning_by_hash,
+                    find_active_learning_ids_by_hash,
                 )
                 from minni.writeback import CATEGORIES
 
@@ -1890,56 +2617,131 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                             )
                         if sid_int not in existing_lids:
                             existing_lids.append(sid_int)
-                while True:
-                    existing = find_active_learning_by_hash(c, _chash, author_agent)
-                    if existing is None:
-                        break
-                    ex_lid = int(existing["learning_id"])
-                    if ex_lid in existing_lids:
-                        break
-                    existing_lids.append(ex_lid)
-                    if _have_status_col:
-                        c.execute(
-                            "UPDATE learnings SET status = 'superseded' WHERE learning_id = ?",
-                            (ex_lid,),
-                        )
-                    elif "superseded_by" in l_cols:
-                        c.execute(
-                            "UPDATE learnings SET superseded_by = -1 WHERE learning_id = ?",
-                            (ex_lid,),
-                        )
-                    else:
-                        break
+                # Collect pre-existing active hash-matching rows WITHOUT mutating
+                # their status yet so `_revalidate_target` inside
+                # `commit_prepared_learning` continues to see active targets;
+                # they are superseded/evicted after `lid` is committed below.
+                for ex_lid in find_active_learning_ids_by_hash(c, _chash, author_agent):
+                    if ex_lid not in existing_lids:
+                        existing_lids.append(ex_lid)
                 cand_ws = str(rowd.get("workspace_id") or "default").strip() or "default"
-                ins_cols = ["agent_id", "category", "content", "created_at"]
-                ins_vals: list[Any] = [author_agent, cat, content, now]
-                if _have_status_col:
-                    ins_cols.append("status")
-                    ins_vals.append("active")
-                if _have_hash_col:
-                    ins_cols.append("content_hash")
-                    ins_vals.append(_chash)
-                if "workspace_id" in l_cols:
-                    ins_cols.append("workspace_id")
-                    ins_vals.append(cand_ws)
-                c.execute(
-                    f"INSERT INTO learnings ({', '.join(ins_cols)}) "
-                    f"VALUES ({', '.join('?' * len(ins_vals))})",
-                    ins_vals,
+                commit_res = None
+                committed_edges: list[Any] = []
+                graph_superseded_lids: list[int] = []
+                plan_matches = (
+                    plan is not None
+                    and pre_snapshot == (content, author_agent, cand_ws, cat)
                 )
-                lid = c.lastrowid
-                # Coordinated canonical commit: the join row lands in the same
-                # transaction as the learning + candidate status update, so a
-                # mid-commit failure rolls all three back. Typed edges come
-                # from the classifier (activation gate), not this path.
-                ensure_canonical_learning_node(
-                    c,
-                    learning_id=lid,
-                    agent_id=author_agent,
-                    content=content,
-                    vault_path=db.config.vault_path,
-                    created_at=now,
-                    workspace_id=cand_ws,
+                if (
+                    plan_matches
+                    and plan is not None
+                    and plan.prepared is not None
+                    and ensure_canonical_learning_node is _ORIG_ENSURE_CANONICAL_LEARNING_NODE
+                ):
+                    c.execute("SAVEPOINT minni_graph_commit")
+                    try:
+                        commit_res = commit_prepared_learning(
+                            c, plan.prepared, db=db, principal=plan.graph_principal
+                        )
+                        c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                    except GraphCommitAborted as abort:
+                        c.execute("ROLLBACK TO SAVEPOINT minni_graph_commit")
+                        c.execute("RELEASE SAVEPOINT minni_graph_commit")
+                        if abort.code in _HARD_GRAPH_ABORT_CODES:
+                            err_code = (
+                                -32004
+                                if abort.code in ("canonical_restricted", "principal_mismatch")
+                                else -32602
+                            )
+                            raise ResolveRejected(
+                                context.make_error(
+                                    err_code, f"{abort.code}: {abort}", request_id
+                                )
+                            )
+                        context.logger.warning(
+                            "resolve_candidate: graph commit aborted (%s: %s); falling back to direct canonical commit",
+                            abort.code,
+                            abort,
+                        )
+                        commit_res = None
+
+                if commit_res is not None and plan is not None:
+                    lid = commit_res.learning_id
+                    canonical_doc_id = commit_res.doc_id
+                    committed_edges.extend(commit_res.edges)
+                    graph_superseded_lids.extend(commit_res.superseded_learning_ids)
+                    if plan.fallback_edges is not None and not committed_edges:
+                        fb_edges, fb_sup = apply_fallback_graph_edges(
+                            c,
+                            plan.fallback_edges,
+                            graph_principal=plan.graph_principal,
+                            workspace_id=cand_ws,
+                            new_learning_id=lid,
+                            new_doc_id=canonical_doc_id,
+                            now=now,
+                        )
+                        committed_edges.extend(fb_edges)
+                        graph_superseded_lids.extend(fb_sup)
+                else:
+                    ins_cols = ["agent_id", "category", "content", "created_at"]
+                    ins_vals: list[Any] = [author_agent, cat, content, now]
+                    if _have_status_col:
+                        ins_cols.append("status")
+                        ins_vals.append("active")
+                    if _have_hash_col:
+                        ins_cols.append("content_hash")
+                        ins_vals.append(_chash)
+                    if "workspace_id" in l_cols:
+                        ins_cols.append("workspace_id")
+                        ins_vals.append(cand_ws)
+                    c.execute(
+                        f"INSERT INTO learnings ({', '.join(ins_cols)}) "
+                        f"VALUES ({', '.join('?' * len(ins_vals))})",
+                        ins_vals,
+                    )
+                    lid = c.lastrowid
+                    canonical_doc_id = ensure_canonical_learning_node(
+                        c,
+                        learning_id=lid,
+                        agent_id=author_agent,
+                        content=content,
+                        vault_path=db.config.vault_path,
+                        created_at=now,
+                        workspace_id=cand_ws,
+                    )
+                    if canonical_doc_id is not None:
+                        post_doc = c.execute(
+                            "SELECT page_status, privacy_level FROM documents WHERE doc_id = ?",
+                            (canonical_doc_id,),
+                        ).fetchone()
+                        if post_doc is not None and projection_row_closed(
+                            post_doc["page_status"], post_doc["privacy_level"]
+                        ):
+                            raise ResolveRejected(
+                                context.make_error(
+                                    -32004,
+                                    "canonical_restricted: canonical node is lifecycle-closed/restricted",
+                                    request_id,
+                                )
+                            )
+                    if plan_matches and plan is not None and plan.fallback_edges is not None:
+                        fb_edges, fb_sup = apply_fallback_graph_edges(
+                            c,
+                            plan.fallback_edges,
+                            graph_principal=plan.graph_principal,
+                            workspace_id=cand_ws,
+                            new_learning_id=lid,
+                            new_doc_id=canonical_doc_id,
+                            now=now,
+                        )
+                        committed_edges.extend(fb_edges)
+                        graph_superseded_lids.extend(fb_sup)
+
+                linked_lids = linked_learning_ids_for_edges(
+                    c, committed_edges, exclude_learning_id=lid
+                )
+                superseded_docs.extend(
+                    collect_superseded_purge_targets(c, graph_superseded_lids, author_agent)
                 )
                 near_dups = find_near_duplicate_active_learning(
                     c,
@@ -1949,10 +2751,14 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     exclude_learning_id=lid,
                 )
                 for dup_lid in near_dups:
-                    if dup_lid not in existing_lids:
+                    if (
+                        int(dup_lid) not in existing_lids
+                        and int(dup_lid) not in linked_lids
+                        and int(dup_lid) not in graph_superseded_lids
+                    ):
                         existing_lids.append(dup_lid)
                 for ex_lid in existing_lids:
-                    if ex_lid == lid:
+                    if ex_lid == lid or int(ex_lid) in graph_superseded_lids:
                         continue
                     ex_row = c.execute(
                         "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
@@ -2029,11 +2835,49 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         indexed_ok = True
         cand_ws_resolved = str(rowd.get("workspace_id") or "default").strip() or "default"
         if lid is not None:
-            indexed_ok = settle_accepted_candidate(
-                context, db, cid, author_agent,
-                str(rowd.get("content") or ""), lid,
-                workspace_id=cand_ws_resolved,
-            )
+            try:
+                wb_opt = context.lazy_writeback() if callable(context.lazy_writeback) else None
+                if (
+                    wb_opt is not None
+                    and getattr(getattr(wb_opt, "config", None), "writeback_enabled", False)
+                    and hasattr(wb_opt, "_write_to_disk")
+                ):
+                    raw_c = str(rowd.get("category") or params.get("category") or "general").strip().lower()
+                    wb_opt._write_to_disk(
+                        lid,
+                        author_agent,
+                        raw_c or "general",
+                        str(rowd.get("content") or ""),
+                        now,
+                        workspace_id=cand_ws_resolved,
+                    )
+            except Exception:
+                pass
+            if commit_res is not None and plan is not None:
+                indexed_ok = finalize_governed_promotion(
+                    plan, commit_res,
+                    content=str(rowd.get("content") or ""),
+                    workspace_id=cand_ws_resolved,
+                )
+                if not indexed_ok:
+                    indexed_ok = settle_accepted_candidate(
+                        context, db, cid, author_agent,
+                        str(rowd.get("content") or ""), lid,
+                        workspace_id=cand_ws_resolved,
+                    )
+                else:
+                    try:
+                        context.maybe_archive_inbox_source(db, cid)
+                    except Exception as exc:
+                        context.logger.warning(
+                            "candidate=%s inbox archive failed (%s; non-fatal)", cid, exc,
+                        )
+            else:
+                indexed_ok = settle_accepted_candidate(
+                    context, db, cid, author_agent,
+                    str(rowd.get("content") or ""), lid,
+                    workspace_id=cand_ws_resolved,
+                )
         else:
             # A non-accept resolution still archives its inbox source.
             context.maybe_archive_inbox_source(db, cid)

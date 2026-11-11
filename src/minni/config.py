@@ -182,11 +182,11 @@ class MinniConfig:
             "MINNI_GRAPH_CLASSIFICATION_ENABLED", "on"
         ).lower() not in {"0", "false", "no", "off"}
     )
-    # Governs read-time 1-hop neighbor traversal in retrieve() (default False during bootstrap).
+    # Governs read-time 1-hop neighbor traversal in retrieve() (default True).
     graph_expansion_enabled: bool = field(
         default_factory=lambda: os.environ.get(
-            "MINNI_GRAPH_EXPANSION_ENABLED", "off"
-        ).lower() in {"1", "true", "yes", "on"}
+            "MINNI_GRAPH_EXPANSION_ENABLED", "on"
+        ).lower() not in {"0", "false", "no", "off"}
     )
 
     # AFM self-organization loop (PR-12)

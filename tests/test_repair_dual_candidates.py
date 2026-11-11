@@ -634,10 +634,7 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
     from minni.afm_passes import compact_distillation as cd
 
     db, cfg = _make_db(tmp_path)
-    content = (
-        "Compaction summary — Key technical concepts: "
-        "race on bootout after launchctl error 5"
-    )
+    content = "race on bootout after launchctl error 5"
 
     _insert_candidate(
         db,

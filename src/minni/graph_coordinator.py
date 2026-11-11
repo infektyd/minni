@@ -797,9 +797,15 @@ def _revalidate_target(
     if descriptor.store_id != store_id:
         raise _Abort("stale_candidate",
                      f"target doc {descriptor.doc_id} bound to another store")
+    doc_cols = {
+        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+        for r in c.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    has_doc_ws = "workspace_id" in doc_cols
+    ws_col_sql = ", workspace_id" if has_doc_ws else ""
     row = c.execute(
-        "SELECT doc_id, path, agent, privacy_level, page_status, page_type,"
-        " memory_kind FROM documents WHERE doc_id = ?",
+        f"SELECT doc_id, path, agent, privacy_level, page_status, page_type,"
+        f" memory_kind{ws_col_sql} FROM documents WHERE doc_id = ?",
         (descriptor.doc_id,),
     ).fetchone()
     if row is None:
@@ -812,6 +818,8 @@ def _revalidate_target(
         "memory_kind": row["memory_kind"],
         "path": row["path"],
     }
+    if has_doc_ws:
+        metadata["workspace_id"] = row["workspace_id"]
     try:
         authorized = bool(can_read_document(principal, workspace, metadata))
     except Exception:
@@ -850,6 +858,12 @@ def _revalidate_target(
                 "stale_candidate",
                 f"target doc {descriptor.doc_id} field {field} changed"
                 " since prepare",
+            )
+    if has_doc_ws and "workspace_id" in metadata_snapshot:
+        if str(metadata.get("workspace_id") or "") != str(metadata_snapshot.get("workspace_id") or ""):
+            raise _Abort(
+                "stale_candidate",
+                f"target doc {descriptor.doc_id} field workspace_id changed since prepare",
             )
     if (
         str(metadata["page_status"] or "accepted") != descriptor.status
@@ -1003,6 +1017,7 @@ def _insert_learning(
     now: float,
     fields: LearningFields,
     workspace_id: str = "default",
+    apply_supersedes: bool = True,
 ) -> int:
     """Learnings INSERT: wrapper columns plus any provided optional fields."""
     from minni.writeback import CATEGORIES
@@ -1012,6 +1027,16 @@ def _insert_learning(
     confidence = 1.0 if fields.confidence is None else float(fields.confidence)
     if not math.isfinite(confidence):
         raise _Abort("learning_field_invalid", "confidence must be finite")
+    if fields.supersedes is not None:
+        exists = c.execute(
+            "SELECT 1 FROM learnings WHERE learning_id = ?",
+            (fields.supersedes,),
+        ).fetchone()
+        if exists is None:
+            raise _Abort(
+                "supersedes_missing",
+                f"supersedes learning {fields.supersedes} not found",
+            )
     cols = ["agent_id", "category", "content", "confidence", "embedding", "created_at"]
     vals: List[Any] = [agent_id, category, content, confidence, embedding, now]
     present = {str(r[1]) for r in c.execute("PRAGMA table_info(learnings)").fetchall()}
@@ -1044,7 +1069,7 @@ def _insert_learning(
         vals,
     )
     learning_id = int(c.lastrowid)
-    if fields.supersedes is not None:
+    if apply_supersedes and fields.supersedes is not None:
         c.execute(
             "UPDATE learnings SET superseded_by = ? WHERE learning_id = ?",
             (learning_id, fields.supersedes),
@@ -1224,19 +1249,34 @@ def prepare_learning_with_graph(
             source = {
                 "store_id": store_id,
                 "agent_id": agent_id,
+                "workspace_id": str(fields.workspace_id or workspace or ""),
+                "category": category,
                 "title": f"learning:{agent_id}",
                 "content_sha256": _sha256_text(content),
                 "excerpt": content.strip()[:2000],
             }
             descriptors = {p.pair_id: p for p in pairs}
-            candidates = [
-                {"pair_id": p.pair_id, "doc_id": p.doc_id,
-                 "store_id": p.store_id, "title": p.title,
-                 "status": p.status, "page_type": p.page_type,
-                 "excerpt": p.excerpt,
-                 "content_sha256": p.content_sha256}
-                for p in pairs
-            ]
+            candidates = []
+            for p in pairs:
+                cand_item: Dict[str, Any] = {
+                    "pair_id": p.pair_id,
+                    "doc_id": p.doc_id,
+                    "store_id": p.store_id,
+                    "title": p.title,
+                    "status": p.status,
+                    "page_type": p.page_type,
+                    "excerpt": p.excerpt,
+                    "content_sha256": p.content_sha256,
+                }
+                snap = meta_snapshots.get(p.doc_id)
+                if isinstance(snap, dict):
+                    if snap.get("agent") is not None:
+                        cand_item["agent"] = snap["agent"]
+                    if "workspace_id" in snap:
+                        cand_item["workspace_id"] = snap["workspace_id"]
+                    if snap.get("category") is not None:
+                        cand_item["category"] = snap["category"]
+                candidates.append(cand_item)
             try:
                 _assert_unlocked(db, "classify")
                 validated, classifier_info = _classify_validated(
@@ -1327,19 +1367,26 @@ def commit_prepared_learning(
         " WHERE path = ?",
         (prepared.path,),
     ).fetchone()
-    if prior is not None and projection_row_closed(
-        prior["page_status"], prior["privacy_level"]
-    ):
-        raise _Abort("canonical_restricted",
-                     "canonical node is lifecycle-closed/restricted")
+    if prior is not None:
+        prior_status = str(prior["page_status"] or "")
+        if (
+            prior["privacy_level"] == "blocked"
+            or prior_status in ("draft", "expired", "rejected")
+            or (prior_status == "superseded" and os.path.lexists(prepared.path))
+        ):
+            raise _Abort("canonical_restricted",
+                         "canonical node is lifecycle-closed/restricted")
     effective_ws = str(
         prepared.learning_fields.workspace_id or prepared.workspace or "default"
     ).strip() or "default"
+    # Defer explicit `fields.supersedes` UPDATE until after `_revalidate_target`
+    # and `_apply_updates_supersession` so active shortlisted targets remain
+    # valid during graph edge binding.
     learning_id = _insert_learning(
         c, agent_id=prepared.principal.agent_id, category=prepared.category,
         content=prepared.content, embedding=prepared.learning_vector,
         now=prepared.prepared_at, fields=prepared.learning_fields,
-        workspace_id=effective_ws,
+        workspace_id=effective_ws, apply_supersedes=False,
     )
     doc_id = ensure_canonical_learning_node(
         c, learning_id=learning_id, agent_id=prepared.principal.agent_id,
@@ -1348,6 +1395,15 @@ def commit_prepared_learning(
     )
     if doc_id is None:
         raise _Abort("canonical_failed", "canonical node commit refused")
+    post_doc = c.execute(
+        "SELECT page_status, privacy_level FROM documents WHERE doc_id = ?",
+        (doc_id,),
+    ).fetchone()
+    if post_doc is not None and projection_row_closed(
+        post_doc["page_status"], post_doc["privacy_level"]
+    ):
+        raise _Abort("canonical_restricted",
+                     "canonical node is lifecycle-closed/restricted")
     bound: List[Tuple[int, int, str, float]] = []
     if prepared.graph_enabled and prepared.validated:
         targets = {}
@@ -1402,6 +1458,11 @@ def commit_prepared_learning(
             new_learning_id=learning_id, new_doc_id=int(doc_id),
             agent_id=prepared.principal.agent_id, now=prepared.prepared_at,
             allow_retire=True,
+        )
+    if prepared.learning_fields.supersedes is not None:
+        c.execute(
+            "UPDATE learnings SET superseded_by = ? WHERE learning_id = ?",
+            (learning_id, prepared.learning_fields.supersedes),
         )
     return CommitResult(
         status="staged", learning_id=learning_id, doc_id=doc_id,

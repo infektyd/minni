@@ -470,26 +470,19 @@ def test_the_knob_does_not_unlock_resolve_contradiction(db_path):
 
 
 def test_auto_accept_does_not_store_duplicates(db_path):
-    """F2: the unattended writer must not blind the guard in front of it.
-    detect_contradictions filters `embedding IS NOT NULL`, so unembedded rows
-    are invisible to it — five identical calls previously stored five rows."""
+    """F2: the unattended writer must not double-store identical learnings;
+    in-transaction content_hash deduplication withholds auto-accept on repeats."""
     principal = _principal(auto_accept_own=True)
     content = "Pin the CLI version so a release becomes a reviewable file change."
     first, _r, _ = _learn(principal, db_path, content=content)
     assert first["status"] == "accepted"
 
     later = [_learn(principal, db_path, content=content)[0] for _ in range(3)]
-    # Two defences, and which one fires is the point. Because the row is now
-    # EMBEDDED, detect_contradictions can see it and stops the repeat before it
-    # is even staged ("contradiction"); the in-transaction content_hash check is
-    # the backstop for paths that skip that pre-check. Either way the durable
-    # tier gains nothing. Before the fix all three stored a fourth row.
+    assert all(r["status"] == "proposed" for r in later), later
     assert all(
-        r["status"] in ("contradiction", "proposed") for r in later
+        any("duplicate" in reason for reason in r.get("auto_accept_withheld", []))
+        for r in later
     ), later
-    assert any(r["status"] == "contradiction" for r in later), (
-        "the embedding did not restore detect_contradictions' vision"
-    )
     assert len(_rows(db_path, "SELECT * FROM learnings")) == 1
 
 

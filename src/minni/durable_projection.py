@@ -528,7 +528,7 @@ def evict_candidate_to_cold_archive(
         )
         try:
             from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
-            from minni.config import Config
+            from minni.config import MinniConfig
 
             db_wrapper = engine if hasattr(engine, "cursor") else None
             if db_wrapper is None:
@@ -542,7 +542,7 @@ def evict_candidate_to_cold_archive(
                             yield self._cur
                         return _cm()
                 db_wrapper = _CursorWrapper(c)
-            cfg = getattr(engine, "config", None) or Config()
+            cfg = getattr(engine, "config", None) or MinniConfig()
             maybe_archive_for_candidate(db_wrapper, cfg, cid)
         except Exception:
             pass

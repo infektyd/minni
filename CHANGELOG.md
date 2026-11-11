@@ -12,6 +12,10 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Added
 
+- **Wave 3 typed memory graph, supersession engine & hands-free hygiene (`BUG-05`, `BUG-10`, `BUG-11`, `BUG-12`):**
+  - Wired `GraphRuntimeAdapter`, `prepare_learning_with_graph` / `commit_prepared_learning`, post-commit vector refresh, and `backfill_learning_projections` into live candidate acceptance (`resolve_candidate`, `stage_candidate` `auto_accept_own`), forced learns (`handle_learn`), and AFM durable promotion (`promote_candidate_durable`), preserving `workspace_id`, purging superseded durable vectors, and providing a zero-network deterministic edge heuristic fallback when local AFM is disabled or unavailable.
+  - Enabled `graph_expansion_enabled` by default, wired `expand_typed_graph` into retrieval and typed `memory_links` (`updates`, `updated_by`, `contradicts`, `extends`, `relates`) into `minni_drill` (`expand`), folded `@Generable` `edge_inference` / `edge_inference_compact` guided generation into `native_afm_helper.swift`, and surfaced workspace- and principal-authorized graph contradiction sidecars on recall and `subscribe_contradictions`.
+  - Retired the legacy cosine contradiction detector (`WriteBackMemory.detect_contradictions`) that emitted unclassified rows into `contradiction_log`.
 - **Wave 2 project-scoped storage, Repo-First recall & first-class CLI:**
   - Migration `025_workspace_scoping.sql` and idempotent `MinniDB` schema initialization adding `workspace_id` + indexes onto `documents` and `learnings`, backfilling `learnings.workspace_id` from accepted `candidate_packets`, and preserving `workspace_id` across candidate staging/acceptance, forced learns, AFM durable promotion, YAML frontmatter indexing, and `_durable/` hydration.
   - Repo-First 3-tier recall ranking (`workspace_id` query context without narrowing `can_read_document` ACL scope), post-rerank confidence floor enforcement across FTS single-word overlap and HyDE enrichment, high cross-repo confidence bar for explicit foreign-repo hits, and blank `<EVIDENCE>` stripping across Python retrieval and TypeScript plugin surfaces.
@@ -41,6 +45,8 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Fixed
 
+- Prevented AFM content-level `context_overflow`, `guardrail`, and `refusal` responses from tripping the global 300s `CircuitBreaker`, added proactive/reactive candidate chunking and a deterministic quality fallback evaluator in `afm_passes/judge.py`, added recursive batch splitting in `EdgeClassifier`, and removed `"Compaction summary — ..."` wrapper prefixes from `compact_distillation` deterministic fallbacks (`BUG-10`).
+- Stripped runtime/system wrapper blocks (`Created At:` / `Completed At:`, `<SYSTEM_MESSAGE>`, `<MINNI_ENVELOPE>`, `[Message] timestamp=`, `<background-task>`, `<task-notification>`) before Jev inline harvest, enforced a hard stripped-content floor (`>= 15` non-whitespace chars and `>= 4` meaningful tokens) in `assessLearningQuality` before metadata bonuses apply, rejected 1-word chatter and wrapper leaks at candidate/inbox intake, and auto-rejected short/wrapper/sprint-chatter rows in consolidation (`BUG-11`).
 - Synchronous durable projection purge when learnings are superseded or retracted, plus FAISS, Trie, and rerank cache invalidation and explicit DB error surfacing on retract (`H11`).
 - Crash-safe vector index deletion reconciliation that treats interrupted `syncing` rows as dirty and preserves concurrent `mark_dirty` flags across sync errors (`H13`, `H14`).
 - Prevented `Stop` hook relay re-injection loops, tilde-expansion misses on socket/env paths, active-plan terminal self-heal drift, and `PostToolUse` read-only false positives.

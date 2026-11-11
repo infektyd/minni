@@ -21,6 +21,8 @@ export type SemanticTierState = "ran" | "unavailable" | "skipped";
 
 export interface LearningQualityReport {
   ok: boolean;
+  passed?: boolean;
+  reason?: string;
   score: number;
   warnings: string[];
   summary: string;
@@ -444,13 +446,76 @@ function persistedChannels(input: LearningInput): Array<{ field: string; text: s
   ).flatMap(({ field, text }) => (text?.trim() ? [{ field, text }] : []));
 }
 
+const QUALITY_WRAPPER_PREAMBLE_RE =
+  /(?:^|\n)[ \t]*The following is a <SYSTEM_MESSAGE>[^\n]*[ \t]*(?=\n|$)/gi;
+const QUALITY_WRAPPER_BLOCKS_RE =
+  /<(SYSTEM_MESSAGE|MINNI_ENVELOPE|EVIDENCE|minni:context|minni:packet|background-task|task-notification)\b[^>]*>[\s\S]*?<\/\1>/gi;
+const QUALITY_WRAPPER_LINES_RE =
+  /(?:^|\n)[ \t]*(?:Created At:\s*\d{4}-\d{2}-\d{2}T[^\n]*|Completed At:\s*\d{4}-\d{2}-\d{2}T[^\n]*|The following is a <SYSTEM_MESSAGE>[^\n]*|\[Message\]\s+timestamp=[^\n]*|<\/?(?:SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b[^\n]*)[ \t]*(?=\n|$)/gi;
+const BARE_CHATTER_OR_WRAPPER_RE =
+  /^\s*(?:fix(?:ed)?|done|lgtm|ok(?:ay)?|wip|ack|thanks|yes|no|Created At:\s*\S+.*)\s*$/i;
+
+export function stripQualityWrappers(text: string): string {
+  if (!text) return "";
+  let current = text.replace(QUALITY_WRAPPER_PREAMBLE_RE, "");
+  for (let pass = 0; pass < 3; pass++) {
+    const next = current.replace(QUALITY_WRAPPER_BLOCKS_RE, "");
+    if (next === current) break;
+    current = next;
+  }
+  return current.replace(QUALITY_WRAPPER_LINES_RE, "").trim();
+}
+
 export function assessLearningQuality(input: LearningInput): LearningQualityReport {
   // Regex-only fast path. Learn / quality MCP + CLI use
   // `assessLearningQualityAsync` so the #147 AFM inconclusive tier runs.
   const warnings: string[] = [];
   let score = 0.35;
-  const content = input.content.trim();
-  const wordCount = content.split(/\s+/).filter(Boolean).length;
+  const rawContent = input.content.trim();
+  const strippedContent = stripQualityWrappers(rawContent);
+  const nonWhitespaceChars = strippedContent.replace(/\s+/g, "").length;
+  const meaningfulTokens = (strippedContent.match(/[A-Za-z0-9][A-Za-z0-9_./'-]*/g) ?? []).filter(
+    (tok) => /[A-Za-z0-9]/.test(tok),
+  );
+  const isBareChatterOrWrapper =
+    BARE_CHATTER_OR_WRAPPER_RE.test(rawContent) || BARE_CHATTER_OR_WRAPPER_RE.test(strippedContent);
+  const hardContentFloorFailed =
+    nonWhitespaceChars < 15 || meaningfulTokens.length < 4 || isBareChatterOrWrapper;
+  const hardFailReason =
+    nonWhitespaceChars < 15 || meaningfulTokens.length < 4
+      ? "content_too_short"
+      : isBareChatterOrWrapper
+        ? "bare_chatter_or_wrapper"
+        : undefined;
+
+  const wordCount = strippedContent.split(/\s+/).filter(Boolean).length;
+
+  for (const channel of persistedChannels(input)) {
+    const secretMaterial = detectSecretMaterial(channel.text);
+    if (!secretMaterial) continue;
+    score -= 0.3;
+    // The field is named but the offending value is never echoed back.
+    warnings.push(
+      `The "${channel.field}" field appears to contain sensitive material ` +
+        `(${secretMaterial}); never store secrets in memory.`,
+    );
+  }
+
+  if (hardContentFloorFailed) {
+    warnings.push(
+      "Content is too short or wrapper/chatter only; stripped content requires at least 15 non-whitespace characters and 4 meaningful tokens.",
+    );
+    const normalizedFloor = clampScore(Math.min(score, 0.2));
+    return {
+      ok: false,
+      passed: false,
+      reason: hardFailReason ?? "content_too_short",
+      score: normalizedFloor,
+      warnings,
+      summary: warnings.join(" "),
+      semanticTier: "skipped",
+    };
+  }
 
   if (input.title.trim().length >= 8) score += 0.15;
   else warnings.push("Title is very short; use a durable, searchable title.");
@@ -464,25 +529,16 @@ export function assessLearningQuality(input: LearningInput): LearningQualityRepo
   if (input.source) score += 0.1;
   else warnings.push("Source is missing; add one when this came from a session, file, or user instruction.");
 
-  if (/\b(todo|maybe|later|stuff|thing)\b/i.test(content)) {
+  if (/\b(todo|maybe|later|stuff|thing)\b/i.test(strippedContent)) {
     score -= 0.12;
     warnings.push("Content has vague wording; prefer specific facts and decisions.");
   }
 
-  for (const channel of persistedChannels(input)) {
-    const secretMaterial = detectSecretMaterial(channel.text);
-    if (!secretMaterial) continue;
-    score -= 0.3;
-    // The field is named but the offending value is never echoed back.
-    warnings.push(
-      `The "${channel.field}" field appears to contain sensitive material ` +
-        `(${secretMaterial}); never store secrets in memory.`,
-    );
-  }
-
   const normalized = clampScore(score);
+  const ok = normalized >= 0.6 && !warnings.some(isSensitiveMaterialWarning);
   return {
-    ok: normalized >= 0.6 && !warnings.some(isSensitiveMaterialWarning),
+    ok,
+    passed: ok,
     score: normalized,
     warnings,
     summary: warnings.length === 0 ? "Learning looks durable and specific." : warnings.join(" "),
@@ -573,6 +629,7 @@ export async function assessLearningQualityAsync(
   const score = clampScore(base.score - 0.3);
   return {
     ok: false,
+    passed: false,
     score,
     warnings,
     summary: warnings.join(" "),

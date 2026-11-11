@@ -1055,15 +1055,6 @@ def _quality_blockers(draft: dict) -> List[str]:
     return blockers
 
 
-def _contradiction_candidates(draft: dict, writeback: Any = None) -> List[dict]:
-    if writeback is None or not hasattr(writeback, "detect_contradictions"):
-        return []
-    try:
-        return list(writeback.detect_contradictions(draft.get("body") or "", agent_id=None) or [])
-    except Exception:
-        return []
-
-
 # RCM-010: ported from writeback.py _contains_forged_frontmatter (G09 / SEC-018)
 def _contains_forged_frontmatter(content: str) -> bool:
     """Return True if content has a bare '---' line or a code fence containing one.
@@ -1158,8 +1149,8 @@ def _write_one(
     forged = _contains_forged_frontmatter(draft.get("body", ""))
     if forged:
         blockers = blockers + ["forged-frontmatter (RCM-010 / SEC-018)"]
-    contradictions = _contradiction_candidates(draft, writeback)
-    gate_status = "blocked" if blockers or contradictions else "ready_for_review"
+    contradictions: List[dict] = []
+    gate_status = "blocked" if blockers else "ready_for_review"
 
     # Finding #4: this is the staging point where a synthesized draft becomes a
     # durable vault page. Trust-but-verify the draft's own instruction_like (set by

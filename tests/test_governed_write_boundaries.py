@@ -187,7 +187,6 @@ def governed_context(db, *, automatic=True):
     model = SimpleNamespace(encode=lambda *a, **k: np.ones(4, dtype=np.float32))
     wb = SimpleNamespace(
         db=db, config=db.config, model=model,
-        detect_contradictions=lambda **k: [],
         add_derived_from_edges=lambda **k: None,
     )
     return governance.GovernanceContext(

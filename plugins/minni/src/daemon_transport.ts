@@ -1422,6 +1422,8 @@ export async function drillMemory(
       });
       const combinedResults = [...localResults, ...mergedDaemonItems];
       const firstMeta = daemonMeta[0] ?? {};
+      const firstMemoryLinks =
+        (combinedResults[0] as Record<string, unknown> | undefined)?.memory_links;
       return {
         ok: true,
         data: {
@@ -1434,6 +1436,7 @@ export async function drillMemory(
           ...(firstMeta.source_unverified !== undefined
             ? { source_unverified: firstMeta.source_unverified }
             : {}),
+          ...(firstMemoryLinks !== undefined ? { memory_links: firstMemoryLinks } : {}),
           results: combinedResults,
         },
       };

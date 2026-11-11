@@ -214,6 +214,55 @@ def _bump_merged_document_access(results: list) -> None:
             )
 
 
+def _record_returned_learning_reads(
+    results: list,
+    *,
+    reader_agent: Optional[str],
+    shared_db: Any = None,
+) -> None:
+    """Record learning_reads for canonical learning_documents returned to caller."""
+    clean_reader = str(reader_agent or "").strip()
+    if not clean_reader or not results:
+        return
+    by_db: dict[int, tuple[Any, list[int]]] = {}
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        raw_doc_id = row.get("doc_id")
+        if raw_doc_id is None:
+            continue
+        try:
+            doc_id = int(raw_doc_id)
+        except (TypeError, ValueError):
+            continue
+        engine = row.get(_QTY_ENGINE_KEY)
+        db = getattr(engine, "db", None) or shared_db
+        if db is None:
+            continue
+        bucket = by_db.get(id(db))
+        if bucket is None:
+            by_db[id(db)] = (db, [doc_id])
+        elif doc_id not in bucket[1]:
+            bucket[1].append(doc_id)
+    now = time.time()
+    for db, doc_ids in by_db.values():
+        if not doc_ids:
+            continue
+        marks = ",".join("?" * len(doc_ids))
+        try:
+            with db.cursor() as c:
+                c.execute(
+                    f"""INSERT OR IGNORE INTO learning_reads
+                        (learning_id, agent_id, read_at, source)
+                        SELECT learning_id, ?, ?, 'minnid.search'
+                        FROM learning_documents
+                        WHERE doc_id IN ({marks})""",
+                    [clean_reader, now, *doc_ids],
+                )
+        except Exception:
+            pass
+
+
 def _strip_private_search_keys(results: list) -> None:
     for row in results:
         if not isinstance(row, dict):
@@ -520,6 +569,7 @@ def _degradation_for(
         ("last_query_expand_degraded", "query_expand_degraded"),
         ("last_hyde_degraded", "hyde_degraded"),
         ("last_document_hydration_degraded", "document_hydration_degraded"),
+        ("last_contradiction_sidecars_degraded", "contradiction_sidecars_degraded"),
     ):
         value = getattr(retrieval_engine, flag, None)
         if value:
@@ -1383,7 +1433,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         def record_scores():
             try:
                 from minni.rationale import explain
-                from minni.retrieval import _recommended_action
+                from minni.retrieval import _recommended_action, overlay_contradiction_action
                 from minni.scoring import calibrated_confidence, record_score
 
                 # grok-review round 6 (finding 1): TWO passes. Recording and
@@ -1434,16 +1484,19 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                     # old value so one payload has one meaning of confidence.
                     if "recommended_action" in r:
                         try:
-                            r["recommended_action"] = _recommended_action(
+                            action = _recommended_action(
                                 r.get("review_state"),
                                 r.get("instruction_like"),
                                 r.get("confidence"),
                             )
+                            if r.get("contradictions"):
+                                action = overlay_contradiction_action(action)
+                            r["recommended_action"] = action
                         except RequestDeadlineExceeded:
                             raise
-                        except Exception as exc:
+                        except Exception as extra:
                             context.logger.debug(
-                                "search: recommended_action refresh failed: %s", exc
+                                "search: recommended_action refresh failed: %s", extra
                             )
                     if "rationale" in r:
                         try:
@@ -1496,6 +1549,17 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 if not is_passive:
                     run_document_access()
                 run_score_calibration()
+        if not is_passive and results:
+            with allow_expired_sql():
+                _record_returned_learning_reads(
+                    results,
+                    reader_agent=(
+                        getattr(principal, "agent_id", None)
+                        if principal is not None
+                        else agent_id
+                    ),
+                    shared_db=getattr(engine, "db", None),
+                )
         results = _normalize_caller_visible_results(results)
 
         learnings: list = []
@@ -1807,7 +1871,7 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
     if context.increment_request_count is not None:
         context.increment_request_count()
 
-    result_id = params.get("result_id")
+    result_id = params.get("result_id", params.get("doc_id"))
     if result_id is None:
         return context.make_error(-32602, "result_id is required", request_id)
 
@@ -1818,6 +1882,7 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
 
     depth = str(params.get("depth", "chunk"))
     claim = str(params.get("claim", "")).strip() or None
+    id_kind = params.get("id_kind")
 
     principal, err = context.handler_principal(params, request_id)
     if err:
@@ -1825,13 +1890,16 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
 
     try:
         engine = context.lazy_retrieval()
-        result = engine.expand_result(
-            result_id=result_id,
-            depth=depth,
-            principal=principal,
-            workspace=principal.workspace_id,
-            claim=claim,
-        )
+        expand_kwargs: dict[str, Any] = {
+            "result_id": result_id,
+            "depth": depth,
+            "principal": principal,
+            "workspace": principal.workspace_id,
+            "claim": claim,
+        }
+        if id_kind is not None:
+            expand_kwargs["id_kind"] = str(id_kind)
+        result = engine.expand_result(**expand_kwargs)
         if result is None:
             return context.make_error(-32000, f"No result found for result_id={result_id}", request_id)
         trace_id = record_attribution_trace(

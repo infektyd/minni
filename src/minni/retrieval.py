@@ -54,7 +54,9 @@ from minni.request_deadline import (
     RequestDeadlineExceeded,
     allow_expired_sql,
     bind_copied_deadline,
+    check_deadline,
     current_query_embed_cache,
+    request_deadline,
     run_bound,
 )
 from minni.safety import is_instruction_like
@@ -165,6 +167,7 @@ _DEGRADATION_STATE_ATTRS = {
     "vector": "vector_degraded",
     "hyde": "hyde_degraded",
     "document_hydration": "document_hydration_degraded",
+    "contradiction_sidecars": "contradiction_sidecars_degraded",
 }
 
 
@@ -178,6 +181,7 @@ class RetrievalCallState:
     vector_degraded: Optional[str] = None
     hyde_degraded: Optional[str] = None
     document_hydration_degraded: Optional[str] = None
+    contradiction_sidecars_degraded: Optional[str] = None
     trace_id: Optional[str] = None
 
 
@@ -234,6 +238,14 @@ class _ThreadLocalStateProxy:
     @document_hydration_degraded.setter
     def document_hydration_degraded(self, value: Optional[str]) -> None:
         self._engine.last_document_hydration_degraded = value
+
+    @property
+    def contradiction_sidecars_degraded(self) -> Optional[str]:
+        return self._engine.last_contradiction_sidecars_degraded
+
+    @contradiction_sidecars_degraded.setter
+    def contradiction_sidecars_degraded(self, value: Optional[str]) -> None:
+        self._engine.last_contradiction_sidecars_degraded = value
 
     @property
     def trace_id(self) -> Optional[str]:
@@ -430,6 +442,37 @@ def _recommended_action(
     return "cite"
 
 
+# Graph P2.2: unresolved authorized contradictions overlay follow_up, but
+# never downgrade instruction-like escalate or terminal ignore.
+_PROTECTED_RECALL_ACTIONS = frozenset({"escalate", "ignore"})
+_MAX_GRAPH_CONTRADICTION_DOCS = 32
+_MAX_GRAPH_CONTRADICTION_SIDECARS = 4
+_GRAPH_CONTRADICTION_PAGE = 32
+_CONTRADICTION_SIDECARS_SKIPPED = "search deadline; skipped contradiction sidecars"
+_CONTRADICTION_SIDECARS_INCOMPLETE = (
+    "search deadline; contradiction sidecars incomplete"
+)
+
+
+def _contradiction_scan_expired(deadline_monotonic: Optional[float]) -> bool:
+    """True when the explicit retrieve deadline or request deadline is gone."""
+    remaining = remaining_search_budget(deadline_monotonic)
+    if remaining is not None and remaining <= 0:
+        return True
+    try:
+        check_deadline()
+    except RequestDeadlineExceeded:
+        return True
+    return False
+
+
+def overlay_contradiction_action(action: Optional[str]) -> str:
+    """Keep escalate/ignore; otherwise follow_up for an authorized contradiction."""
+    if action in _PROTECTED_RECALL_ACTIONS:
+        return str(action)
+    return "follow_up"
+
+
 class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
     """Hybrid FTS5 + FAISS semantic retrieval with cross-encoder re-ranking."""
 
@@ -576,6 +619,15 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
     def last_document_hydration_degraded(self, value: Optional[str]) -> None:
         self._set_degradation_flag("document_hydration", value)
 
+    @property
+    def last_contradiction_sidecars_degraded(self) -> Optional[str]:
+        """Contradiction sidecar scan hit the deadline or page budget."""
+        return self._degradation_flag("contradiction_sidecars")
+
+    @last_contradiction_sidecars_degraded.setter
+    def last_contradiction_sidecars_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("contradiction_sidecars", value)
+
     def _current_state(self) -> Any:
         top = self._stack_top()
         if top is not None:
@@ -604,6 +656,9 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         self.last_vector_degraded = state.vector_degraded
         self.last_hyde_degraded = state.hyde_degraded
         self.last_document_hydration_degraded = state.document_hydration_degraded
+        self.last_contradiction_sidecars_degraded = (
+            state.contradiction_sidecars_degraded
+        )
         self.last_trace_id = state.trace_id
 
     def _deadline_skipped_vector(self) -> bool:
@@ -1502,6 +1557,318 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             budgeted.append(r)
         return budgeted
 
+    def _unresolved_graph_contradictions(
+        self,
+        doc_ids: Sequence[Any],
+        *,
+        principal: Optional[EffectivePrincipal],
+        workspace: str,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Dict[int, Tuple[Dict[str, Any], ...]]:
+        """Page authorized unresolved graph contradiction sidecars."""
+        work = {
+            "log_rows_seen": 0,
+            "auth_checks": 0,
+            "metadata_ids": 0,
+            "pages": 0,
+            "incomplete": False,
+        }
+        self._last_graph_contradiction_work = work
+        if principal is None:
+            return {}
+        ids: List[int] = []
+        seen = set()
+        for raw in doc_ids:
+            try:
+                doc_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            ids.append(doc_id)
+            if len(ids) >= _MAX_GRAPH_CONTRADICTION_DOCS:
+                break
+        if not ids:
+            return {}
+
+        def _stamp(reason: str) -> None:
+            work["incomplete"] = True
+            self.last_contradiction_sidecars_degraded = reason
+
+        if _contradiction_scan_expired(deadline_monotonic):
+            _stamp(_CONTRADICTION_SIDECARS_SKIPPED)
+            return {}
+
+        with request_deadline(deadline_monotonic):
+            return self._page_graph_contradictions(
+                ids,
+                principal=principal,
+                workspace=workspace,
+                deadline_monotonic=deadline_monotonic,
+                work=work,
+                stamp=_stamp,
+            )
+
+    def _page_graph_contradictions(
+        self,
+        ids: List[int],
+        *,
+        principal: EffectivePrincipal,
+        workspace: str,
+        deadline_monotonic: Optional[float],
+        work: Dict[str, Any],
+        stamp,
+    ) -> Dict[int, Tuple[Dict[str, Any], ...]]:
+        placeholders = ",".join("?" * len(ids))
+        attached: Dict[int, List[Dict[str, Any]]] = {doc_id: [] for doc_id in ids}
+        meta_by_id: Dict[int, Dict[str, Any]] = {}
+        auth_cache: Dict[int, bool] = {}
+        pair_seen: set = set()
+        after_id = 0
+        ws = workspace or getattr(principal, "workspace_id", "default") or "default"
+        conn = self.db._get_conn()
+        nested = bool(getattr(conn, "in_transaction", False))
+        cur = conn.cursor()
+        savepoint = f"minni_graph_contra_{id(cur) & 0xFFFFFFFF:x}"
+        started = False
+        has_doc_ws_col: Optional[bool] = None
+
+        def _buckets_full() -> bool:
+            return all(
+                len(attached[doc_id]) >= _MAX_GRAPH_CONTRADICTION_SIDECARS
+                for doc_id in ids
+            )
+
+        def _load_meta(needed: List[int]) -> bool:
+            nonlocal has_doc_ws_col
+            fresh = []
+            seen_need = set()
+            for doc_id in needed:
+                if doc_id in meta_by_id or doc_id in seen_need:
+                    continue
+                seen_need.add(doc_id)
+                fresh.append(doc_id)
+            if not fresh:
+                return True
+            for offset in range(0, len(fresh), _GRAPH_CONTRADICTION_PAGE):
+                if _contradiction_scan_expired(deadline_monotonic):
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    return False
+                chunk = fresh[offset:offset + _GRAPH_CONTRADICTION_PAGE]
+                marks = ",".join("?" * len(chunk))
+                try:
+                    if has_doc_ws_col is None:
+                        doc_cols = {
+                            r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                            for r in cur.execute("PRAGMA table_info(documents)").fetchall()
+                        }
+                        has_doc_ws_col = "workspace_id" in doc_cols
+                    ws_col_sql = ", workspace_id" if has_doc_ws_col else ""
+                    for doc in cur.execute(
+                        f"""SELECT doc_id, path, agent, privacy_level,
+                                   page_status, page_type, memory_kind{ws_col_sql}
+                            FROM documents WHERE doc_id IN ({marks})""",
+                        chunk,
+                    ).fetchall():
+                        meta_entry = {
+                            "doc_id": doc["doc_id"],
+                            "path": doc["path"],
+                            "agent": doc["agent"],
+                            "privacy_level": doc["privacy_level"],
+                            "page_status": doc["page_status"],
+                            "page_type": doc["page_type"],
+                            "memory_kind": doc["memory_kind"],
+                        }
+                        if has_doc_ws_col:
+                            meta_entry["workspace_id"] = doc["workspace_id"]
+                        meta_by_id[int(doc["doc_id"])] = meta_entry
+                        work["metadata_ids"] += 1
+                except RequestDeadlineExceeded:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    return False
+                except sqlite3.OperationalError:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    return False
+                if _contradiction_scan_expired(deadline_monotonic):
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    return False
+            return True
+
+        def _readable(doc_id: int) -> Optional[bool]:
+            cached = auth_cache.get(doc_id)
+            if cached is not None:
+                return cached
+            if _contradiction_scan_expired(deadline_monotonic):
+                stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                return None
+            meta = meta_by_id.get(doc_id)
+            work["auth_checks"] += 1
+            allowed = False
+            if meta is not None:
+                try:
+                    allowed = bool(can_read_document(principal, ws, meta))
+                except Exception:
+                    allowed = False
+            auth_cache[doc_id] = allowed
+            if _contradiction_scan_expired(deadline_monotonic):
+                stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+            return allowed
+
+        try:
+            if nested:
+                cur.execute(f"SAVEPOINT {savepoint}")
+            else:
+                cur.execute("BEGIN DEFERRED")
+            started = True
+            while not _buckets_full():
+                if _contradiction_scan_expired(deadline_monotonic):
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    break
+                try:
+                    page = cur.execute(
+                        f"""SELECT id, memory_a_id, source_doc_id, target_doc_id,
+                                   edge_run_id, confidence, detection_method
+                            FROM contradiction_log
+                            WHERE resolution_status = 'unresolved'
+                              AND id > ?
+                              AND (source_doc_id IN ({placeholders})
+                                   OR target_doc_id IN ({placeholders}))
+                            ORDER BY id ASC
+                            LIMIT ?""",
+                        (after_id, *ids, *ids, _GRAPH_CONTRADICTION_PAGE),
+                    ).fetchall()
+                except RequestDeadlineExceeded:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    break
+                except sqlite3.OperationalError:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    break
+                except Exception as exc:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    logger.debug("graph contradictions: log query skipped (%s)", exc)
+                    break
+                work["pages"] += 1
+                if not page:
+                    break
+                after_id = int(page[-1]["id"])
+                needed: List[int] = []
+                parsed_page = []
+                for row in page:
+                    work["log_rows_seen"] += 1
+                    try:
+                        source_id = (
+                            int(row["source_doc_id"])
+                            if row["source_doc_id"] is not None else None
+                        )
+                        target_id = (
+                            int(row["target_doc_id"])
+                            if row["target_doc_id"] is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if source_id is None or target_id is None:
+                        continue
+                    pair_key = (
+                        source_id, target_id
+                    ) if source_id <= target_id else (target_id, source_id)
+                    if pair_key in pair_seen:
+                        continue
+                    need_source = (
+                        source_id in attached
+                        and len(attached[source_id]) < _MAX_GRAPH_CONTRADICTION_SIDECARS
+                    )
+                    need_target = (
+                        target_id in attached
+                        and len(attached[target_id]) < _MAX_GRAPH_CONTRADICTION_SIDECARS
+                    )
+                    if not need_source and not need_target:
+                        continue
+                    parsed_page.append((row, source_id, target_id, pair_key))
+                    if source_id not in meta_by_id:
+                        needed.append(source_id)
+                    if target_id not in meta_by_id:
+                        needed.append(target_id)
+                if not _load_meta(needed):
+                    break
+                stop = False
+                for row, source_id, target_id, pair_key in parsed_page:
+                    if pair_key in pair_seen:
+                        continue
+                    pair_seen.add(pair_key)
+                    source_ok = _readable(source_id)
+                    if source_ok is None:
+                        stop = True
+                        break
+                    target_ok = _readable(target_id)
+                    if target_ok is None:
+                        stop = True
+                        break
+                    if not source_ok or not target_ok:
+                        continue
+                    confidence = row["confidence"]
+                    try:
+                        confidence = (
+                            float(confidence) if confidence is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        confidence = None
+                    if confidence is not None and not math.isfinite(confidence):
+                        confidence = None
+                    sidecar = {
+                        "id": int(row["id"]),
+                        "confidence": confidence,
+                        "detection_method": row["detection_method"],
+                        "edge_run_id": row["edge_run_id"],
+                        "graph_path": {
+                            "link_type": "contradicts",
+                            "source_doc_id": source_id,
+                            "target_doc_id": target_id,
+                        },
+                    }
+                    for node_id, counterpart in (
+                        (source_id, target_id),
+                        (target_id, source_id),
+                    ):
+                        bucket = attached.get(node_id)
+                        if bucket is None:
+                            continue
+                        if len(bucket) >= _MAX_GRAPH_CONTRADICTION_SIDECARS:
+                            continue
+                        if any(item["id"] == sidecar["id"] for item in bucket):
+                            continue
+                        bucket.append({**sidecar, "counterpart_doc_id": counterpart})
+                    if _buckets_full():
+                        break
+                    if _contradiction_scan_expired(deadline_monotonic):
+                        stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                        stop = True
+                        break
+                if stop or _buckets_full():
+                    break
+                if len(page) < _GRAPH_CONTRADICTION_PAGE:
+                    break
+        except RequestDeadlineExceeded:
+            stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+        except sqlite3.OperationalError:
+            stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+        finally:
+            try:
+                if started:
+                    if nested:
+                        sqlite3.Cursor.execute(cur, f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        sqlite3.Cursor.execute(cur, f"RELEASE SAVEPOINT {savepoint}")
+                    else:
+                        conn.rollback()
+            finally:
+                cur.close()
+
+        return {
+            doc_id: tuple(items)
+            for doc_id, items in attached.items()
+            if items
+        }
+
     def _apply_depth(self, result: Dict, depth: str) -> Dict:
         if depth not in _VALID_DEPTHS:
             depth = "snippet"
@@ -1523,6 +1890,10 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 "attribution_score": result.get("attribution_score"),
                 "attribution_model": result.get("attribution_model"),
             }
+            if result.get("contradictions"):
+                fields["contradictions"] = result.get("contradictions")
+            if result.get("memory_links") is not None:
+                fields["memory_links"] = result.get("memory_links")
             if result.get("workspace_id"):
                 fields["workspace_id"] = result.get("workspace_id")
             if result.get("full_provenance") is not None:
@@ -1554,6 +1925,10 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 "wikilink": result.get("wikilink"),
                 "depth": "headline",
             }
+            if result.get("contradictions"):
+                out["contradictions"] = result.get("contradictions")
+            if result.get("memory_links") is not None:
+                out["memory_links"] = result.get("memory_links")
             if result.get("workspace_id"):
                 out["workspace_id"] = result["workspace_id"]
             if result.get("provenance") is not None:
@@ -2063,6 +2438,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         state.vector_degraded = None
         state.hyde_degraded = None
         state.document_hydration_degraded = None
+        state.contradiction_sidecars_degraded = None
         self._reset_encode_ms()
         self._set_current_deadline(deadline_monotonic)
         if effective_fast:
@@ -2440,6 +2816,77 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
 
             merged = _eligible(merged)
 
+            if (
+                merged
+                and not effective_fast
+                and principal is not None
+                and bool(getattr(self.config, "graph_expansion_enabled", True))
+                and not past_search_deadline(deadline_monotonic)
+            ):
+                try:
+                    from minni.graph_expansion import expand_typed_graph
+                    from minni.minnid_runtime.graph_adapters import canonical_store_id
+
+                    store_id = canonical_store_id(self.db)
+                    ws_for_graph = (
+                        ws if ws not in ("default", "*") else (norm_query_ws or ws)
+                    )
+                    seeds = [
+                        {
+                            "doc_id": int(r["doc_id"]),
+                            "score": float(
+                                r.get("rrf_score", r.get("final_score", 0.0)) or 0.0
+                            ),
+                            "store_id": store_id,
+                        }
+                        for r in merged[:8]
+                        if r.get("doc_id") is not None
+                    ]
+                    if seeds:
+                        graph_res = expand_typed_graph(
+                            db=self.db,
+                            store_id=store_id,
+                            seeds=seeds,
+                            principal=principal,
+                            workspace=ws_for_graph,
+                            deadline_monotonic=deadline_monotonic,
+                        )
+                        seen_merged_ids = {
+                            int(r["doc_id"])
+                            for r in merged
+                            if r.get("doc_id") is not None
+                        }
+                        extra_graph_rows: List[Dict] = []
+                        for nb in graph_res.neighbors:
+                            nb_doc_id = int(nb["doc_id"])
+                            if nb_doc_id in seen_merged_ids:
+                                continue
+                            nb_text = str(nb.get("chunk_text") or "")
+                            if not nb_text.strip():
+                                continue
+                            g_score = float(nb.get("graph_score", 0.0) or 0.0)
+                            nb_row: Dict[str, Any] = {
+                                **nb,
+                                "filename": os.path.basename(str(nb.get("path") or "")),
+                                "rrf_score": g_score,
+                                "final_score": g_score,
+                                "decay_score": 1.0,
+                                "fts_rank": None,
+                                "sem_rank": None,
+                            }
+                            extra_graph_rows.append(nb_row)
+                            seen_merged_ids.add(nb_doc_id)
+                        if extra_graph_rows:
+                            extra_eligible = _eligible(extra_graph_rows)
+                            if extra_eligible:
+                                merged.extend(extra_eligible)
+                                merged.sort(
+                                    key=lambda x: float(x.get("final_score", 0.0) or 0.0),
+                                    reverse=True,
+                                )
+                except Exception as exc:
+                    logger.debug("graph expansion skipped: %s", exc)
+
             if effective_fast:
                 merged = self._filter_unreranked_cross_repo(
                     query, merged, norm_query_ws
@@ -2606,6 +3053,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             query_variants=query_variants,
             update_access=update_access,
             deadline_monotonic=deadline_monotonic,
+            principal=principal,
+            workspace=workspace,
         )
 
         trace["decay_factors"] = [
@@ -2699,6 +3148,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         variant_vector_degraded: List[str] = []
         variant_hyde_degraded: List[str] = []
         variant_document_hydration_degraded: List[str] = []
+        variant_contradiction_sidecars_degraded: List[str] = []
         variant_states = [RetrievalCallState() for _ in query_variants]
         truncated_expand = None
 
@@ -2763,6 +3213,10 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             if child.document_hydration_degraded:
                 variant_document_hydration_degraded.append(
                     f"{variant}: {child.document_hydration_degraded}"
+                )
+            if child.contradiction_sidecars_degraded:
+                variant_contradiction_sidecars_degraded.append(
+                    f"{variant}: {child.contradiction_sidecars_degraded}"
                 )
 
         def _should_drop_deadline_child(
@@ -2852,6 +3306,11 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         state.document_hydration_degraded = (
             "; ".join(variant_document_hydration_degraded)
             if variant_document_hydration_degraded
+            else None
+        )
+        state.contradiction_sidecars_degraded = (
+            "; ".join(variant_contradiction_sidecars_degraded)
+            if variant_contradiction_sidecars_degraded
             else None
         )
         if variant_suppressions:
@@ -3211,10 +3670,19 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         query_variants: List[str],
         update_access: bool,
         deadline_monotonic: Optional[float],
+        principal: Optional[EffectivePrincipal] = None,
+        workspace: str = "default",
     ) -> List[Dict]:
         """Format merged candidates with envelopes, confidence, provenance, and depth projection."""
         from minni.rationale import explain
         from minni.scoring import compute_confidence, raw_confidence
+
+        contradiction_sidecars = self._unresolved_graph_contradictions(
+            [row.get("doc_id") for row in merged],
+            principal=principal,
+            workspace=workspace,
+            deadline_monotonic=deadline_monotonic,
+        )
 
         results = []
         for r in merged:
@@ -3322,6 +3790,12 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 provenance["salience_boost"] = r.get("salience_boost", 0.0)
             if r.get("provenance", {}).get("via_hyde"):
                 provenance["via_hyde"] = True
+            if r.get("retrieval_origin") == "graph":
+                provenance["retrieval_origin"] = "graph"
+                provenance["graph_score"] = r.get("graph_score")
+                provenance["seed_doc_id"] = r.get("seed_doc_id")
+                if r.get("graph_paths"):
+                    provenance["graph_paths"] = r.get("graph_paths")
             if r.get("attribution_score") is not None:
                 provenance["attribution"] = r.get("attribution")
                 provenance["attribution_score"] = r.get("attribution_score")
@@ -3371,6 +3845,21 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 raw["workspace_id"] = r.get("workspace_id")
             if r.get("full_provenance") is not None:
                 raw["full_provenance"] = r.get("full_provenance")
+            graph_pairs = (
+                contradiction_sidecars.get(int(r["doc_id"]))
+                if r.get("doc_id") is not None
+                else None
+            )
+            if graph_pairs:
+                raw["contradictions"] = graph_pairs
+                raw["recommended_action"] = overlay_contradiction_action(
+                    raw.get("recommended_action")
+                )
+                if isinstance(provenance, dict):
+                    provenance["contradictions"] = tuple(
+                        {"id": item["id"], "confidence": item.get("confidence")}
+                        for item in graph_pairs
+                    )
 
             try:
                 raw["rationale"] = explain(raw)
@@ -3393,6 +3882,10 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     raw["recommended_action"] = _recommended_action(
                         raw.get("review_state"), doc_flag, raw.get("confidence")
                     )
+                    if raw.get("contradictions"):
+                        raw["recommended_action"] = overlay_contradiction_action(
+                            raw.get("recommended_action")
+                        )
                     if claim_text and not past_search_deadline(deadline_monotonic):
                         attribution = self._score_attribution(claim_text, full_text)
                         if attribution is not None:
@@ -3472,6 +3965,124 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         """Backward-compatible alias for callers that use search() terminology."""
         return self.retrieve(*args, **kwargs)
 
+    def _authorized_memory_links_for_doc(
+        self,
+        doc_id: int,
+        *,
+        principal: Optional[EffectivePrincipal],
+        workspace: str,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return active typed memory_links grouped by relation for doc_id, filtered by ACL."""
+        grouped: Dict[str, List[Dict[str, Any]]] = {
+            "updates": [],
+            "updated_by": [],
+            "contradicts": [],
+            "extends": [],
+            "relates": [],
+        }
+        try:
+            with self.db.cursor() as c:
+                tables = {
+                    r[0]
+                    for r in c.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if "memory_links" not in tables or "documents" not in tables:
+                    return grouped
+                doc_cols = {
+                    r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                    for r in c.execute("PRAGMA table_info(documents)").fetchall()
+                }
+                has_ws = "workspace_id" in doc_cols
+                ws_col_sql = ", d.workspace_id" if has_ws else ""
+                ml_cols = {
+                    r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                    for r in c.execute("PRAGMA table_info(memory_links)").fetchall()
+                }
+                conf_col_sql = "ml.confidence" if "confidence" in ml_cols else "NULL AS confidence"
+                edge_status_sql = (
+                    "AND COALESCE(ml.edge_status, 'active') = 'active'"
+                    if "edge_status" in ml_cols
+                    else ""
+                )
+
+                rows = c.execute(
+                    f"""
+                    SELECT ml.source_doc_id, ml.target_doc_id, ml.link_type,
+                           {conf_col_sql}, ml.weight,
+                           d.doc_id AS counterpart_doc_id, d.path, d.agent,
+                           d.privacy_level, d.page_status, d.page_type, d.memory_kind{ws_col_sql}
+                    FROM memory_links ml
+                    JOIN documents d
+                      ON d.doc_id = CASE
+                           WHEN ml.source_doc_id = ? THEN ml.target_doc_id
+                           ELSE ml.source_doc_id
+                         END
+                    WHERE (ml.source_doc_id = ? OR ml.target_doc_id = ?)
+                      AND ml.source_doc_id != ml.target_doc_id
+                      {edge_status_sql}
+                    ORDER BY ml.source_doc_id ASC, ml.target_doc_id ASC, ml.link_type ASC
+                    """,
+                    (doc_id, doc_id, doc_id),
+                ).fetchall()
+
+                seen_keys: set[tuple[str, int]] = set()
+                for row in rows:
+                    link_type = str(row["link_type"] or "").strip().lower()
+                    src_id = int(row["source_doc_id"])
+                    counterpart_id = int(row["counterpart_doc_id"])
+                    direction = "outgoing" if src_id == int(doc_id) else "incoming"
+
+                    if link_type == "updates":
+                        bucket_name = "updates" if direction == "outgoing" else "updated_by"
+                    elif link_type in ("contradicts", "extends", "relates"):
+                        bucket_name = link_type
+                    else:
+                        continue
+
+                    dedup_key = (bucket_name, counterpart_id)
+                    if dedup_key in seen_keys:
+                        continue
+
+                    meta: Dict[str, Any] = {
+                        "doc_id": counterpart_id,
+                        "path": row["path"],
+                        "agent": row["agent"],
+                        "privacy_level": row["privacy_level"] or "safe",
+                        "page_status": row["page_status"] or "candidate",
+                        "page_type": row["page_type"],
+                        "memory_kind": row["memory_kind"],
+                    }
+                    if has_ws:
+                        meta["workspace_id"] = row["workspace_id"]
+
+                    if principal is not None and not can_read_document(principal, workspace, meta):
+                        continue
+
+                    seen_keys.add(dedup_key)
+                    conf_raw = row["confidence"]
+                    try:
+                        conf_val = (
+                            round(float(conf_raw), 4)
+                            if conf_raw is not None and math.isfinite(float(conf_raw))
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        conf_val = None
+
+                    grouped[bucket_name].append({
+                        "doc_id": counterpart_id,
+                        "path": row["path"],
+                        "link_type": link_type,
+                        "direction": direction,
+                        "confidence": conf_val,
+                        "page_status": meta["page_status"],
+                    })
+        except Exception as exc:
+            logger.debug("expand_result memory_links query skipped: %s", exc)
+        return grouped
+
     def expand_result(
         self,
         result_id: int,
@@ -3492,13 +4103,23 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             )
 
         row = None
-        if normalized_kind in {"auto", "chunk"}:
-            with self.db.cursor() as c:
+        with self.db.cursor() as c:
+            doc_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            extra_doc_cols = ""
+            if "workspace_id" in doc_cols:
+                extra_doc_cols += ", d.workspace_id"
+            if "memory_kind" in doc_cols:
+                extra_doc_cols += ", d.memory_kind"
+
+            if normalized_kind in {"auto", "chunk"}:
                 c.execute(
-                    """
+                    f"""
                     SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
                            d.path, d.agent, d.sigil, d.decay_score,
-                           d.privacy_level, d.page_type, d.page_status
+                           d.privacy_level, d.page_type, d.page_status{extra_doc_cols}
                     FROM chunk_embeddings ce
                     JOIN documents d ON d.doc_id = ce.doc_id
                     WHERE ce.chunk_id = ?
@@ -3507,13 +4128,12 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 )
                 row = c.fetchone()
 
-        if row is None and normalized_kind in {"auto", "doc"}:
-            with self.db.cursor() as c:
+            if row is None and normalized_kind in {"auto", "doc"}:
                 c.execute(
-                    """
+                    f"""
                     SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
                            d.path, d.agent, d.sigil, d.decay_score,
-                           d.privacy_level, d.page_type, d.page_status
+                           d.privacy_level, d.page_type, d.page_status{extra_doc_cols}
                     FROM chunk_embeddings ce
                     JOIN documents d ON d.doc_id = ce.doc_id
                     WHERE ce.doc_id = ?
@@ -3524,11 +4144,26 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 )
                 row = c.fetchone()
 
+            if row is None and normalized_kind in {"auto", "doc"}:
+                c.execute(
+                    f"""
+                    SELECT NULL AS chunk_id, d.doc_id, vf.content AS chunk_text,
+                           '' AS heading_context, d.path, d.agent, d.sigil, d.decay_score,
+                           d.privacy_level, d.page_type, d.page_status{extra_doc_cols}
+                    FROM documents d
+                    JOIN vault_fts vf ON vf.doc_id = d.doc_id
+                    WHERE d.doc_id = ?
+                    LIMIT 1
+                    """,
+                    (result_id,),
+                )
+                row = c.fetchone()
+
         if row is None:
             return None
 
         cleaned_chunk = _strip_leading_frontmatter(str(row["chunk_text"] or ""))
-        raw = {
+        raw: Dict[str, Any] = {
             "doc_id": row["doc_id"],
             "chunk_id": row["chunk_id"],
             "path": row["path"],
@@ -3552,6 +4187,11 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             "page_type": row["page_type"],
             "page_status": row["page_status"] or "candidate",
         }
+        if hasattr(row, "keys"):
+            if "workspace_id" in row.keys() and row["workspace_id"]:
+                raw["workspace_id"] = row["workspace_id"]
+            if "memory_kind" in row.keys() and row["memory_kind"]:
+                raw["memory_kind"] = row["memory_kind"]
 
         if depth == "document":
             try:
@@ -3574,8 +4214,13 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     (time.time(), row["doc_id"]),
                 )
 
+        ws_effective = (
+            workspace or getattr(principal, "workspace_id", "default")
+            if principal is not None
+            else (workspace or "default")
+        )
         if principal is not None:
-            ws = workspace or getattr(principal, "workspace_id", "default")
+            ws = ws_effective
             if not can_read_document(principal, ws, raw):
                 return None
             txt = effective_body
@@ -3622,5 +4267,28 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 raw["chunk_text"] = raw["evidence_envelope"]
             if "full_document_text" in raw:
                 raw["full_document_text"] = raw["evidence_envelope"]
+
+        mem_links = self._authorized_memory_links_for_doc(
+            int(row["doc_id"]),
+            principal=principal,
+            workspace=ws_effective,
+        )
+        raw["memory_links"] = mem_links
+        if any(mem_links.values()):
+            prov = raw.get("provenance")
+            if not isinstance(prov, dict):
+                prov = {
+                    "fts_rank": None,
+                    "semantic_rank": None,
+                    "rrf_score": None,
+                    "cross_encoder_score": None,
+                    "decay_factor": raw.get("decay_score"),
+                    "doc_id": row["doc_id"],
+                    "chunk_id": row["chunk_id"],
+                    "agent_origin": raw.get("agent", ""),
+                    "backend": "faiss-disk",
+                }
+            prov["memory_links"] = mem_links
+            raw["provenance"] = prov
 
         return self._project_depth(raw, depth)
