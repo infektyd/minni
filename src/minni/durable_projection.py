@@ -308,6 +308,8 @@ def evict_learning_to_cold_archive(
 
         if "superseded_by" in l_cols:
             c.execute("UPDATE learnings SET superseded_by = NULL WHERE superseded_by = ?", (lid,))
+        if "contradicts_id" in l_cols:
+            c.execute("UPDATE learnings SET contradicts_id = NULL WHERE contradicts_id = ?", (lid,))
 
         if has_ld:
             c.execute("DELETE FROM learning_documents WHERE learning_id = ?", (lid,))

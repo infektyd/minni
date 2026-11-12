@@ -673,6 +673,44 @@ class MinniDB:
             END
         """)
 
+        # === Vector Backend Sync State & Dirty Triggers (PR-3 + Migration 027) ===
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS vector_backends (
+                name TEXT PRIMARY KEY,
+                last_synced_chunk_rowid INTEGER DEFAULT 0,
+                last_synced_at INTEGER DEFAULT 0,
+                vector_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'empty',
+                dirty_seq INTEGER NOT NULL DEFAULT 0,
+                synced_dirty_seq INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        for col_ddl in (
+            "ALTER TABLE vector_backends ADD COLUMN dirty_seq INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE vector_backends ADD COLUMN synced_dirty_seq INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                c.execute(col_ddl)
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
+
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_chunk_embeddings_ad_vector_dirty
+            AFTER DELETE ON chunk_embeddings
+            BEGIN
+                UPDATE vector_backends SET status = 'dirty', dirty_seq = dirty_seq + 1;
+            END
+        """)
+
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_chunk_embeddings_au_vector_dirty
+            AFTER UPDATE OF embedding, chunk_text ON chunk_embeddings
+            BEGIN
+                UPDATE vector_backends SET status = 'dirty', dirty_seq = dirty_seq + 1;
+            END
+        """)
+
         conn.commit()
 
         # Run schema migrations for this db file, guarded by two independent

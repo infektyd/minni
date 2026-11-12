@@ -1,4 +1,6 @@
 import logging
+import os
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,6 +123,32 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
         is_vault_path_excluded,
     )
 
+    def _bump_mtime_best_effort() -> None:
+        try:
+            if full_path.is_file() and not full_path.is_symlink():
+                os.utime(full_path, None)
+        except OSError:
+            pass
+
+    def _invalidate_engine_for_chunks(eng: Any, chunk_ids: list[int]) -> None:
+        if eng is None:
+            return
+        from types import SimpleNamespace
+
+        if isinstance(eng, SimpleNamespace):
+            for name, args in (
+                ("_invalidate_durable_rerank", (chunk_ids,)),
+                ("_remove_live_faiss", (chunk_ids,)),
+                ("_invalidate_trie", ()),
+            ):
+                fn = getattr(eng, name, None)
+                if callable(fn):
+                    fn(*args)
+        else:
+            eng._invalidate_durable_rerank(chunk_ids)
+            eng._remove_live_faiss(chunk_ids)
+            eng._invalidate_trie()
+
     def _retract_existing_if_any() -> bool:
         eng = context.lazy_retrieval()
         db_obj = getattr(eng, "db", None) if eng is not None else None
@@ -146,28 +174,18 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
                         )
                     c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (did,))
                     c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (did,))
-                    c.execute(
-                        "DELETE FROM memory_links WHERE source_doc_id = ? OR target_doc_id = ?",
-                        (did, did),
-                    )
+                    try:
+                        c.execute(
+                            "DELETE FROM memory_links WHERE source_doc_id = ? OR target_doc_id = ?",
+                            (did, did),
+                        )
+                    except sqlite3.OperationalError as exc:
+                        if "no such table: memory_links" not in str(exc).lower():
+                            raise
                     c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
                     retracted_any = True
         if retracted_any and eng is not None:
-            from types import SimpleNamespace
-
-            if isinstance(eng, SimpleNamespace):
-                for name, args in (
-                    ("_invalidate_durable_rerank", (old_chunk_ids,)),
-                    ("_remove_live_faiss", (old_chunk_ids,)),
-                    ("_invalidate_trie", ()),
-                ):
-                    fn = getattr(eng, name, None)
-                    if callable(fn):
-                        fn(*args)
-            else:
-                eng._invalidate_durable_rerank(old_chunk_ids)
-                eng._remove_live_faiss(old_chunk_ids)
-                eng._invalidate_trie()
+            _invalidate_engine_for_chunks(eng, old_chunk_ids)
         return retracted_any
 
     explicit_status = extract_explicit_frontmatter_status(content)
@@ -183,6 +201,7 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
         try:
             retracted = _retract_existing_if_any()
         except Exception as exc:
+            _bump_mtime_best_effort()
             context.logger.exception("vault_index_doc retract failed")
             return context.make_error(-32000, f"vault_index_doc error: {exc}", request_id)
         context.record_latency("vault_index_doc", time.perf_counter() - started_at)
@@ -208,6 +227,7 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
         try:
             retracted = _retract_existing_if_any()
         except Exception as exc:
+            _bump_mtime_best_effort()
             context.logger.exception("vault_index_doc retract failed")
             return context.make_error(-32000, f"vault_index_doc error: {exc}", request_id)
         context.record_latency("vault_index_doc", time.perf_counter() - started_at)
@@ -226,20 +246,38 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
     try:
         engine = context.lazy_retrieval()
         # Retract any legacy relative-path row so canonical full_path does not duplicate it
-        try:
-            db_obj = getattr(engine, "db", None)
-            if db_obj is not None and str(rel_path) != str(full_path):
-                with db_obj.transaction() as c:
-                    rel_rows = c.execute(
-                        "SELECT doc_id FROM documents WHERE path = ?", (rel_path,)
+        db_obj = getattr(engine, "db", None)
+        if db_obj is not None and str(rel_path) != str(full_path):
+            legacy_retracted = False
+            legacy_chunk_ids: list[int] = []
+            with db_obj.transaction() as c:
+                rel_rows = c.execute(
+                    "SELECT doc_id FROM documents WHERE path = ?", (rel_path,)
+                ).fetchall()
+                for r in rel_rows:
+                    did = int(r["doc_id"] if hasattr(r, "keys") else r[0])
+                    chunk_rows = c.execute(
+                        "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
+                        (did,),
                     ).fetchall()
-                    for r in rel_rows:
-                        did = int(r["doc_id"] if hasattr(r, "keys") else r[0])
-                        c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (did,))
-                        c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (did,))
-                        c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
-        except Exception:
-            pass
+                    for cr in chunk_rows:
+                        legacy_chunk_ids.append(
+                            int(cr["chunk_id"] if hasattr(cr, "keys") else cr[0])
+                        )
+                    c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (did,))
+                    c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (did,))
+                    try:
+                        c.execute(
+                            "DELETE FROM memory_links WHERE source_doc_id = ? OR target_doc_id = ?",
+                            (did, did),
+                        )
+                    except sqlite3.OperationalError as exc:
+                        if "no such table: memory_links" not in str(exc).lower():
+                            raise
+                    c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
+                    legacy_retracted = True
+            if legacy_retracted:
+                _invalidate_engine_for_chunks(engine, legacy_chunk_ids)
         result = engine.index_durable_document(
             content=content,
             path=str(full_path),

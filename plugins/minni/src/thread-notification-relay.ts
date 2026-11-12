@@ -632,8 +632,12 @@ export function readPendingAttention(
 
 const inProcessRelayLocks = new Map<string, Promise<void>>();
 
+function hasValidHostPid(pid: unknown): pid is number {
+  return typeof pid === "number" && Number.isInteger(pid) && pid > 1;
+}
+
 function isProcessLiveForRelayLock(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
+  if (!hasValidHostPid(pid)) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -769,6 +773,7 @@ export async function liveSessionSubscribersForPlan(
   vaultPath: string,
   planId: string,
   fallbackAgentId?: string,
+  nowMs: number = Date.now(),
 ): Promise<string[]> {
   const dir = path.join(vaultPath, ".runtime", "active-thread.d");
   let entries: string[];
@@ -777,7 +782,6 @@ export async function liveSessionSubscribersForPlan(
   } catch {
     return [];
   }
-  const nowMs = Date.now();
   const defaultPrincipal = vaultPrincipalSubscriberId(vaultPath) ?? fallbackAgentId ?? "";
   const out = new Set<string>();
   for (const name of entries) {
@@ -793,12 +797,15 @@ export async function liveSessionSubscribersForPlan(
         set_at?: string;
       };
       if (raw?.plan_id !== planId) continue;
-      if (typeof raw.host_pid === "number" && !isProcessLiveForRelayLock(raw.host_pid)) {
-        continue;
-      }
-      const ts = Date.parse(raw.updated_at ?? raw.set_at ?? "");
-      if (Number.isFinite(ts) && nowMs - ts > RELAY_CURSOR_PRUNE_AGE_MS) {
-        continue;
+      if (hasValidHostPid(raw.host_pid)) {
+        if (!isProcessLiveForRelayLock(raw.host_pid)) {
+          continue;
+        }
+      } else {
+        const ts = Date.parse(raw.updated_at ?? raw.set_at ?? "");
+        if (Number.isFinite(ts) && nowMs - ts > RELAY_CURSOR_PRUNE_AGE_MS) {
+          continue;
+        }
       }
       const agentId =
         typeof raw.agent_id === "string" && raw.agent_id && raw.agent_id !== "unknown"
@@ -1259,11 +1266,11 @@ export async function sweepDeadRelayCursors(
           const raw = JSON.parse(
             await readFile(path.join(activeThreadDir, f), "utf8"),
           ) as { host_pid?: number; updated_at?: string; set_at?: string };
-          const pidLive =
-            typeof raw.host_pid !== "number" || isProcessLiveForRelayLock(raw.host_pid);
           const ts = Date.parse(raw.updated_at ?? raw.set_at ?? "");
-          const recent = !Number.isFinite(ts) || nowMs - ts <= RELAY_CURSOR_PRUNE_AGE_MS;
-          if (pidLive && recent) {
+          const entryLive = hasValidHostPid(raw.host_pid)
+            ? isProcessLiveForRelayLock(raw.host_pid)
+            : !Number.isFinite(ts) || nowMs - ts <= RELAY_CURSOR_PRUNE_AGE_MS;
+          if (entryLive) {
             liveSessionKeys.add(stem);
           }
         } catch {
@@ -1284,19 +1291,26 @@ export async function sweepDeadRelayCursors(
             await readFile(path.join(runtimeDir, f), "utf8"),
           ) as {
             host_pid?: number;
+            pid?: number;
             process_start_marker?: string;
             session_key?: string;
             updated_at?: string;
+            set_at?: string;
           };
           if (
             typeof raw.session_key === "string" &&
-            SESSION_KEY_HEX_RE.test(raw.session_key) &&
-            typeof raw.host_pid === "number" &&
-            isLiveMatchingProcess(raw.host_pid, raw.process_start_marker)
+            SESSION_KEY_HEX_RE.test(raw.session_key)
           ) {
-            const ts = Date.parse(raw.updated_at ?? "");
-            if (!Number.isFinite(ts) || nowMs - ts <= RELAY_CURSOR_PRUNE_AGE_MS) {
-              liveSessionKeys.add(raw.session_key);
+            const hintPid = raw.host_pid !== undefined ? raw.host_pid : raw.pid;
+            if (hasValidHostPid(hintPid)) {
+              if (isLiveMatchingProcess(hintPid, raw.process_start_marker)) {
+                liveSessionKeys.add(raw.session_key);
+              }
+            } else {
+              const ts = Date.parse(raw.updated_at ?? raw.set_at ?? "");
+              if (Number.isFinite(ts) && nowMs - ts <= RELAY_CURSOR_PRUNE_AGE_MS) {
+                liveSessionKeys.add(raw.session_key);
+              }
             }
           }
         } catch {

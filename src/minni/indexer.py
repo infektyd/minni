@@ -524,16 +524,29 @@ class VaultIndexer:
             return "artifact"
         return "knowledge"
 
+    @staticmethod
+    def _delete_memory_links_for_doc(c, doc_id: int) -> None:
+        try:
+            c.execute(
+                "DELETE FROM memory_links WHERE source_doc_id = ? OR target_doc_id = ?",
+                (doc_id, doc_id),
+            )
+        except Exception as exc:
+            if "no such table: memory_links" not in str(exc).lower():
+                raise
+
     def _delete_doc_rows(self, doc_id: int) -> int:
         """Drop one document and everything keyed to it. Returns rows deleted (0 or 1)."""
-        with self.db.cursor() as c:
-            c.execute(
-                "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
-            )
-            stale = [r["chunk_id"] for r in c.fetchall()]
         with self.db.transaction() as c:
+            stale = [
+                int(r["chunk_id"] if hasattr(r, "keys") else r[0])
+                for r in c.execute(
+                    "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
+                ).fetchall()
+            ]
             c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
             c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+            self._delete_memory_links_for_doc(c, doc_id)
             c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
         if stale:
             self._invalidate_rerank_chunks(stale)
@@ -755,9 +768,19 @@ class VaultIndexer:
                     if row:
                         doc_id = row["doc_id"]
                         with self.db.transaction() as c:
+                            stale = [
+                                int(r["chunk_id"] if hasattr(r, "keys") else r[0])
+                                for r in c.execute(
+                                    "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
+                                    (doc_id,),
+                                ).fetchall()
+                            ]
                             c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                             c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            self._delete_memory_links_for_doc(c, doc_id)
                             c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                        if stale:
+                            self._invalidate_rerank_chunks(stale)
                         stats["deleted"] += 1
                     else:
                         stats["skipped"] += 1
@@ -776,9 +799,19 @@ class VaultIndexer:
                     if row:
                         doc_id = row["doc_id"]
                         with self.db.transaction() as c:
+                            stale = [
+                                int(r["chunk_id"] if hasattr(r, "keys") else r[0])
+                                for r in c.execute(
+                                    "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
+                                    (doc_id,),
+                                ).fetchall()
+                            ]
                             c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                             c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            self._delete_memory_links_for_doc(c, doc_id)
                             c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                        if stale:
+                            self._invalidate_rerank_chunks(stale)
                         stats["deleted"] += 1
                     else:
                         stats["skipped"] += 1
@@ -799,12 +832,22 @@ class VaultIndexer:
                     if row:
                         doc_id = row["doc_id"]
                         with self.db.transaction() as c:
+                            stale = [
+                                int(r["chunk_id"] if hasattr(r, "keys") else r[0])
+                                for r in c.execute(
+                                    "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
+                                    (doc_id,),
+                                ).fetchall()
+                            ]
                             c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                             c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
                             c.execute(
                                 "UPDATE documents SET page_status=?, last_modified=?, indexed_at=? WHERE doc_id=?",
                                 (explicit_status, mtime, now, doc_id),
                             )
+                        if stale:
+                            self._invalidate_rerank_chunks(stale)
+                            stats["chunks_purged"] += len(stale)
                     stats["skipped"] += 1
                     continue
 

@@ -209,6 +209,27 @@ def _is_process_live(pid: Any) -> bool:
         return exc.errno == errno.EPERM
 
 
+def _entry_pid_or_recency_live(
+    pid: Any,
+    ts_ms: float | None,
+    now_ms: float,
+    *,
+    require_ts_when_pidless: bool = False,
+) -> bool:
+    """Return True if a session/pointer entry is live:
+    - When a valid host PID (> 1) is present, process liveness is authoritative:
+      a genuinely live PID stays live regardless of ``updated_at`` age (> 24h / > 7d),
+      while a dead PID is rejected immediately.
+    - When no valid PID is present (None / missing / <= 1), fall back to the 24h
+      ``RELAY_CURSOR_PRUNE_AGE_MS`` recency check."""
+    has_valid_pid = not isinstance(pid, bool) and isinstance(pid, int) and pid > 1
+    if has_valid_pid:
+        return _is_process_live(pid)
+    if ts_ms is None:
+        return not require_ts_when_pidless
+    return (now_ms - ts_ms) <= RELAY_CURSOR_PRUNE_AGE_MS
+
+
 def format_session_subscriber_id(
     agent_id: str,
     session_key: str | None = None,
@@ -824,11 +845,8 @@ def active_plan_ids_from_vault(
         if not isinstance(raw, dict):
             continue
         host_pid = raw.get("host_pid")
-        if not isinstance(host_pid, bool) and isinstance(host_pid, int):
-            if not _is_process_live(host_pid):
-                continue
         ts_ms = _parse_iso_ms(raw.get("updated_at") or raw.get("set_at"))
-        if ts_ms is not None and (effective_now_ms - ts_ms) > RELAY_CURSOR_PRUNE_AGE_MS:
+        if not _entry_pid_or_recency_live(host_pid, ts_ms, effective_now_ms):
             continue
         _add_plan(raw.get("plan_id"))
 
@@ -873,11 +891,8 @@ def live_session_subscribers_for_plan(
         if not isinstance(raw, dict) or raw.get("plan_id") != plan_id:
             continue
         host_pid = raw.get("host_pid")
-        if not isinstance(host_pid, bool) and isinstance(host_pid, int):
-            if not _is_process_live(host_pid):
-                continue
         ts_ms = _parse_iso_ms(raw.get("updated_at") or raw.get("set_at"))
-        if ts_ms is not None and (effective_now_ms - ts_ms) > RELAY_CURSOR_PRUNE_AGE_MS:
+        if not _entry_pid_or_recency_live(host_pid, ts_ms, effective_now_ms):
             continue
         raw_agent = raw.get("agent_id")
         agent_id = (
@@ -895,14 +910,8 @@ def live_session_subscribers_for_plan(
         active_raw = None
     if isinstance(active_raw, dict) and active_raw.get("plan_id") == plan_id:
         owner_pid = active_raw.get("owner_host_pid")
-        pid_ok = (
-            isinstance(owner_pid, bool)
-            or not isinstance(owner_pid, int)
-            or _is_process_live(owner_pid)
-        )
         ts_ms = _parse_iso_ms(active_raw.get("updated_at") or active_raw.get("set_at"))
-        age_ok = ts_ms is None or (effective_now_ms - ts_ms) <= RELAY_CURSOR_PRUNE_AGE_MS
-        if pid_ok and age_ok:
+        if _entry_pid_or_recency_live(owner_pid, ts_ms, effective_now_ms):
             owner_sk = active_raw.get("owner_session_key")
             raw_agent = active_raw.get("agent_id")
             agent_id = (
@@ -1624,14 +1633,8 @@ def _discover_live_session_keys(vault: Path, now_ms: float) -> set[str]:
         if not isinstance(raw, dict):
             continue
         host_pid = raw.get("host_pid")
-        pid_live = (
-            isinstance(host_pid, bool)
-            or not isinstance(host_pid, int)
-            or _is_process_live(host_pid)
-        )
         ts_ms = _parse_iso_ms(raw.get("updated_at") or raw.get("set_at"))
-        recent = ts_ms is None or (now_ms - ts_ms) <= RELAY_CURSOR_PRUNE_AGE_MS
-        if pid_live and recent:
+        if _entry_pid_or_recency_live(host_pid, ts_ms, now_ms):
             live_keys.add(stem)
 
     runtime_dir = vault / ".runtime"
@@ -1651,15 +1654,11 @@ def _discover_live_session_keys(vault: Path, now_ms: float) -> set[str]:
         sk = raw.get("session_key")
         if not isinstance(sk, str) or sk == "default" or not _SESSION_KEY_RE.match(sk):
             continue
-        host_pid = raw.get("host_pid")
-        pid_live = (
-            not isinstance(host_pid, bool)
-            and isinstance(host_pid, int)
-            and _is_process_live(host_pid)
-        )
-        ts_ms = _parse_iso_ms(raw.get("updated_at"))
-        recent = ts_ms is None or (now_ms - ts_ms) <= RELAY_CURSOR_PRUNE_AGE_MS
-        if pid_live and recent:
+        hint_pid = raw.get("host_pid") if "host_pid" in raw else raw.get("pid")
+        ts_ms = _parse_iso_ms(raw.get("updated_at") or raw.get("set_at"))
+        if _entry_pid_or_recency_live(
+            hint_pid, ts_ms, now_ms, require_ts_when_pidless=True
+        ):
             live_keys.add(sk)
 
     return live_keys

@@ -26,6 +26,7 @@ Entry points:
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from typing import Dict, List, Optional
 
@@ -39,18 +40,53 @@ logger = logging.getLogger("sovereign.vector_sync")
 _DEFAULT_BATCH = 1000
 
 
+def _ensure_dirty_seq_columns(c) -> bool:
+    """Ensure dirty_seq and synced_dirty_seq exist on vector_backends (graceful on mock/legacy DBs)."""
+    try:
+        pragma = c.execute("PRAGMA table_info(vector_backends)").fetchall()
+        cols = {
+            row["name"] if isinstance(row, dict) or hasattr(row, "keys") else row[1]
+            for row in pragma
+        }
+    except Exception:
+        return False
+    if not cols:
+        return False
+    if "dirty_seq" not in cols:
+        try:
+            c.execute(
+                "ALTER TABLE vector_backends ADD COLUMN dirty_seq INTEGER NOT NULL DEFAULT 0"
+            )
+            cols.add("dirty_seq")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" in str(exc).lower():
+                cols.add("dirty_seq")
+            else:
+                return False
+    if "synced_dirty_seq" not in cols:
+        try:
+            c.execute(
+                "ALTER TABLE vector_backends ADD COLUMN synced_dirty_seq INTEGER NOT NULL DEFAULT 0"
+            )
+            cols.add("synced_dirty_seq")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" in str(exc).lower():
+                cols.add("synced_dirty_seq")
+            else:
+                return False
+    return "dirty_seq" in cols and "synced_dirty_seq" in cols
+
+
 def get_backend_state(backend_name: str, db) -> Dict:
     """
     Return the vector_backends row for *backend_name*, or default values.
 
     Returns dict with keys: name, last_synced_chunk_rowid, last_synced_at,
-    vector_count, status.
+    vector_count, status, dirty_seq, synced_dirty_seq.
     """
     with db.cursor() as c:
         c.execute(
-            "SELECT name, last_synced_chunk_rowid, last_synced_at, "
-            "       vector_count, status "
-            "FROM vector_backends WHERE name = ?",
+            "SELECT * FROM vector_backends WHERE name = ?",
             (backend_name,),
         )
         row = c.fetchone()
@@ -62,8 +98,18 @@ def get_backend_state(backend_name: str, db) -> Dict:
             "last_synced_at": 0,
             "vector_count": 0,
             "status": "empty",
+            "dirty_seq": 0,
+            "synced_dirty_seq": 0,
         }
-    return dict(row)
+    result = dict(row)
+    result.setdefault("name", backend_name)
+    result.setdefault("last_synced_chunk_rowid", 0)
+    result.setdefault("last_synced_at", 0)
+    result.setdefault("vector_count", 0)
+    result.setdefault("status", "empty")
+    result["dirty_seq"] = int(result.get("dirty_seq") or 0)
+    result["synced_dirty_seq"] = int(result.get("synced_dirty_seq") or 0)
+    return result
 
 
 def _upsert_backend_state(
@@ -74,15 +120,44 @@ def _upsert_backend_state(
     vector_count: int,
     status: str = "ok",
     preserve_dirty: bool = False,
+    cleanup_seq: Optional[int] = None,
 ) -> None:
-    """Insert or replace a vector_backends row."""
+    """Insert or update a vector_backends row."""
     now = int(time.time())
-    status_expr = (
-        "CASE WHEN vector_backends.status = 'dirty' THEN 'dirty' ELSE excluded.status END"
-        if preserve_dirty
-        else "excluded.status"
-    )
     with db.cursor() as c:
+        has_seq = _ensure_dirty_seq_columns(c)
+        if has_seq and cleanup_seq is not None:
+            c.execute(
+                "INSERT INTO vector_backends "
+                "(name, last_synced_chunk_rowid, last_synced_at, vector_count, status, dirty_seq, synced_dirty_seq) "
+                "VALUES (?, ?, ?, ?, ?, 0, 0) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "  last_synced_chunk_rowid = excluded.last_synced_chunk_rowid,"
+                "  last_synced_at = excluded.last_synced_at,"
+                "  vector_count = excluded.vector_count,"
+                "  status = CASE "
+                "    WHEN vector_backends.status = 'dirty' OR vector_backends.dirty_seq > ? "
+                "    THEN 'dirty' ELSE excluded.status END,"
+                "  synced_dirty_seq = CASE "
+                "    WHEN vector_backends.status = 'dirty' OR vector_backends.dirty_seq > ? "
+                "    THEN vector_backends.synced_dirty_seq ELSE vector_backends.dirty_seq END",
+                (
+                    backend_name,
+                    last_synced_chunk_rowid,
+                    now,
+                    vector_count,
+                    status,
+                    cleanup_seq,
+                    cleanup_seq,
+                ),
+            )
+            return
+
+        status_expr = (
+            "CASE WHEN vector_backends.status = 'dirty' THEN 'dirty' ELSE excluded.status END"
+            if preserve_dirty
+            else "excluded.status"
+        )
         c.execute(
             "INSERT INTO vector_backends "
             "(name, last_synced_chunk_rowid, last_synced_at, vector_count, status) "
@@ -96,19 +171,56 @@ def _upsert_backend_state(
         )
 
 
+def _checkpoint_last_synced_rowid(
+    backend_name: str,
+    db,
+    *,
+    last_synced_chunk_rowid: int,
+    fallback_vector_count: int,
+) -> None:
+    """Persist uploaded last_synced_chunk_rowid immediately after upsert succeeds
+    without clearing dirty status or advancing synced_dirty_seq."""
+    now = int(time.time())
+    with db.cursor() as c:
+        _ensure_dirty_seq_columns(c)
+        c.execute(
+            "INSERT INTO vector_backends "
+            "(name, last_synced_chunk_rowid, last_synced_at, vector_count, status) "
+            "VALUES (?, ?, ?, ?, 'syncing') "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "  last_synced_chunk_rowid = CASE "
+            "    WHEN excluded.last_synced_chunk_rowid > COALESCE(vector_backends.last_synced_chunk_rowid, 0) "
+            "    THEN excluded.last_synced_chunk_rowid "
+            "    ELSE vector_backends.last_synced_chunk_rowid END,"
+            "  last_synced_at = excluded.last_synced_at",
+            (backend_name, last_synced_chunk_rowid, now, fallback_vector_count),
+        )
+
+
 def mark_dirty(backend_name: str, db) -> None:
     """
     Mark a backend as dirty so the idle hook will re-sync it.
 
     Call this whenever chunk_embeddings rows are deleted (the incremental
-    chunk_id cursor only catches INSERTs, not DELETEs).
+    chunk_id cursor only catches INSERTs, not DELETEs). Note: Migration 027
+    triggers also update vector_backends automatically on DELETE / UPDATE.
     """
     with db.cursor() as c:
-        c.execute(
-            "INSERT INTO vector_backends (name, status) VALUES (?, 'dirty') "
-            "ON CONFLICT(name) DO UPDATE SET status = 'dirty'",
-            (backend_name,),
-        )
+        if _ensure_dirty_seq_columns(c):
+            c.execute(
+                "INSERT INTO vector_backends (name, status, dirty_seq, synced_dirty_seq) "
+                "VALUES (?, 'dirty', 1, 0) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "  status = 'dirty', "
+                "  dirty_seq = vector_backends.dirty_seq + 1",
+                (backend_name,),
+            )
+        else:
+            c.execute(
+                "INSERT INTO vector_backends (name, status) VALUES (?, 'dirty') "
+                "ON CONFLICT(name) DO UPDATE SET status = 'dirty'",
+                (backend_name,),
+            )
 
 
 def sync_backend(
@@ -139,7 +251,11 @@ def sync_backend(
     dim = embedding_dim or backend.dim or cfg.embedding_dim
 
     state = get_backend_state(backend.name, db)
-    is_dirty = state["status"] in ("dirty", "error", "syncing")
+    cleanup_seq = int(state.get("dirty_seq", 0) or 0)
+    was_dirty = (
+        state["status"] in ("dirty", "error", "syncing")
+        or cleanup_seq > int(state.get("synced_dirty_seq", 0) or 0)
+    ) and not full_rebuild
     start_rowid = 0 if full_rebuild else state["last_synced_chunk_rowid"]
 
     logger.debug(
@@ -192,6 +308,12 @@ def sync_backend(
                     "Synced %d vectors → backend %r (last_rowid=%d)",
                     upserted, backend.name, last_rowid,
                 )
+                _checkpoint_last_synced_rowid(
+                    backend.name,
+                    db,
+                    last_synced_chunk_rowid=max(state["last_synced_chunk_rowid"], last_rowid),
+                    fallback_vector_count=state["vector_count"] + upserted,
+                )
             except Exception as exc:
                 logger.error(
                     "Backend %r upsert failed during sync: %s", backend.name, exc
@@ -213,11 +335,34 @@ def sync_backend(
     # Reconcile deletions. The incremental cursor above only catches INSERTs
     # (chunk_id > start_rowid); a deleted chunk leaves a stale vector in the
     # backend forever. On a dirty (post-delete), error-retry, or full_rebuild
-    # pass — or if mark_dirty arrived concurrently during upsert — drop any
-    # vector whose chunk_id is no longer present in chunk_embeddings.
-    post_upsert_status = get_backend_state(backend.name, db)["status"]
-    if is_dirty or post_upsert_status == "dirty" or full_rebuild:
+    # pass — or if mark_dirty / a SQLite trigger arrived concurrently during
+    # upsert — drop any vector whose chunk_id is no longer present in
+    # chunk_embeddings.
+    post_upsert_state = get_backend_state(backend.name, db)
+    post_dirty_seq = int(post_upsert_state.get("dirty_seq", 0) or 0)
+    post_synced_seq = int(post_upsert_state.get("synced_dirty_seq", 0) or 0)
+    if (
+        was_dirty
+        or post_upsert_state["status"] == "dirty"
+        or post_dirty_seq > post_synced_seq
+        or full_rebuild
+    ):
         with db.cursor() as c:
+            has_seq = _ensure_dirty_seq_columns(c)
+            if has_seq:
+                seq_row = c.execute(
+                    "SELECT dirty_seq FROM vector_backends WHERE name = ?",
+                    (backend.name,),
+                ).fetchone()
+                if seq_row is not None:
+                    cleanup_seq = int(
+                        (
+                            seq_row["dirty_seq"]
+                            if isinstance(seq_row, dict) or hasattr(seq_row, "keys")
+                            else seq_row[0]
+                        )
+                        or 0
+                    )
             c.execute(
                 "UPDATE vector_backends SET status = 'syncing' "
                 "WHERE name = ? AND status = 'dirty'",
@@ -246,7 +391,7 @@ def sync_backend(
                     )
                     _upsert_backend_state(
                         backend.name, db,
-                        last_synced_chunk_rowid=start_rowid,
+                        last_synced_chunk_rowid=prior_max,
                         vector_count=state["vector_count"],
                         status="error",
                     )
@@ -266,19 +411,28 @@ def sync_backend(
 
     _upsert_backend_state(
         backend.name, db,
-        last_synced_chunk_rowid=last_rowid,
+        last_synced_chunk_rowid=max(state["last_synced_chunk_rowid"], last_rowid),
         vector_count=vector_count,
         status="ok",
         preserve_dirty=True,
+        cleanup_seq=cleanup_seq,
     )
-    final_status = get_backend_state(backend.name, db)["status"]
+    final_state = get_backend_state(backend.name, db)
+    final_status = (
+        "dirty"
+        if (
+            final_state["status"] == "dirty"
+            or final_state.get("dirty_seq", 0) > final_state.get("synced_dirty_seq", 0)
+        )
+        else "ok"
+    )
 
     return {
         "backend": backend.name,
         "upserted": upserted,
         "last_rowid": last_rowid,
         "vector_count": vector_count,
-        "status": final_status if final_status == "dirty" else "ok",
+        "status": final_status,
     }
 
 
@@ -331,7 +485,11 @@ def should_sync(backend_name: str, db) -> bool:
     Return True if this backend needs a sync pass.
 
     Called by the daemon idle hook every 30s.
-    Returns True if status == 'dirty', 'empty', 'error', or 'syncing'.
+    Returns True if status == 'dirty', 'empty', 'error', or 'syncing', or if
+    dirty_seq > synced_dirty_seq.
     """
     state = get_backend_state(backend_name, db)
-    return state["status"] in ("dirty", "empty", "error", "syncing")
+    return (
+        state["status"] in ("dirty", "empty", "error", "syncing")
+        or state.get("dirty_seq", 0) > state.get("synced_dirty_seq", 0)
+    )

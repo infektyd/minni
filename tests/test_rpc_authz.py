@@ -54,10 +54,14 @@ def _patch_db(monkeypatch, tmp_path):
     return db_obj
 
 
-def _stamp_principal(monkeypatch, agent_id, capabilities=("*",)):
+def _stamp_principal(monkeypatch, agent_id, capabilities=("*",), *, auto_accept_own=False):
     """Force the server-stamped EffectivePrincipal for the next handler calls
     (the handlers only ever trust the stamp, never wire strings)."""
-    principal = EffectivePrincipal(agent_id=agent_id, capabilities=list(capabilities))
+    principal = EffectivePrincipal(
+        agent_id=agent_id,
+        capabilities=list(capabilities),
+        auto_accept_own=auto_accept_own,
+    )
     monkeypatch.setattr(provenance, "resolve_effective_principal", lambda **_kw: principal)
     return principal
 
@@ -625,7 +629,7 @@ def test_resolve_contradiction_owner_succeeds(monkeypatch, tmp_path):
     monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
     lid = _insert_learning(db_obj, "codex", "an outdated codex fact")
 
-    _stamp_principal(monkeypatch, "codex", capabilities=["read"])
+    _stamp_principal(monkeypatch, "codex", capabilities=["read"], auto_accept_own=True)
     resp = minnid._handle_resolve_contradiction(
         {"new_content": "the corrected codex fact", "supersede_ids": [lid]}, 3
     )
@@ -635,6 +639,51 @@ def test_resolve_contradiction_owner_succeeds(monkeypatch, tmp_path):
     assert row["status"] == "superseded"
     assert row["superseded_by"] == resp["result"]["new_learning_id"]
     assert count == 2
+
+
+def test_resolve_contradiction_unreviewed_owner_stages_proposal(monkeypatch, tmp_path):
+    db_obj = _patch_wb(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    lid = _insert_learning(db_obj, "codex", "an outdated codex fact needing review")
+
+    _stamp_principal(monkeypatch, "codex", capabilities=["read"], auto_accept_own=False)
+    resp = minnid._handle_resolve_contradiction(
+        {"new_content": "the proposed codex correction", "supersede_ids": [lid]}, 31
+    )
+    res = resp.get("result", {})
+    assert res.get("status") == "proposed", resp
+    assert res.get("supersede_ids") == [lid]
+    assert res.get("superseded") == []
+    cid = res["candidate_id"]
+
+    row, count = _learning_row(tmp_path, lid)
+    assert row["status"] == "active" and row["superseded_by"] is None
+    assert count == 1, "unreviewed contradiction must not write active learnings before review"
+
+    with db_obj.cursor() as c:
+        c.execute("SELECT status, principal, content FROM candidate_packets WHERE candidate_id=?", (cid,))
+        c_row = c.fetchone()
+    assert c_row is not None
+    assert c_row["status"] == "proposed"
+    assert c_row["principal"] == "codex"
+    assert c_row["content"] == "the proposed codex correction"
+
+    _stamp_principal(monkeypatch, "main", capabilities=["*", "govern"])
+    accepted = minnid._resolve_candidate({"candidate_id": cid, "decision": "accept"}, 32)
+    assert accepted.get("result", {}).get("new_status") == "accepted", accepted
+    new_lid = accepted["result"]["learning_id"]
+
+    old_after, _ = _learning_row(tmp_path, lid)
+    assert old_after is None or (
+        old_after["status"] == "superseded" and old_after["superseded_by"] == new_lid
+    )
+    new_after, _ = _learning_row(tmp_path, new_lid)
+    assert new_after is not None and new_after["status"] == "active"
+    with db_obj.cursor() as c:
+        c.execute("SELECT content, agent_id FROM learnings WHERE learning_id=?", (new_lid,))
+        l_row = c.fetchone()
+    assert l_row["content"] == "the proposed codex correction"
+    assert l_row["agent_id"] == "codex"
 
 
 def test_resolve_contradiction_explicit_operator_allows_cross(monkeypatch, tmp_path):

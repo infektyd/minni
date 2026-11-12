@@ -19,6 +19,54 @@ logger = logging.getLogger("minnid")
 
 HANDOFF_KINDS = frozenset({"handoff", "candidate_learning", "request", "answer"})
 HANDOFF_ACK_STATUSES = {"accepted", "rejected_stale", "rejected_contradicts", "rejected_scope"}
+_STATIC_REVERSE_ALIASES: dict[str, tuple[str, ...]] = {
+    "claude-code": ("claudecode",),
+    "gemini": ("antigravity", "agy"),
+}
+
+
+def _canon_agent_or_raw(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        from minni.principal import canonicalize_agent_id
+
+        return canonicalize_agent_id(raw)
+    except Exception:
+        return raw
+
+
+def _recipient_scope_for(agent_id: str) -> set[str]:
+    from minni.principal import canonicalize_agent_id, handoff_aliases_for
+
+    clean = str(agent_id or "").strip()
+    if not clean:
+        return set()
+    scope: set[str] = {clean}
+    try:
+        canonical = canonicalize_agent_id(clean)
+        scope.add(canonical)
+    except Exception:
+        canonical = clean
+    try:
+        scope.update(handoff_aliases_for(clean))
+    except Exception:
+        pass
+    scope.update(_STATIC_REVERSE_ALIASES.get(canonical, ()))
+    return scope
+
+
+def _agent_matches_scope(
+    target: Any, caller_agent: str, scope: Optional[set[str]] = None
+) -> bool:
+    target_str = str(target or "").strip()
+    if not target_str:
+        return False
+    allowed = scope if scope is not None else _recipient_scope_for(caller_agent)
+    if target_str in allowed:
+        return True
+    return _canon_agent_or_raw(target_str) == _canon_agent_or_raw(caller_agent)
 
 
 class HandoffStoreError(RuntimeError):
@@ -355,6 +403,7 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
 
     from minni.principal import (
         _canonical_live_vault_root,
+        canonicalize_agent_id,
         from_operator_config,
         validate_agent_id,
     )
@@ -364,7 +413,8 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
     if not from_agent or not to_agent:
         return context.make_error(-32602, "from_agent and to_agent are required", request_id)
     try:
-        validate_agent_id(to_agent)
+        raw_to_agent = validate_agent_id(to_agent)
+        to_agent = canonicalize_agent_id(raw_to_agent)
     except ValueError as exc:
         return context.make_error(-32602, f"invalid to_agent: {exc}", request_id)
 
@@ -380,11 +430,21 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
     # will thread the full EffectivePrincipal object).
     from_agent = principal.agent_id
 
-    packet, error = context.validate_handoff_packet(from_agent, to_agent, params.get("packet"))
+    raw_packet = params.get("packet")
+    if (
+        isinstance(raw_packet, dict)
+        and raw_packet.get("to_agent") == raw_to_agent
+        and to_agent != raw_to_agent
+    ):
+        raw_packet = {**raw_packet, "to_agent": to_agent}
+
+    packet, error = context.validate_handoff_packet(from_agent, to_agent, raw_packet)
     if error:
         return context.make_error(-32602, error, request_id)
+    packet["to_agent"] = to_agent
 
     redacted_packet, redacted = context.redact_value(packet)
+    redacted_packet["to_agent"] = to_agent
     sender_vault, sender_explicit = context.agent_vault(from_agent)
     recipient_vault, recipient_explicit = context.agent_vault(to_agent)
 
@@ -459,6 +519,21 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
             # treat resolution failure as deny
             return context.make_error(-32003, "wikilink_traversal_denied: unresolvable ref", request_id)
 
+    lease_id_claim = str(redacted_packet["lease_id"])
+    existing_parties, _ = _lease_participants(lease_id_claim, context=context)
+    if existing_parties is not None:
+        existing_from, existing_to = existing_parties
+        if (
+            _canon_agent_or_raw(existing_from) != _canon_agent_or_raw(from_agent)
+            or _canon_agent_or_raw(existing_to) != _canon_agent_or_raw(to_agent)
+        ):
+            return context.make_error(
+                -32004,
+                f"principal_mismatch: handoff lease {lease_id_claim} already belongs to "
+                f"'{existing_from}' -> '{existing_to}'",
+                request_id,
+            )
+
     create_missing = os.environ.get("MINNI_HANDOFF_CREATE_MISSING_VAULTS", "1").lower() not in {
         "0",
         "false",
@@ -472,6 +547,7 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
             "status": "degraded",
             "delivered": False,
             "reason": f"destination vault not found for {to_agent}",
+            "from_agent": from_agent,
             "to_agent": to_agent,
             "recipient_vault": str(recipient_vault),
         }, request_id)
@@ -510,6 +586,8 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
         return context.make_response({
             "status": status,
             "delivered": True,
+            "from_agent": from_agent,
+            "to_agent": to_agent,
             "lease_persisted": lease_persisted,
             "reason": None if lease_persisted else "handoff delivered to JSON packets but SQLite lease persistence failed",
             "redacted": redacted,
@@ -526,6 +604,7 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
             "status": "degraded",
             "delivered": False,
             "reason": str(exc),
+            "from_agent": from_agent,
             "to_agent": to_agent,
         }, request_id)
 
@@ -534,8 +613,11 @@ def iter_handoff_files(agent_id: Optional[str] = None, *, context: HandoffContex
     agent_vault_fn = context.agent_vault if context is not None else agent_vault
     known_agent_vaults_fn = context.known_agent_vaults if context is not None else known_agent_vaults
     if agent_id:
-        vault, _ = agent_vault_fn(agent_id)
-        vaults = [vault]
+        vault_candidates = [agent_vault_fn(aid)[0] for aid in sorted(_recipient_scope_for(agent_id))]
+        if not vault_candidates:
+            vault, _ = agent_vault_fn(agent_id)
+            vault_candidates = [vault]
+        vaults = list(dict.fromkeys(vault_candidates))
     else:
         vaults = known_agent_vaults_fn()
     for vault in vaults:
@@ -619,7 +701,9 @@ def store_handoff_lease(packet: dict, inbox_path: Path, outbox_path: Path, conte
                      inbox_path = excluded.inbox_path,
                      outbox_path = excluded.outbox_path,
                      created_at = excluded.created_at,
-                     expires_at = excluded.expires_at""",
+                     expires_at = excluded.expires_at
+                   WHERE handoff_leases.from_agent = excluded.from_agent
+                     AND handoff_leases.to_agent = excluded.to_agent""",
                 (
                     packet["lease_id"],
                     packet["from_agent"],
@@ -633,7 +717,51 @@ def store_handoff_lease(packet: dict, inbox_path: Path, outbox_path: Path, conte
                     expires_at,
                 ),
             )
-        return True
+            if c.rowcount and c.rowcount > 0:
+                return True
+            existing = c.execute(
+                "SELECT from_agent, to_agent FROM handoff_leases WHERE lease_id = ?",
+                (packet["lease_id"],),
+            ).fetchone()
+            if existing is None:
+                return False
+            if (
+                _canon_agent_or_raw(existing["from_agent"])
+                != _canon_agent_or_raw(packet["from_agent"])
+                or _canon_agent_or_raw(existing["to_agent"])
+                != _canon_agent_or_raw(packet["to_agent"])
+            ):
+                return False
+            c.execute(
+                """UPDATE handoff_leases
+                   SET from_agent = ?,
+                       to_agent = ?,
+                       task = ?,
+                       status = ?,
+                       contradicts_id = ?,
+                       inbox_path = ?,
+                       outbox_path = ?,
+                       created_at = ?,
+                       expires_at = ?
+                   WHERE lease_id = ?
+                     AND from_agent = ?
+                     AND to_agent = ?""",
+                (
+                    packet["from_agent"],
+                    packet["to_agent"],
+                    packet.get("task"),
+                    status,
+                    packet.get("contradicts_id"),
+                    str(inbox_path),
+                    str(outbox_path),
+                    created_at,
+                    expires_at,
+                    packet["lease_id"],
+                    existing["from_agent"],
+                    existing["to_agent"],
+                ),
+            )
+            return bool(c.rowcount and c.rowcount > 0)
     except Exception as exc:
         context.logger.warning("Could not persist handoff lease %r: %s", packet.get("lease_id"), exc)
         return False
@@ -668,16 +796,18 @@ def update_handoff_lease_status(
 def pending_handoff_leases(agent_id: str, *, context: HandoffContext) -> list[dict]:
     try:
         now = time.time()
+        scope = sorted(_recipient_scope_for(agent_id) or {agent_id})
+        placeholders = ", ".join("?" for _ in scope)
         db = context.lazy_writeback().db
         with db.cursor() as c:
             rows = c.execute(
-                """SELECT lease_id, from_agent, to_agent, task, expires_at, inbox_path
+                f"""SELECT lease_id, from_agent, to_agent, task, expires_at, inbox_path
                    FROM handoff_leases
-                   WHERE to_agent = ?
+                   WHERE to_agent IN ({placeholders})
                      AND status = 'pending'
                      AND (expires_at IS NULL OR expires_at > ?)
                    ORDER BY created_at ASC, lease_id ASC""",
-                (agent_id, now),
+                (*scope, now),
             ).fetchall()
         return [
             {
@@ -760,7 +890,8 @@ def handle_ack_handoff(params: dict, request_id: Any, context: HandoffContext) -
     to_agent = lease_to_agent(lease_id, context=context)
     if to_agent is None:
         return context.make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
-    if to_agent != principal.agent_id:
+    allowed_recipients = _recipient_scope_for(principal.agent_id)
+    if not _agent_matches_scope(to_agent, principal.agent_id, allowed_recipients):
         return context.make_error(
             -32004,
             f"principal_mismatch: handoff lease {lease_id} is addressed to "
@@ -817,9 +948,10 @@ def handle_ack_handoff(params: dict, request_id: Any, context: HandoffContext) -
 def _file_channel_pending_handoffs(agent_id: str, *, context: HandoffContext) -> list[dict]:
     """Pending leases visible only on the JSON packet channel (inbox/outbox)."""
     now = time.time()
+    allowed_recipients = _recipient_scope_for(agent_id)
     handoffs = []
     for _vault, path, packet in iter_handoff_files(agent_id, context=context):
-        if packet.get("to_agent") != agent_id:
+        if not _agent_matches_scope(packet.get("to_agent"), agent_id, allowed_recipients):
             continue
         if not packet.get("requires_ack", False):
             continue
@@ -868,11 +1000,13 @@ def _known_lease_ids_for_agent(agent_id: str, *, context: HandoffContext) -> set
     unavailable, not that the response fails.
     """
     try:
+        scope = sorted(_recipient_scope_for(agent_id) or {agent_id})
+        placeholders = ", ".join("?" for _ in scope)
         db = context.lazy_writeback().db
         with db.cursor() as c:
             rows = c.execute(
-                "SELECT lease_id FROM handoff_leases WHERE to_agent = ?",
-                (agent_id,),
+                f"SELECT lease_id FROM handoff_leases WHERE to_agent IN ({placeholders})",
+                tuple(scope),
             ).fetchall()
         return {row["lease_id"] for row in rows}
     except Exception as exc:
@@ -990,11 +1124,18 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
     principal, err = context.handler_principal(params, request_id)
     if err:
         return err
+    caller_scope = _recipient_scope_for(principal.agent_id)
+
+    def _caller_in_participants(parts: tuple[str, str]) -> bool:
+        return _agent_matches_scope(
+            parts[0], principal.agent_id, caller_scope
+        ) or _agent_matches_scope(parts[1], principal.agent_id, caller_scope)
+
     cross_allowed = _principal_allows_cross_handoff(principal)
     if not cross_allowed:
         participants, db_ok = _lease_participants(lease_id, context=context)
         if participants is not None:
-            if principal.agent_id not in set(participants):
+            if not _caller_in_participants(participants):
                 return context.make_error(
                     -32003,
                     f"access_denied: caller principal {principal.agent_id!r} is not "
@@ -1038,7 +1179,7 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
         if lease is not None and lease.get("status") not in {None, "pending"}:
             if not cross_allowed:
                 participants, _ = _lease_participants(lease_id, context=context)
-                if participants is None or principal.agent_id not in set(participants):
+                if participants is None or not _caller_in_participants(participants):
                     return context.make_error(
                         -32003,
                         f"access_denied: caller principal {principal.agent_id!r} is not "
@@ -1053,7 +1194,7 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
         if file_ack is not None:
             if not cross_allowed:
                 participants, _ = _lease_participants(lease_id, context=context)
-                if participants is None or principal.agent_id not in set(participants):
+                if participants is None or not _caller_in_participants(participants):
                     return context.make_error(
                         -32003,
                         f"access_denied: caller principal {principal.agent_id!r} is not "

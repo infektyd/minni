@@ -2542,8 +2542,12 @@ export interface ActiveThreadBinding {
   updated_at: string;
 }
 
+function hasValidHostPid(pid: unknown): pid is number {
+  return typeof pid === "number" && Number.isInteger(pid) && pid > 1;
+}
+
 function isHostPidAlive(pid: number | undefined): boolean {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1) return true;
+  if (!hasValidHostPid(pid)) return true;
   try {
     process.kill(pid, 0);
     return true;
@@ -2613,10 +2617,11 @@ export async function listLiveActiveThreadBindings(
       if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
       const updatedIso = typeof parsed.updated_at === "string" ? parsed.updated_at : parsed.set_at;
       const updatedMs = Date.parse(updatedIso);
-      if (Number.isFinite(updatedMs) && nowMs - updatedMs > ACTIVE_THREAD_SESSION_TTL_MS) {
-        continue;
-      }
-      if (typeof parsed.host_pid === "number" && !isHostPidAlive(parsed.host_pid)) {
+      if (hasValidHostPid(parsed.host_pid)) {
+        if (!isHostPidAlive(parsed.host_pid)) {
+          continue;
+        }
+      } else if (Number.isFinite(updatedMs) && nowMs - updatedMs > ACTIVE_THREAD_SESSION_TTL_MS) {
         continue;
       }
       try {
@@ -2697,8 +2702,8 @@ export async function getConcurrentActiveThreads(
  *
  * Prunes `.runtime/active-thread.d/<sessionKey>.json` when:
  *  - the referenced plan is terminal or missing, OR
- *  - `host_pid` is dead (`ESRCH`) AND `updated_at > 24h`, OR
- *  - `updated_at > 7d`.
+ *  - `host_pid` (> 1) is dead (`ESRCH`) AND `updated_at > 24h`, OR
+ *  - `host_pid` is absent/invalid (<= 1) AND `updated_at > 7d`.
  * Before deleting a non-terminal session pointer, if `wiki/artifacts/_active_plan.json`
  * is absent, preserves the last non-terminal `plan_id` in `_active_plan.json`.
  *
@@ -2759,7 +2764,8 @@ export async function sweepDeadActiveThreadPointers(
       const updatedIso = typeof raw.updated_at === "string" ? raw.updated_at : raw.set_at;
       const updatedMs = Date.parse(updatedIso);
       const ageMs = Number.isFinite(updatedMs) ? nowMs - updatedMs : 0;
-      const pidAlive = typeof raw.host_pid === "number" ? isHostPidAlive(raw.host_pid) : true;
+      const hasValidPid = hasValidHostPid(raw.host_pid);
+      const pidAlive = hasValidPid ? isHostPidAlive(raw.host_pid) : true;
 
       let isTerminalOrMissing = false;
       try {
@@ -2773,8 +2779,8 @@ export async function sweepDeadActiveThreadPointers(
         }
       }
 
-      const deadSessionExpired = !pidAlive && ageMs > ACTIVE_THREAD_SESSION_TTL_MS;
-      const hardMaxAgeExpired = ageMs > ACTIVE_THREAD_MAX_AGE_MS;
+      const deadSessionExpired = hasValidPid && !pidAlive && ageMs > ACTIVE_THREAD_SESSION_TTL_MS;
+      const hardMaxAgeExpired = !hasValidPid && ageMs > ACTIVE_THREAD_MAX_AGE_MS;
       if (!isTerminalOrMissing && !deadSessionExpired && !hardMaxAgeExpired) {
         continue;
       }
@@ -2818,7 +2824,7 @@ export async function sweepDeadActiveThreadPointers(
       prunedPointers += 1;
       // Always record expired/dead session keys for relay cursor GC, even when the
       // referenced plan had already transitioned to complete/terminal.
-      if (!pidAlive || deadSessionExpired || hardMaxAgeExpired) {
+      if ((hasValidPid && !pidAlive) || deadSessionExpired || hardMaxAgeExpired) {
         prunedSessionKeys.add(stem);
       }
     } catch {
@@ -2855,14 +2861,13 @@ export async function sweepDeadActiveThreadPointers(
           ? nowMs - updatedMs
           : nowMs - mtimeMs;
         const pidLive =
-          typeof rawHint?.host_pid === "number"
-            ? isLiveMatchingProcess(
-                rawHint.host_pid,
-                typeof rawHint.process_start_marker === "string"
-                  ? rawHint.process_start_marker
-                  : undefined,
-              )
-            : false;
+          hasValidHostPid(rawHint?.host_pid) &&
+          isLiveMatchingProcess(
+            rawHint.host_pid,
+            typeof rawHint.process_start_marker === "string"
+              ? rawHint.process_start_marker
+              : undefined,
+          );
         if (pidLive) {
           if (typeof rawHint?.session_key === "string" && SESSION_KEY_HEX16_RE.test(rawHint.session_key)) {
             liveRuntimeSessionKeys.add(rawHint.session_key);
@@ -3169,7 +3174,7 @@ export async function getActivePlan(
           parsed.owner_session_key !== sessionKey
         ) {
           if (
-            typeof parsed.owner_host_pid === "number" &&
+            hasValidHostPid(parsed.owner_host_pid) &&
             isHostPidAlive(parsed.owner_host_pid)
           ) {
             return undefined;
@@ -3307,7 +3312,7 @@ export async function clearActivePlan(
         sessionKey &&
         parsed?.owner_session_key &&
         parsed.owner_session_key !== sessionKey &&
-        typeof parsed.owner_host_pid === "number" &&
+        hasValidHostPid(parsed.owner_host_pid) &&
         isHostPidAlive(parsed.owner_host_pid)
       ) {
         return;

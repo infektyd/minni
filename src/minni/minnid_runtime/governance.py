@@ -700,14 +700,38 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         context.record_latency("learn", time.perf_counter() - started_at)
 
 
+def _parse_derived_from_meta(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
 def handle_resolve_contradiction(params: dict, request_id: Any, context: GovernanceContext) -> dict:
     """Write a new learning and atomically supersede prior learnings."""
     if context.increment_request_count is not None:
         context.increment_request_count()
 
+    knob_err = reject_wire_supplied_auto_accept(params, request_id, context)
+    if knob_err:
+        return knob_err
+
     new_content = params.get("new_content", "")
-    if not new_content:
+    if not isinstance(new_content, str) or not new_content:
         return context.make_error(-32602, "new_content is required", request_id)
+
+    from minni.afm_passes.inbox_ingest import has_wrapper_leak
+
+    if has_wrapper_leak(new_content):
+        return context.make_error(
+            -32602, "new_content rejected (wrapper_leak)", request_id
+        )
 
     supersede_ids = params.get("supersede_ids", [])
     if not isinstance(supersede_ids, list):
@@ -828,6 +852,152 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
 
         now = time.time()
         doc_ids_json = json.dumps(evidence_doc_ids) if evidence_doc_ids else None
+        can_write_directly = (
+            is_operator_principal(principal)
+            or explicitly_allowed_operator(principal)
+            or bool(getattr(principal, "auto_accept_own", False))
+        )
+
+        if not can_write_directly:
+            requested_privacy = params.get("privacy_level")
+            if requested_privacy is None or (
+                isinstance(requested_privacy, str) and not requested_privacy.strip()
+            ):
+                requested_privacy = "safe"
+            else:
+                requested_privacy = str(requested_privacy).strip()
+            stored_privacy = (
+                requested_privacy if explicitly_allowed_operator(principal) else "review"
+            )
+            ev_json = json.dumps(evidence_doc_ids if isinstance(evidence_doc_ids, list) else [])
+            instr_flag = int(bool(is_instruction_like(new_content)))
+            resolved_ws = normalize_workspace_scope(params.get("workspace_id"), default="")
+            with wb.db.transaction() as c:
+                _has_ws_col = _learnings_has_workspace_col(c)
+                for sid in supersede_ids:
+                    c.execute(
+                        "SELECT agent_id, content, workspace_id FROM learnings WHERE learning_id = ?"
+                        if _has_ws_col
+                        else "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
+                        (sid,),
+                    )
+                    srow = c.fetchone()
+                    if not srow:
+                        raise ResolveRejected(context.make_error(
+                            -32001, f"learning_not_found: {sid}", request_id
+                        ))
+                    owner = str(srow["agent_id"] or "")
+                    if not resolved_ws and _has_ws_col and "workspace_id" in srow.keys():
+                        cand_sup_ws = str(srow["workspace_id"] or "").strip()
+                        if cand_sup_ws and cand_sup_ws != "default":
+                            resolved_ws = cand_sup_ws
+                    if owner != agent_id and not explicitly_allowed_operator(principal):
+                        raise ResolveRejected(context.make_error(
+                            -32004,
+                            f"principal_mismatch: learning #{sid} is owned by '{owner}'; "
+                            f"caller principal '{agent_id}' may only supersede its own "
+                            "learnings (cross-principal supersession requires an "
+                            "explicitly allowed operator)",
+                            request_id,
+                        ))
+                resolved_ws = resolved_ws or "default"
+                derived_payload = json.dumps(
+                    {
+                        "source": "resolve_contradiction",
+                        "supersede_ids": supersede_ids,
+                        "category": category,
+                        "assertion": assertion,
+                        "applies_when": applies_when,
+                        "evidence_doc_ids": evidence_doc_ids,
+                    }
+                )
+                pragma_cp = c.execute("PRAGMA table_info(candidate_packets)").fetchall()
+                cp_cols = {
+                    row["name"] if isinstance(row, dict) or hasattr(row, "keys") else row[1]
+                    for row in pragma_cp
+                }
+                if "category" in cp_cols and "requested_privacy" in cp_cols:
+                    c.execute(
+                        """
+                        INSERT INTO candidate_packets
+                        (principal, workspace_id, layer, privacy_level, requested_privacy, category, content,
+                         evidence_refs, derived_from, instruction_like, status, proposed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                        """,
+                        (
+                            agent_id,
+                            resolved_ws,
+                            params.get("layer"),
+                            stored_privacy,
+                            requested_privacy,
+                            category,
+                            new_content,
+                            ev_json,
+                            derived_payload,
+                            instr_flag,
+                            now,
+                        ),
+                    )
+                elif "requested_privacy" in cp_cols:
+                    c.execute(
+                        """
+                        INSERT INTO candidate_packets
+                        (principal, workspace_id, layer, privacy_level, requested_privacy, content,
+                         evidence_refs, derived_from, instruction_like, status, proposed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                        """,
+                        (
+                            agent_id,
+                            resolved_ws,
+                            params.get("layer"),
+                            stored_privacy,
+                            requested_privacy,
+                            new_content,
+                            ev_json,
+                            derived_payload,
+                            instr_flag,
+                            now,
+                        ),
+                    )
+                else:
+                    c.execute(
+                        """
+                        INSERT INTO candidate_packets
+                        (principal, workspace_id, layer, privacy_level, content,
+                         evidence_refs, derived_from, instruction_like, status, proposed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                        """,
+                        (
+                            agent_id,
+                            resolved_ws,
+                            params.get("layer"),
+                            stored_privacy,
+                            new_content,
+                            ev_json,
+                            derived_payload,
+                            instr_flag,
+                            now,
+                        ),
+                    )
+                cid = c.lastrowid
+
+            context.logger.info(
+                "Staged contradiction proposal: candidate #%d by %s supersedes %s",
+                cid,
+                agent_id,
+                supersede_ids,
+            )
+            return context.make_response(
+                {
+                    "status": "proposed",
+                    "candidate_id": cid,
+                    "principal": agent_id,
+                    "workspace_id": resolved_ws,
+                    "supersede_ids": supersede_ids,
+                    "superseded": [],
+                },
+                request_id,
+            )
 
         # Hoisted ABOVE the transaction on purpose. This helper opens a cursor,
         # and MinniDB.cursor() commits on exit on the same thread-local
@@ -2413,8 +2583,12 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                         pre_instr = bool(int(pre_d.get("instruction_like") or 0)) or is_instruction_like(
                             pre_content
                         )
+                        pre_derived = _parse_derived_from_meta(pre_d.get("derived_from"))
                         pre_raw_cat = str(
-                            pre_d.get("category") or params.get("category") or "general"
+                            pre_d.get("category")
+                            or params.get("category")
+                            or pre_derived.get("category")
+                            or "general"
                         ).strip().lower()
                         pre_cat = (
                             pre_raw_cat if pre_raw_cat in _PRE_CATEGORIES else "general"
@@ -2558,7 +2732,13 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 )
                 from minni.writeback import CATEGORIES
 
-                raw_cat = str(rowd.get("category") or params.get("category") or "general").strip().lower()
+                derived_meta = _parse_derived_from_meta(rowd.get("derived_from"))
+                raw_cat = str(
+                    rowd.get("category")
+                    or params.get("category")
+                    or derived_meta.get("category")
+                    or "general"
+                ).strip().lower()
                 cat = raw_cat if raw_cat in CATEGORIES else "general"
                 _chash = _content_hash(content)
                 pragma_l = c.execute("PRAGMA table_info(learnings)").fetchall()
@@ -2569,11 +2749,19 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 _have_hash_col = "content_hash" in l_cols
                 _have_status_col = "status" in l_cols
                 existing_lids: list[int] = []
+                contradiction_supersede_lids: set[int] = set()
+                is_contradiction_candidate = derived_meta.get("source") == "resolve_contradiction" or (
+                    derived_meta.get("kind") == "contradiction_resolution"
+                )
                 raw_sup = (
                     params.get("supersede_ids")
                     if "supersede_ids" in params
                     else params.get("supersedes")
                 )
+                raw_sup_from_derived = False
+                if raw_sup is None and isinstance(derived_meta.get("supersede_ids"), (list, tuple)):
+                    raw_sup = derived_meta.get("supersede_ids")
+                    raw_sup_from_derived = True
                 if raw_sup is not None:
                     if isinstance(raw_sup, int) and not isinstance(raw_sup, bool):
                         raw_sup_list: list[Any] = [raw_sup]
@@ -2616,6 +2804,8 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                             (sid_int,),
                         ).fetchone()
                         if not srow:
+                            if raw_sup_from_derived:
+                                continue
                             raise ResolveRejected(
                                 context.make_error(
                                     -32001, f"learning_not_found: {sid_int}", request_id
@@ -2639,6 +2829,8 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                             )
                         if sid_int not in existing_lids:
                             existing_lids.append(sid_int)
+                        if is_contradiction_candidate:
+                            contradiction_supersede_lids.add(sid_int)
                 # Collect pre-existing active hash-matching rows WITHOUT mutating
                 # their status yet so `_revalidate_target` inside
                 # `commit_prepared_learning` continues to see active targets;
@@ -2763,6 +2955,43 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                         committed_edges.extend(fb_edges)
                         graph_superseded_lids.extend(fb_sup)
 
+                meta_updates: list[str] = []
+                meta_vals: list[Any] = []
+                meta_assertion = (
+                    params.get("assertion")
+                    if "assertion" in params
+                    else derived_meta.get("assertion")
+                )
+                if meta_assertion is not None and "assertion" in l_cols:
+                    meta_updates.append("assertion = ?")
+                    meta_vals.append(meta_assertion)
+                meta_applies = (
+                    params.get("applies_when")
+                    if "applies_when" in params
+                    else derived_meta.get("applies_when")
+                )
+                if meta_applies is not None and "applies_when" in l_cols:
+                    meta_updates.append("applies_when = ?")
+                    meta_vals.append(meta_applies)
+                meta_ev_docs = (
+                    params.get("evidence_doc_ids")
+                    if "evidence_doc_ids" in params
+                    else derived_meta.get("evidence_doc_ids")
+                )
+                if meta_ev_docs is not None and "evidence_doc_ids" in l_cols:
+                    meta_updates.append("evidence_doc_ids = ?")
+                    meta_vals.append(
+                        meta_ev_docs
+                        if isinstance(meta_ev_docs, str)
+                        else json.dumps(meta_ev_docs)
+                    )
+                if meta_updates:
+                    meta_vals.append(lid)
+                    c.execute(
+                        f"UPDATE learnings SET {', '.join(meta_updates)} WHERE learning_id = ?",
+                        meta_vals,
+                    )
+
                 linked_lids = linked_learning_ids_for_edges(
                     c, committed_edges, exclude_learning_id=lid
                 )
@@ -2801,7 +3030,29 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                         if ex_row and "content" in ex_row.keys()
                         else f"learning:{ex_lid}"
                     )
-                    if getattr(db.config, "writeback_enabled", True):
+                    if int(ex_lid) in contradiction_supersede_lids:
+                        if _have_status_col and "superseded_by" in l_cols:
+                            c.execute(
+                                "UPDATE learnings SET superseded_by = ?, status = 'superseded' "
+                                "WHERE learning_id = ?",
+                                (lid, ex_lid),
+                            )
+                        elif "superseded_by" in l_cols:
+                            c.execute(
+                                "UPDATE learnings SET superseded_by = ? "
+                                "WHERE learning_id = ?",
+                                (lid, ex_lid),
+                            )
+                        try:
+                            c.execute(
+                                """INSERT INTO contradiction_events
+                                   (superseded_learning_id, new_learning_id, originating_agent, created_at)
+                                   VALUES (?, ?, ?, ?)""",
+                                (ex_lid, lid, author_agent, now),
+                            )
+                        except Exception:
+                            pass
+                    elif getattr(db.config, "writeback_enabled", True):
                         evict_learning_to_cold_archive(
                             c,
                             None,
