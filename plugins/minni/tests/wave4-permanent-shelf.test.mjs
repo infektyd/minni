@@ -190,12 +190,24 @@ test(
     const fx = await createMappedRepoFixture("sm-w4-bug13-");
     t.after(() => cleanupTempDir(fx.root));
 
-    const header = "# Operator Layer 1 Core\n\n";
+    const header = "# Layer 1 — claude-code core orientation\n\n";
     const tailSentinel = "\n\n## Final Invariant\nTAIL_SENTINEL_INTACT_12KB\n";
-    const fillerLen = 12_000 - Buffer.byteLength(header, "utf8") - Buffer.byteLength(tailSentinel, "utf8");
-    const core12k = header + "Rule line preserving permanent agent orientation.\n".repeat(Math.ceil(fillerLen / 50)).slice(0, fillerLen) + tailSentinel;
-    assert.equal(Buffer.byteLength(core12k, "utf8"), 12_000);
+    const fillerUnit = 'Rule — "preserve" · permanent agent orientation.\n';
+    const fillerTargetChars = 12_500 - header.length - tailSentinel.length;
+    const core12k =
+      header +
+      fillerUnit.repeat(Math.ceil(fillerTargetChars / fillerUnit.length)).slice(0, fillerTargetChars) +
+      tailSentinel;
     await writeFile(path.join(fx.vault, "layer1", "core.md"), core12k, "utf8");
+    // BUG-55 regression: populate vault notes so SessionStart boot recall (~2.5 KB) + JSON-escaped
+    // UTF-8 shelf (~1.5 KB escaping overhead) run concurrently with 12.5 KB core.md + project_shelf.
+    for (let idx = 1; idx <= 4; idx += 1) {
+      await writeFile(
+        path.join(fx.vault, `boot-identity-note-${idx}.md`),
+        `---\nagent: claude-code\nprivacy: safe\n---\nBoot identity & architecture note ${idx} for alpha-repo: ${"detailed context ".repeat(35)}\n`,
+        "utf8",
+      );
+    }
 
     const { body } = await runHookEvent(
       "SessionStart",
@@ -205,9 +217,9 @@ test(
 
     assert.ok(body, "SessionStart must emit <minni:context>");
     assert.equal(body.layer1_shelf.ok, true);
-    assert.equal(body.layer1_shelf.truncated, false, "12 KB core.md must load with truncated: false");
-    assert.equal(body.layer1_shelf.inline_trim, undefined, "12 KB core.md must NOT be crushed to boot form");
-    assert.equal(body.layer1_shelf.content.length, 12_000);
+    assert.equal(body.layer1_shelf.truncated, false, "12.5 KB core.md must load with truncated: false");
+    assert.equal(body.layer1_shelf.inline_trim, undefined, "12.5 KB core.md must NOT be crushed to boot form even with full boot recall");
+    assert.equal(body.layer1_shelf.content.length, core12k.length);
     assert.ok(body.layer1_shelf.content.includes("TAIL_SENTINEL_INTACT_12KB"));
     assert.equal(typeof body.project_shelf, "string");
     assert.ok(body.project_shelf.includes("### Project Shelf (workspace-alpha-repo)"));
@@ -230,7 +242,7 @@ test(
       },
       { tokenLimit: 4500, charLimit: 18_000 },
     );
-    assert.equal(step9Fitted.layer1_shelf.content.length, 12_000);
+    assert.equal(step9Fitted.layer1_shelf.content.length, core12k.length);
     assert.equal(step9Fitted.layer1_shelf.inline_trim, undefined);
     assert.equal(step9Fitted.project_shelf, body.project_shelf);
   },

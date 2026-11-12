@@ -2223,22 +2223,26 @@ export function createHookHandlers(
     });
 
     const budget = envelopeBudgetFor(config.contextWindow);
-    const permanentLayer1Chars =
+    const permanentLayer1RawChars =
       layer1Shelf.ok &&
       layer1Shelf.truncated !== true &&
       typeof layer1Shelf.content === "string"
         ? layer1Shelf.content.length
         : 0;
-    const permanentProjectChars = typeof projectShelf === "string" ? projectShelf.length : 0;
-    const permanentShelfChars = permanentLayer1Chars + permanentProjectChars;
+    const permanentProjectRawChars =
+      typeof projectShelf === "string" ? projectShelf.length : 0;
+    const permanentShelfRawChars = permanentLayer1RawChars + permanentProjectRawChars;
+    const permanentShelfSerializedChars =
+      (permanentLayer1RawChars > 0 ? JSON.stringify(envelopeBody.layer1_shelf).length : 0) +
+      (permanentProjectRawChars > 0 ? JSON.stringify(projectShelf).length : 0);
     const rawHostInlineCap = wireCapabilities(wire).hostInlineCapChars;
     const sessionStartCharLimit =
-      rawHostInlineCap !== undefined && permanentShelfChars + 1800 > rawHostInlineCap
-        ? Math.min(36_000, permanentShelfChars + 3200)
+      rawHostInlineCap !== undefined && permanentShelfRawChars + 1_800 > rawHostInlineCap
+        ? Math.min(40_000, permanentShelfSerializedChars + 8_000)
         : rawHostInlineCap;
     const sessionStartBudget =
-      permanentShelfChars + 2800 > budget * 4
-        ? Math.max(budget, Math.ceil((permanentShelfChars + 3200) / 4))
+      permanentShelfRawChars + 2_800 > budget * 4
+        ? Math.max(budget, Math.ceil((permanentShelfSerializedChars + 8_000) / 4))
         : budget;
 
     if (identityRead.ok && identityRead.data?.context) {
