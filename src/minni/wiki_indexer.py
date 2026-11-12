@@ -44,6 +44,7 @@ class WikiFrontmatter:
     privacy: str = "safe"        # safe | local-only | private | blocked
     superseded_by: str = ""      # wikilink or path of the superseding page
     expires: str = ""            # ISO date string
+    workspace_id: str = ""       # normalized workspace scope if present in frontmatter
     raw: Dict[str, str] = field(default_factory=dict)
 
     # PR-2: Valid values for validation
@@ -195,6 +196,10 @@ class WikiPageParser:
                 fm.superseded_by = value
             elif key == 'expires':
                 fm.expires = value
+            elif key in ('workspace_id', 'workspace'):
+                from minni.config import normalize_workspace_scope
+
+                fm.workspace_id = normalize_workspace_scope(value, default="") if value else ""
 
         return fm
 
@@ -516,28 +521,55 @@ class WikiIndexer:
                     layer = VaultIndexer._infer_layer(
                         agent=agent_tag, page_type=page_type, whole_document=0
                     )
+                    doc_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in c.execute("PRAGMA table_info(documents)").fetchall()
+                    }
+                    has_doc_ws = "workspace_id" in doc_cols
+                    doc_ws = page.frontmatter.workspace_id or ""
 
                     if row:
                         doc_id = row["doc_id"]
-                        c.execute(
-                            """UPDATE documents
-                               SET agent=?, sigil=?, last_modified=?, indexed_at=?,
-                                   page_status=?, privacy_level=?, page_type=?, layer=?
-                               WHERE doc_id=?""",
-                            (agent_tag, "📖", mtime, now,
-                             page_status, privacy_level, page_type, layer, doc_id),
-                        )
+                        if has_doc_ws:
+                            c.execute(
+                                """UPDATE documents
+                                   SET agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                       page_status=?, privacy_level=?, page_type=?, layer=?,
+                                       workspace_id = CASE WHEN ? != '' THEN ? ELSE documents.workspace_id END
+                                   WHERE doc_id=?""",
+                                (agent_tag, "📖", mtime, now,
+                                 page_status, privacy_level, page_type, layer,
+                                 doc_ws, doc_ws, doc_id),
+                            )
+                        else:
+                            c.execute(
+                                """UPDATE documents
+                                   SET agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                       page_status=?, privacy_level=?, page_type=?, layer=?
+                                   WHERE doc_id=?""",
+                                (agent_tag, "📖", mtime, now,
+                                 page_status, privacy_level, page_type, layer, doc_id),
+                            )
                         # Clean old FTS + embeddings for re-index
                         c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                         c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
                     else:
-                        c.execute(
-                            """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
-                                   page_status, privacy_level, page_type, layer)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (path, agent_tag, "📖", mtime, now,
-                             page_status, privacy_level, page_type, layer),
-                        )
+                        if has_doc_ws:
+                            c.execute(
+                                """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
+                                       page_status, privacy_level, page_type, layer, workspace_id)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (path, agent_tag, "📖", mtime, now,
+                                 page_status, privacy_level, page_type, layer, doc_ws),
+                            )
+                        else:
+                            c.execute(
+                                """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
+                                       page_status, privacy_level, page_type, layer)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (path, agent_tag, "📖", mtime, now,
+                                 page_status, privacy_level, page_type, layer),
+                            )
                         doc_id = c.lastrowid
 
                     # FTS5 insert (full content for keyword search)

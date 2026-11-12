@@ -268,19 +268,65 @@ async function queryTopWorkspaceScars(
       if (!cols.has("workspace_id") || !cols.has("content")) return [];
 
       const idCol = cols.has("learning_id") ? "learning_id" : cols.has("id") ? "id" : "rowid";
-      const catCol = cols.has("category") ? "category" : "'general' AS category";
-      const confCol = cols.has("confidence") ? "COALESCE(confidence, 0.5) AS confidence" : "0.5 AS confidence";
-      const whereParts = ["workspace_id = ?"];
+      const catCol = cols.has("category") ? "l.category" : "'general' AS category";
+      const confCol = cols.has("confidence") ? "COALESCE(l.confidence, 0.5) AS confidence" : "0.5 AS confidence";
+      const whereParts = ["l.workspace_id = ?"];
       if (cols.has("superseded_by")) {
-        whereParts.push("superseded_by IS NULL");
+        whereParts.push("l.superseded_by IS NULL");
       }
       if (cols.has("status")) {
-        whereParts.push("COALESCE(status, 'accepted') NOT IN ('rejected', 'expired', 'superseded', 'proposed', 'candidate', 'draft')");
+        whereParts.push("LOWER(TRIM(COALESCE(l.status, 'active'))) IN ('active', 'accepted')");
       }
-      if (cols.has("privacy_level")) {
-        whereParts.push("COALESCE(privacy_level, 'safe') NOT IN ('blocked', 'private', 'local-only')");
+      if (cols.has("expires_at")) {
+        whereParts.push(
+          "(l.expires_at IS NULL OR (typeof(l.expires_at) IN ('integer', 'real') AND l.expires_at > CAST(strftime('%s', 'now') AS REAL)) OR (typeof(l.expires_at) = 'text' AND (TRIM(l.expires_at) = '' OR datetime(l.expires_at) > datetime('now'))))",
+        );
       }
-      const sql = `SELECT ${idCol} AS lid, ${catCol}, ${confCol}, content FROM learnings WHERE ${whereParts.join(" AND ")} ORDER BY ${idCol} DESC LIMIT 60`;
+      if (tables.has("documents")) {
+        const docCols = new Set(
+          db
+            .prepare("PRAGMA table_info(documents)")
+            .all()
+            .map((r) => String(r.name ?? "")),
+        );
+        const badDocDisjuncts: string[] = [];
+        if (docCols.has("privacy_level")) {
+          badDocDisjuncts.push(
+            "LOWER(TRIM(COALESCE(d.privacy_level, 'safe'))) IN ('blocked', 'private', 'local-only', 'secret')",
+          );
+        }
+        if (docCols.has("page_status")) {
+          badDocDisjuncts.push(
+            "LOWER(TRIM(COALESCE(d.page_status, 'accepted'))) IN ('rejected', 'superseded', 'expired', 'archived', 'retired', 'deleted')",
+          );
+        }
+        if (docCols.has("superseded_by")) {
+          badDocDisjuncts.push("d.superseded_by IS NOT NULL");
+        }
+        if (docCols.has("expires_at")) {
+          badDocDisjuncts.push(
+            "(d.expires_at IS NOT NULL AND ((typeof(d.expires_at) IN ('integer', 'real') AND d.expires_at <= CAST(strftime('%s', 'now') AS REAL)) OR (typeof(d.expires_at) = 'text' AND TRIM(d.expires_at) != '' AND datetime(d.expires_at) IS NOT NULL AND datetime(d.expires_at) <= datetime('now'))))",
+          );
+        }
+        if (badDocDisjuncts.length > 0) {
+          const badDocCond = badDocDisjuncts.join(" OR ");
+          if (tables.has("learning_documents") && docCols.has("doc_id")) {
+            whereParts.push(
+              `NOT EXISTS (SELECT 1 FROM learning_documents ld JOIN documents d ON d.doc_id = ld.doc_id WHERE ld.learning_id = l.${idCol} AND (${badDocCond}))`,
+            );
+          }
+          if (docCols.has("memory_uri")) {
+            whereParts.push(
+              `NOT EXISTS (SELECT 1 FROM documents d WHERE d.memory_uri = ('learning://' || l.${idCol}) AND (${badDocCond}))`,
+            );
+          }
+        }
+      } else if (cols.has("privacy_level")) {
+        whereParts.push(
+          "LOWER(TRIM(COALESCE(l.privacy_level, 'safe'))) NOT IN ('blocked', 'private', 'local-only', 'secret')",
+        );
+      }
+      const sql = `SELECT l.${idCol} AS lid, ${catCol}, ${confCol}, l.content FROM learnings l WHERE ${whereParts.join(" AND ")} ORDER BY l.${idCol} DESC LIMIT 60`;
       const rows = db.prepare(sql).all(workspaceId);
       const scored = rows
         .map((r) => {

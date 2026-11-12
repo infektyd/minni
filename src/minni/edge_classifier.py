@@ -366,17 +366,18 @@ def classify_pair_deterministic(
 
     src_ws_raw = str(source.get("workspace_id") or src_meta.get("workspace_id") or "").strip().lower()
     cand_ws_raw = str(candidate.get("workspace_id") or cand_meta.get("workspace_id") or "").strip().lower()
-    src_ws = "" if src_ws_raw in ("", "default") else src_ws_raw
-    cand_ws = "" if cand_ws_raw in ("", "default") else cand_ws_raw
-    if (src_ws or cand_ws) and src_ws != cand_ws:
-        return InferredEdge(
-            pair_id=pair_id,
-            label="none",
-            direction="none",
-            confidence=0.05,
-            supporting_evidence_indices=(),
-            rationale="Distinct workspaces; cross-workspace heuristic edges suppressed.",
-        )
+    if src_ws_raw not in ("global", "*") and cand_ws_raw not in ("global", "*"):
+        src_ws = "" if src_ws_raw in ("", "default") else src_ws_raw
+        cand_ws = "" if cand_ws_raw in ("", "default") else cand_ws_raw
+        if (src_ws or cand_ws) and src_ws != cand_ws:
+            return InferredEdge(
+                pair_id=pair_id,
+                label="none",
+                direction="none",
+                confidence=0.05,
+                supporting_evidence_indices=(),
+                rationale="Distinct workspaces; cross-workspace heuristic edges suppressed.",
+            )
 
     src_agent = str(
         source.get("agent_id")

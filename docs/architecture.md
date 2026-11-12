@@ -3,52 +3,50 @@
 ## Surfaces and request flow
 
 The README's [architecture diagram](../README.md#architecture-at-a-glance) is
-the control plane in summary — the three ingresses, the gate, the four verbs,
-the two stores. This one is the full surface map: the same control plane plus
-the operator surfaces and the ingestion paths that feed it. Dashed edges are
-**host-mediated** — the platform fires the hook and consumes what it returns;
-solid edges are somebody **calling**.
+the control plane in summary — the ingresses, the gate, the core verbs, and the
+stores. This diagram shows the full v1 surface map: client runtimes, non-blocking
+hooks, the 12-tool MCP bridge, the stdlib-only `minni` CLI, the governed daemon,
+the typed memory graph, Living Repo Maps, and the operator-facing `~/.minni/TODAY.md`
+digest. Dashed edges are **host-mediated** — the platform fires the hook and
+consumes what it returns; solid edges are direct calls.
 
 ```mermaid
 flowchart TD
     subgraph Clients["Client surfaces"]
-      Host["Agent runtime host"]
-      Hooks["Hook entrypoint — dist/hook.js<br/>SessionStart · UserPromptSubmit · PreToolUse<br/>PreCompact · PostCompact · Stop"]
-      Plugin["MCP server — dist/server.js<br/>typed minni_* tools"]
-      CLI["minni CLI<br/>up · down · doctor · status · watch · wire"]
+      Host["Agent runtime host<br/>Claude Code · Codex · Gemini/Antigravity · Grok · Cursor · Kilo Code"]
+      Hooks["Non-blocking host hooks — dist/hook.js<br/>SessionStart (24 KB shelf + project_shelf) · SubagentStart<br/>UserPromptSubmit · PreToolUse · PostToolUse<br/>PreCompact · PostCompact · Stop"]
+      Plugin["MCP server — dist/server.js<br/>12 typed minni_* tools"]
+      CLI["minni CLI<br/>up · down · status · activity · map<br/>recall · learn · doctor · watch · wire · sync"]
     end
 
     subgraph Core["Daemon"]
       Daemon["minnid — JSON-RPC over Unix socket"]
-      Gate["EffectivePrincipal gate<br/>identity + capabilities"]
-      AFM["AFM pass loop<br/>compact_distillation · consolidation · vault_ingest"]
+      Gate["EffectivePrincipal gate<br/>identity + capabilities + workspace_id"]
+      AFM["AFM pass loop + GraphCoordinator<br/>compact_distillation · consolidation · vault_ingest"]
     end
 
-    Retrieval["recall / search<br/>personal · combined · both"]
-    Governance["learn → candidate_packets → resolve"]
-    Handoff["handoff leases"]
-    Plans["thread surface — minni_thread_*"]
-    Team["team surface — minni_team_*"]
+    Retrieval["Repo-First recall / search + Living Repo Maps<br/>personal · combined · both"]
+    Governance["learn → candidate_packets → resolve<br/>memory_links + automatic supersession"]
+    Handoff["1-step handoff leases"]
+    Plans["Compact Threads — 4 minni_thread_* tools"]
 
-    Vaults["Per-agent Markdown vaults<br/>raw / wiki / logs / schema / inbox / outbox"]
-    Inbox["vault inbox/<br/>compact_summary packets"]
+    Vaults["Per-agent Markdown vaults<br/>layer1 / wiki / logs / schema / inbox / outbox"]
+    Inbox["vault inbox/<br/>compact_summary &amp; stop packets"]
     Personal[("Personal index<br/>&lt;agent&gt;-vault/.index/")]
-    Shared[("Shared ~/.minni/minni.db + FAISS")]
+    Shared[("Shared ~/.minni/minni.db + FAISS + TODAY.md<br/>repo_map_cards · learnings · memory_links")]
 
     Host -.->|host fires hooks| Hooks
-    Host -->|agent calls tools| Plugin
-    Hooks -->|search RPC| Daemon
-    Hooks -.->|injected context| Host
+    Host -->|12 MCP tools| Plugin
+    Hooks -->|read / search RPC| Daemon
+    Hooks -.->|context-only injection| Host
     Hooks -->|PostCompact summary, deduped| Inbox
-    Plugin --> Daemon
+    Plugin -->|JSON-RPC + gate.shared| Daemon
     Plugin --> Plans
-    Plugin --> Team
-    Plugin -->|vault_write| Vaults
-    CLI --> Daemon
+    Plugin -->|vault-first learn notes &amp; audit| Vaults
+    CLI -->|JSON-RPC / read-only SQLite| Daemon
     CLI -->|watch tails log.md| Vaults
-    Team -->|gate.shared, prepare_task| Daemon
-    Plans -->|plan notes, _active_plan.json| Vaults
-    Hooks -->|reads the active plan| Vaults
+    Plans -->|locked plan-*.md, active-thread.d/| Vaults
+    Hooks -->|reads active plan &amp; layer1/core.md| Vaults
 
     Daemon --> Gate
     Gate --> Retrieval
@@ -69,89 +67,80 @@ flowchart TD
 
 One daemon per host; one plugin process per agent runtime; for daemon-mediated
 operations, identity is stamped server-side (`EffectivePrincipal`, the single
-source of identity) — callers cannot claim capabilities. Plugin-local vault and
-audit writes do not cross this boundary; see
+source of identity) — callers cannot claim capabilities. Plugin-local vault-note
+and audit writes do not cross this boundary; see
 [security](security.md#identity-and-capability-gating).
 
 ## Components
 
 | Component | Responsibility |
 |---|---|
-| `src/minni/minnid.py` | JSON-RPC daemon, dispatch, policy, storage, status |
-| `src/minni/principal.py` | Identity resolution, vault roots, capabilities, read authorization |
-| `src/minni/retrieval.py` (`trie_index.py`, `fts_search.py`, `semantic_rerank.py`) | Hybrid Tier 1 Trie + Tier 2 FTS5 BM25 (`mode="fast"`) + FAISS/RRF/Cross-Encoder rerank retrieval path, personal/shared leg merge |
-| `src/minni/db.py` | Shared SQLite schema and migrations |
+| `src/minni/minnid.py` | JSON-RPC daemon, dispatch, policy, storage, status, and background `TODAY.md` sweeps |
+| `src/minni/principal.py` | Identity resolution, vault roots, capabilities, and workspace/privacy read authorization |
+| `src/minni/retrieval.py` (`trie_index.py`, `fts_search.py`, `semantic_rerank.py`) | Repo-First hybrid Tier 1 Trie (`< 0.5 ms`) + Tier 2 FTS5 BM25 (`< 10 ms` `mode="fast"`) + FAISS/RRF/Cross-Encoder rerank with strict confidence floor across all hits |
+| `src/minni/repo_map.py` | Living Repo Maps (`minni map`) synthesizing file-and-SHA-pinned Subsystem Cards (`~/.minni/vault/maps/<workspace>/` + `repo_map_cards`) with git-diff staleness stamps |
+| `src/minni/graph_coordinator.py` (`edge_classifier.py`, `graph_expansion.py`) | Typed memory graph (`updates`, `contradicts`, `extends`, `relates` in `memory_links` / `learning_links`) and automatic supersession |
+| `src/minni/today_digest.py` | Auto-maintained plain-Markdown `~/.minni/TODAY.md` (`0600`) operator digest |
+| `src/minni/db.py` | Shared SQLite schema and migrations (`workspace_id`, `repo_map_cards`, `memory_links`, `candidate_packets`, `handoff_leases`) |
 | `src/minni/afm_passes/` | Background curation passes (see [concepts](concepts.md#the-afm-pass-pipeline)) |
-| `src/minni/minni_cli.py` | Newcomer lifecycle CLI: `up` / `down` / `status` / `doctor` |
-| `plugins/minni/src/server.ts` | MCP tool registration and request shaping |
-| `plugins/minni/src/hook-handlers.ts` | Shared hook semantics for runtimes that support hooks |
-| `plugins/minni/src/plan.ts` | Durable plan artifacts and state transitions |
-| `plugins/minni/src/vault.ts` | Vault writes, inbox/outbox, compile surfaces |
+| `src/minni/minni_cli.py` | Stdlib-only first-class CLI: `up`, `down`, `status`, `activity`, `map`, `recall`, `learn`, `doctor`, `watch`, `wire`, `wire-adopt`, `sync` |
+| `plugins/minni/src/server.ts` | 12-tool MCP registration, compact `< 2 KB` Thread payload enforcement, and request shaping |
+| `plugins/minni/src/hook-handlers.ts` & `agent_envelope.ts` | Non-blocking host hooks, Two-Part Permanent Boot Shelf (`layer1/core.md` up to `24 KB` + `project_shelf` `<= 2,500` chars), and `PostCompact` shelf recovery |
+| `plugins/minni/src/plan.ts` & `thread-notification-relay.ts` | Durable plan artifacts, file-locked slice transitions, per-session active pointers, and `<agent>:<sessionKey>` relay cursors |
+| `plugins/minni/src/vault.ts` | Vault-first learning notes, inbox/outbox packets, audit trail, and offline lexical fallback |
 
 ## Data model
 
 | Surface | Contents |
 |---|---|
-| Shared `~/.minni/minni.db` (SQLite, FTS5, WAL) | learnings, episodic/contradiction events, candidates, handoff leases, migrations, runtime metadata — plus the pooled `documents` + `chunk_embeddings` (the shared retrieval leg) |
-| Shared FAISS | vector index for the shared document leg |
-| Per-agent `<agent>-vault/.index/` | `vault.db` (chunk text, embeddings, resolved `[[wikilink]]` edges) + `vault.faiss` + `vault.manifest.json`, built by `vault_ingest` from that agent's `wiki/**/*.md` |
-| Vault `raw` / `wiki` / `logs` / `schema` / `inbox` / `outbox` (`wire/writers.py:576`) | the human-readable surfaces: synthesis pages and notes; candidate drafts and hook packets; outgoing handoffs; append-oriented audit trail |
+| Shared `~/.minni/minni.db` (SQLite, FTS5, WAL) | `workspace_id`-scoped `learnings` and `documents`, `repo_map_cards`, typed `memory_links` / `learning_links`, `candidate_packets`, `handoff_leases`, episodic/contradiction events, migrations, and `chunk_embeddings` |
+| Shared FAISS & Tier 1 Trie | Vector index and in-memory lexical Trie for the shared document leg |
+| Living Repo Maps (`~/.minni/vault/maps/<workspace>/`) | Subsystem Map Cards (`*.md`) and `_index.json` pinned to owning file paths and `git` HEAD SHA, indexed into SQLite + live FAISS/Trie |
+| Human digest (`~/.minni/TODAY.md`, mode `0600`) | Auto-maintained plain-Markdown summary of system health, genuine rule conflicts, live sessions/plans/handoffs, 24h project learnings/scars, and map freshness |
+| Per-agent `<agent>-vault/.index/` | `vault.db` (chunk text, embeddings, resolved `[[wikilink]]` edges) + `vault.faiss` + `vault.manifest.json`, built from that agent's `wiki/**/*.md` |
+| Vault `layer1` / `wiki` / `logs` / `schema` / `inbox` / `outbox` / `.runtime` | Standing agent identity (`layer1/core.md`), synthesis/plan/session notes, append-oriented audit trail (`log.md`), hook/candidate inbox packets, outgoing handoffs, and session-scoped runtime pointers |
 
 Recall scope semantics and provenance are covered in
 [concepts — two-tier storage](concepts.md#two-tier-storage).
 
-## MCP tools (literal names)
+## MCP tools (12-tool v1 surface)
 
-These are the registered tool names in `plugins/minni/src/server.ts` — call
-them exactly as written (there is no family/action dispatch layer):
+`plugins/minni/src/server.ts` registers exactly **12 self-explanatory MCP tools** — call them literally as written (there is no family/action dispatch layer, and pre-v1 orchestration/vault/audit tool aliases have been retired in favor of these 12 tools and the `minni` CLI):
 
-| Area | Tools |
-|---|---|
-| Session lifecycle | `minni_prepare_task`, `minni_prepare_outcome` |
-| Recall | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
-| Learning | `minni_learn`, `minni_learning_quality`, `minni_list_candidates`, `minni_resolve_candidate` |
-| Vault | `minni_vault_write`, `minni_compile_vault` |
-| Threads | `minni_thread_create`, `minni_thread_update`, `minni_thread_scar`, `minni_thread_status`, `minni_thread_replan`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_activate`, `minni_thread_deactivate`, `minni_thread_ready`, `minni_thread_assign`, `minni_thread_claim`, `minni_thread_worker_update`, `minni_thread_events` (16 tools — the pre-rename `minni_plan_*` aliases have been removed; only the `minni_thread_*` names are registered) |
-| Handoff | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_list_pending_handoffs`, `minni_await_handoff` |
-| Agent ping | `minni_ping_agent_request`, `minni_ping_agent_inbox`, `minni_ping_agent_decide`, `minni_ping_agent_status` |
-| Team mode | `minni_team_runtime`, `minni_team_evidence`, `minni_team_promotion` |
-| Ops & audit | `minni_status`, `minni_audit_report`, `minni_audit_tail`, `minni_subscribe_contradictions` |
+| Group | Tool | Purpose |
+|---|---|---|
+| **Core Memory & Repo Context (6)** | `minni_recall` | Repo-First hybrid search across Living Repo Maps, project docs, learnings, and scars |
+| | `minni_drill` | Expand `m:<8hex>` handles, `d:<src>:<id>` refs, chunk/result IDs, or wikilinks (including repo-map path wikilinks and typed `memory_links`) |
+| | `minni_learn` | Vault-first quality/secret gate + candidate staging or durable workspace-tagged storage |
+| | `minni_list_candidates` | List pending `proposed` learning candidates scoped to the caller principal |
+| | `minni_resolve_candidate` | Accept, reject, redact, merge, or supersede staged candidates |
+| | `minni_status` | Snapshot of daemon health, AFM provider state, vault path, audit summary, and 7-day recall-to-use stats |
+| **Handoff (2)** | `minni_handoff_send` | 1-step session or cross-agent handoff packet (`< 1 KB` lease receipt) |
+| | `minni_handoff_inbox` | Preview pending handoffs addressed to this agent and acknowledge a `lease_id` or inline-clear (`ack: true`) |
+| **Threads / Shared Plans (4)** | `minni_thread_create` | Create a shared multi-slice plan in the vault (`< 2 KB` receipt, per-session `activate`) |
+| | `minni_thread_status` | Read compact `< 2 KB` plan progress, next action, capped scar previews, and optional shelf drift |
+| | `minni_thread_update` | Advance slice status under file lock (`< 2 KB` compact response, no worker lease tokens, `depends_on` & `evidence` enforced) or toggle per-session `activate` |
+| | `minni_thread_scar` | Record a `failed_command`, `dead_end`, or `rejected_hypothesis` (`< 1 KB` receipt) and promote workspace scar context |
 
-### Thread tool separation & execution boundaries
+### Thread execution & multi-session isolation
 
-- **Team projection**: `minni_team_runtime` projects one vault Thread (`plan_id` + `rev` + `readySlices` after the expiry sweep). `plan_id` present reads that Thread and fails if it is missing. `plan_id` absent creates one Thread. Leftover `taskLedger` is a view of `ready`. `ledgerFor` and the compat invented-ready chain are gone. The coordinator id is stamped server-side (G11).
-- **Orchestrator tools**: `minni_thread_create`, `minni_thread_replan`, `minni_thread_assign` (passes `worker_agent_id`, setting durable slice field `assigned_to`), `minni_thread_ready`, `minni_thread_events`, `minni_thread_update`, `minni_thread_status`, `minni_thread_scar`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_activate`, `minni_thread_deactivate`. The orchestrator manages graph topology, assigns slices, checks ready work units (`pending`, `in_progress`, `blocked` with satisfied dependencies and no live claim), and polls the journal.
-- **Worker tools & packet**: `minni_thread_claim` (acquires lease and returns lease `token`), `minni_thread_worker_update` (mutates claimed slice state; proposes expansions/contractions via `propose_structure`). After assign → claim, the library adapter `buildWorkerPacketAfterClaim` copies `ThreadClaimResponse` (`plan_id`, `slice_id`, `generation`, `token` as `claim_token`) plus that slice, thread goal/constraints, completed-dep evidence refs, bounded `prepare_task` recall (G11: `DEFAULT_AGENT_ID`), and the allowed mutations. The packet is not built inside `minni_team_runtime`, not before claim, and is not a new MCP tool. Workers interact via `minni_thread_worker_update` only. Action `start` transitions any claimed non-terminal worker-updatable slice (`pending`, `in_progress`, or `blocked`) to `in_progress` (slice statuses are `pending`, `in_progress`, `done`, `blocked`, `superseded`; there is no `assigned` status).
-- **Ordered event cursors**: `minni_thread_events(plan_id?, since_seq?, limit?)` reads append-only events from `plan-*.log.md` starting after `since_seq` for polling, state catch-up, and crash recovery. A prefix drop or a cursor-path tail bound is a `journal_truncated` / `cursor_gap` event with `last_dropped_seq` + `first_kept_seq`. An unmarked hole is `THREAD_CURSOR_GAP`, not a silent jump. Seq is never renumbered. The cursor reads a byte-bounded tail; if that tail cannot name those bounds, or bounding would hide a hole, it full-parses instead of inventing a gap. Mutation still full-parses.
-- **Authority boundary & honest limits**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction depends on host tool exposure/scoping. Claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is strictly enforced by the Thread engine regardless of caller principal. Wave 3 `dispatchWorkerPacket` is honesty-only (library, not MCP): grok worker-start is MISSING, default agy allowlist is CANNOT, Codex is UNPROVEN, and `spawned` is always false. Completion is `minni_thread_worker_update`. The named agy worker allowlist exists as `minni_thread_worker_update` only; default dispatch stays CANNOT and `spawned` stays false. G3 is a notification relay, not a second graph: the plugin writes delivery cursors / pending attention to `.runtime/thread-relay/cursors.json` on journal append and rebuilds the queue from journal seq. SQLite `thread_delivery_cursors` (020) is unused; minnid does not ingest. Cursor advances monotonically on successful delivery only (fail-closed). Hooks are fallback readers of pending attention and do not poll `minni_thread_events`. Immediate wake is unsupported (not wet-tested); agy/grok deferred via existing wire (agy SessionStart + PreInvocation injectSteps, Stop rejects; grok SessionStart/UPS ignored, Stop injects, boot `~/.grok/rules`); Codex SessionStart + UPS, Stop cannot, UNPROVEN; Cursor is out. G2 in-session complete is not a spawn. Automatic spawning and grok worker-start are not implemented. `GROK_WORKER_START` stays null.
+- **Compact, lock-serialized mutations**: `minni_thread_create`, `minni_thread_status`, and `minni_thread_update` enforce a `< 2 KB` compact response budget (`serializeCompactBudget`), keeping full `scar_tissue` history on disk (`plan-*.md` + `plan-*.log.md`) unless `include_full_plan: true` is explicitly requested. `minni_thread_update` serializes writes under `withThreadPlanLock` with zero worker claim tokens or idempotency keys, requiring `evidence` before marking a slice `done` and enforcing `depends_on` unless `force` and a non-empty `force_reason` are supplied.
+- **Per-session active pointers & notification relay**: Concurrent windows of the same principal isolate their active plan pointers under `<vault>/.runtime/active-thread.d/<sessionKey>.json` (preserving the frozen `_active_plan.json` mirror when single-session) and track journal events through composite `<agent>:<sessionKey>` relay cursors (`.runtime/thread-relay/cursors.json`, paired with `src/minni/thread_relay.py`). Hooks read pending attention deltas without polling separate event tools; dead-session pointers and cursors are swept automatically while preserving durable plan Markdown files.
 
 ## Observability
 
 The `status` RPC returns daemon and engine health plus operational metrics
-(per-method `latencies`, an `errors` count, `counters`) in its JSON payload;
-`health_report` adds deeper diagnostics (stale docs, never-recalled docs,
-contradicting learnings, vector-backend sync lag), redacted to aggregate
-counts unless the caller is a stamped operator. The `minni status` CLI and
-`minni_status` MCP tool render human-readable summaries of the same data.
+(per-method `latencies`, `errors`, `counters`); `health_report` adds deeper
+diagnostics (index freshness, decay coverage, contradicting learnings,
+vector-backend sync lag), redacted to aggregate counts unless the caller is a
+stamped operator. Operators inspect live state without any localhost web UI
+server via `minni status` (4-line plain-English overview + latencies),
+`minni activity` and `~/.minni/TODAY.md` (`0600` daily digest), `minni watch`
+(live vault + daemon event tail), `minni doctor` (end-to-end socket, recall,
+cache, and 9-host fleet drift checks), and the `minni_status` MCP tool.
 
-## Continuity
+## Continuity & Non-Blocking Hooks
 
-Startup hooks inject compact identity, active **thread** state
-(`active_thread` / `active_thread_ref`; on-disk `_active_plan.json` remains
-the frozen pointer filename), correction re-assertions, and bounded
-inbox/candidate state. On Claude Code, the `<minni:context>` envelope carries
-the lifecycle spine (`prepare_task → prepare_outcome → thread → learn`), backed
-by a deny-capable `PreToolUse` recall-guard backstop. Several hosts expose
-pre-tool **deny capability** (Claude, Kilo, Cursor, Grok, Antigravity/agy;
-Codex is Bash-only). **Live Minni s6 cold-tool guard** (file-backed
-recall-state + adapter/tool map that actually denies Grep/Read/Glob-class
-calls) is complete on Claude Code, agy, and Kilo. Grok Build and Cursor are
-**PARTIAL**: host deny and adapters exist (`grok-adapter.ts` maps camelCase +
-natives — capability, not liveness), but UPS inject is dropped so leftover
-`consumed=false` cannot deny — host deny ≠ Minni s6 liveness. Registration or
-host deny alone is not enough — Codex registers PreToolUse but cannot gate
-cold-file tools. Full matrix:
-[docs/contracts/hook-platforms.md](contracts/hook-platforms.md). Operator
-knobs: `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables) and
-`MINNI_RECALL_GUARD_MODE` (`off` / `soft` / `strict`); the guard fails open —
-a state-write failure never blocks the turn.
+- **Two-Part Permanent Boot Shelf (`SessionStart` / `SubagentStart`)**: `fitEnvelope` loads (1) the **Agent Permanent Shelf** (`layer1/core.md` up to `24 KB` un-truncated, sized against JSON-serialized headroom) for standing identity and rules, and (2) the **Project Permanent Shelf** (`project_shelf`, `<= 2,500` chars) with the current repository's Subsystem Map Cards, git-diff staleness notices, top active scars, and active plan summary — exempt from proportional floor crushing, with one-shot `PostCompact` -> `UserPromptSubmit` shelf recovery after compaction.
+- **Lifecycle spine**: On Claude Code, `<minni:context>` carries the compact v1 lifecycle spine (`recall → drill → thread → learn`), configurable via `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables).
+- **Strictly non-blocking hooks across all hosts**: Hooks across Claude Code, Codex, Gemini/Antigravity, Grok Build, Cursor, and Kilo Code inject context only and **never** emit `permissionDecision: "deny"` or block `Read`, `Grep`, `Glob`, `Bash`, or edit calls. When strong recall for a turn is unconsulted, `PreToolUse` (`MINNI_RECALL_GUARD_MODE` = `off` / `soft` / `strict`) attaches up to 3 top hits non-blockingly via `hookSpecificOutput.additionalContext` (`continue: true`) once per arming on hosts declaring `preToolUseContext: true` (Claude Code), and records non-blocking telemetry (`{continue: true}`) on all other hosts. `UserPromptSubmit` skips synthetic `<task-notification>`, `<SYSTEM_MESSAGE>`, `[Message] timestamp=`, and `<background-task>` wakeups, while `PostToolUse` restricts failure-lesson checks strictly to file edits and failed commands. Full per-host hook matrix: [docs/contracts/hook-platforms.md](contracts/hook-platforms.md).

@@ -79,7 +79,7 @@ def test_ingest_inserts_eligible_candidates_as_proposed(tmp_path):
         c.execute("SELECT * FROM candidate_packets WHERE principal='codex'")
         row = dict(c.fetchone())
     assert row["status"] == "proposed"
-    assert row["workspace_id"] == "/work/proj"
+    assert row["workspace_id"] == "workspace-proj"
     assert row["instruction_like"] == 0
     df = json.loads(row["derived_from"])
     assert df["source"] == "inbox" and df["inbox_file"] == "a.json"

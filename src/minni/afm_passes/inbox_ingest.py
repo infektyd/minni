@@ -81,6 +81,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from minni.config import normalize_workspace_scope
 from minni.safety import is_instruction_like
 
 # Canonical, agent-neutral format tag for stop-candidate inbox files. The
@@ -735,7 +736,7 @@ def _scan_inbox(
 
         log_only_set = _as_str_set(doc.get("log_only"))
         dns_set = _as_str_set(doc.get("do_not_store"))
-        ws = doc.get("workspace_id") or "default"
+        ws = normalize_workspace_scope(doc.get("workspace_id"), default="default")
         # Explicit non-empty privacy is preserved. Missing, null, or blank
         # values are treated as "writer decision: safe" — never re-introduce
         # SQL NULL (that is what permanently parked the backlog after 53da3bd).

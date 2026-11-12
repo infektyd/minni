@@ -84,6 +84,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from minni.afm_provider import resolve_afm_mode
+from minni.config import normalize_workspace_scope
 from minni.model_provider import default_provider_chain
 from minni.safety import is_instruction_like
 from minni.afm_passes.inbox_archive import archive_inbox_file
@@ -601,7 +602,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 )
             raw_privacy = doc.get("privacy_level", "safe")
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
-            workspace = doc.get("workspace_id") or "default"
+            workspace = normalize_workspace_scope(doc.get("workspace_id"), default="default")
             for idx, content, afm_used in insert_slots:
                 to_insert.append({
                     "principal": principal,

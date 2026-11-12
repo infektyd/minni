@@ -116,7 +116,7 @@ export function routeMemoryIntent(task: string): MemoryIntent {
       confidence: 0.88,
       automaticAllowed: false,
       reason: "The task asks for a visible Obsidian/wiki note.",
-      suggestedTool: "minni_vault_write",
+      suggestedTool: "minni_learn",
       suggestedQuery: conciseQuery(task),
     };
   }
@@ -126,7 +126,7 @@ export function routeMemoryIntent(task: string): MemoryIntent {
       confidence: 0.84,
       automaticAllowed: true,
       reason: "The task asks for transparent memory logs or audit state.",
-      suggestedTool: "minni_audit_tail",
+      suggestedTool: "minni_status",
       suggestedQuery: conciseQuery(task),
     };
   }

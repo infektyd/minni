@@ -124,27 +124,35 @@ async function main() {
     try {
       await client.connect(transport);
       const tools = await client.listTools();
-      assert.ok(tools.tools.some((tool) => tool.name === "minni_prepare_task"));
-      assert.ok(tools.tools.some((tool) => tool.name === "minni_prepare_outcome"));
-      const result = await client.callTool({
-        name: "minni_prepare_task",
+      assert.equal(tools.tools.length, 12, `expected 12 v1 MCP tools, got ${tools.tools.length}`);
+      assert.ok(tools.tools.some((tool) => tool.name === "minni_recall"));
+      assert.ok(tools.tools.some((tool) => tool.name === "minni_status"));
+      assert.ok(!tools.tools.some((tool) => tool.name === "minni_prepare_task"));
+      assert.ok(!tools.tools.some((tool) => tool.name === "minni_prepare_outcome"));
+      const recallResult = await client.callTool({
+        name: "minni_recall",
         arguments: {
-          task: "live MCP prepare task using v0 adapter",
-          useAfm: true,
-          budgetTokens: 2000,
-          vaultPath: root,
+          query: "live MCP recall check on 12-tool v1 server",
           limit: 2,
         },
       });
-      const text = result.content?.[0]?.text;
-      assert.equal(typeof text, "string");
-      const mcpPacket = JSON.parse(text);
-      assert.equal(mcpPacket.afm.used, true, mcpPacket.afm.error);
+      const recallText = recallResult.content?.[0]?.text;
+      assert.equal(typeof recallText, "string");
+      assert.ok(recallText.length > 0);
+      const statusResult = await client.callTool({
+        name: "minni_status",
+        arguments: {},
+      });
+      const statusText = statusResult.content?.[0]?.text;
+      assert.equal(typeof statusText, "string");
+      const statusJson = JSON.parse(statusText);
+      assert.equal(typeof statusJson.agentId, "string");
       evidence.mcp = {
         toolCount: tools.tools.length,
-        hasPrepareTask: true,
-        hasPrepareOutcome: true,
-        packet: summarizePacket(mcpPacket),
+        hasRecall: true,
+        hasStatus: true,
+        recallLength: recallText.length,
+        agentId: statusJson.agentId,
       };
     } finally {
       await client.close();

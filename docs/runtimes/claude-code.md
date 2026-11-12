@@ -33,18 +33,20 @@ first-time identity and vault seeding.
 
 Claude Code is the most deeply integrated runtime:
 
-- Session hooks inject the `<minni:context>` envelope with identity, active
-  thread/plan state, correction re-assertions, and the lifecycle spine
-  (`prepare_task → prepare_outcome → thread → learn`).
-- A deny-capable `PreToolUse` **recall guard** nudges recall before tool use.
-  Host **deny capability** is broader than Claude (Kilo, Cursor, Grok,
-  Antigravity/agy also expose pre-tool deny; Codex deny is Bash-only). **Live
-  Minni s6 cold-tool guard** (adapter + tool map + file-backed recall-state)
-  is complete on Claude Code, agy, and Kilo. Grok Build and Cursor are
-  **PARTIAL**: host deny ≠ s6 liveness; UPS inject is dropped so leftover
-  `consumed=false` cannot deny. Registration or host deny alone is not
-  enough. Claude remains the deepest integration (all-tool coverage + full
-  envelope). Full matrix:
+- `SessionStart` and `SubagentStart` hooks inject the `<minni:context>` envelope
+  with the **Two-Part Permanent Boot Shelf** — `layer1/core.md` (up to `24 KB`
+  un-truncated) plus `project_shelf` (`<= 2,500` chars of Living Repo Map
+  subsystem cards, git-diff staleness notices, top scars, and active plan
+  summary) — alongside correction re-assertions, `PostCompact` one-shot shelf
+  recovery, and the v1 lifecycle spine (`recall → drill → thread → learn`).
+- **Strictly non-blocking hooks (`PreToolUse`, `UserPromptSubmit`, `PostToolUse`)**:
+  `PreToolUse` never emits `permissionDecision: "deny"` or blocks `Read`, `Grep`,
+  `Glob`, `Bash`, or edit calls. Because Claude Code supports
+  `preToolUseContext: true`, unconsulted strong recall hits and matched failure
+  lessons are surfaced once per arming via `hookSpecificOutput.additionalContext`
+  (`continue: true`). `UserPromptSubmit` skips `<task-notification>` / background
+  wakeup payloads, and `PostToolUse` scopes failure-lesson checks strictly to
+  file edits and failed commands. Full per-host matrix:
   [docs/contracts/hook-platforms.md](../contracts/hook-platforms.md). Knobs:
   `MINNI_RECALL_GUARD_MODE` (`off`/`soft`/`strict`),
   `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables). The guard fails open.

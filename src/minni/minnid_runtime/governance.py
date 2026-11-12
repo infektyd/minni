@@ -337,7 +337,9 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
 
         with wb.db.cursor() as c_pre:
             if not supersedes and contradicts_id is None:
-                existing = find_active_learning_by_hash(c_pre, _chash, agent_id)
+                existing = find_active_learning_by_hash(
+                    c_pre, _chash, agent_id, workspace_id=ws
+                )
                 if existing is not None:
                     existing_lid = int(existing["learning_id"])
                     if _have_hash_col:
@@ -414,7 +416,9 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                             )
                         )
                 if not supersedes and contradicts_id is None:
-                    existing = find_active_learning_by_hash(c, _chash, agent_id)
+                    existing = find_active_learning_by_hash(
+                        c, _chash, agent_id, workspace_id=ws
+                    )
                     if existing is not None:
                         existing_lid = int(existing["learning_id"])
                         if _have_hash_col:
@@ -620,6 +624,7 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                     content=content,
                     exclude_learning_id=lid,
                     embedding=emb_bytes,
+                    workspace_id=ws,
                 )
                 for dup_lid in near_dups:
                     if supersedes and int(dup_lid) == int(supersedes):
@@ -1877,7 +1882,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             with db.transaction() as c:
                 cid = _stage_proposal(c)
                 if auto_accept and chash is not None:
-                    if has_active_learning_hash(c, chash, principal.agent_id):
+                    if has_active_learning_hash(c, chash, principal.agent_id, workspace_id=ws):
                         auto_accept = False
                         withheld = ["duplicate of an existing learning"]
                 if auto_accept:
@@ -2005,6 +2010,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         content=stored_content,
                         exclude_learning_id=lid,
                         embedding=emb_bytes,
+                        workspace_id=ws,
                     )
                     for dup_lid in near_dups:
                         if int(dup_lid) in linked_lids or int(dup_lid) in graph_superseded_lids:
@@ -2413,9 +2419,8 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                         pre_cat = (
                             pre_raw_cat if pre_raw_cat in _PRE_CATEGORIES else "general"
                         )
-                        pre_ws = (
-                            str(pre_d.get("workspace_id") or "default").strip()
-                            or "default"
+                        pre_ws = normalize_workspace_scope(
+                            pre_d.get("workspace_id"), default="default"
                         )
                         pre_cols = {
                             r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
@@ -2638,10 +2643,14 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 # their status yet so `_revalidate_target` inside
                 # `commit_prepared_learning` continues to see active targets;
                 # they are superseded/evicted after `lid` is committed below.
-                for ex_lid in find_active_learning_ids_by_hash(c, _chash, author_agent):
+                cand_ws = normalize_workspace_scope(
+                    rowd.get("workspace_id"), default="default"
+                )
+                for ex_lid in find_active_learning_ids_by_hash(
+                    c, _chash, author_agent, workspace_id=cand_ws
+                ):
                     if ex_lid not in existing_lids:
                         existing_lids.append(ex_lid)
-                cand_ws = str(rowd.get("workspace_id") or "default").strip() or "default"
                 commit_res = None
                 committed_edges: list[Any] = []
                 graph_superseded_lids: list[int] = []
@@ -2766,6 +2775,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     category=cat,
                     content=content,
                     exclude_learning_id=lid,
+                    workspace_id=cand_ws,
                 )
                 for dup_lid in near_dups:
                     if (
@@ -2850,7 +2860,9 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     pass
 
         indexed_ok = True
-        cand_ws_resolved = str(rowd.get("workspace_id") or "default").strip() or "default"
+        cand_ws_resolved = normalize_workspace_scope(
+            rowd.get("workspace_id"), default="default"
+        )
         if lid is not None:
             try:
                 wb_opt = context.lazy_writeback() if callable(context.lazy_writeback) else None

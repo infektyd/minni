@@ -140,7 +140,7 @@ async function startLargeFakeDaemon(socketPath) {
 }
 
 test(
-  "SessionStart enforces token budget (<= 4000) and 10,000-char inline cap with 4 large results + 8 KB shelf",
+  "SessionStart enforces token budget (<= 4000) and 10,000-char inline cap on standard shelves while preserving 8 KB Permanent Shelf without inline_trim (BUG-67)",
   { timeout: 120_000 },
   async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sm-s2a-budget-"));
@@ -156,7 +156,7 @@ test(
       { length: 32 },
       (_, i) => `## Section ${i + 1}\n${"Durable rule and operational invariant text. ".repeat(5)}`,
     ).join("\n\n");
-    await writeFile(path.join(vault, "layer1", "core.md"), paragraphs.slice(0, 8000), "utf8");
+    await writeFile(path.join(vault, "layer1", "core.md"), paragraphs.slice(0, 1500), "utf8");
 
     const auditLines = Array.from({ length: 20 }, (_, i) =>
       JSON.stringify({
@@ -214,6 +214,29 @@ test(
       assert.equal(typeof entry.from, "number", `${section}.from must be a number`);
       assert.equal(typeof entry.to, "number", `${section}.to must be a number`);
     }
+
+    // BUG-67: an 8 KB (<= 24 KB) Permanent Shelf raises sessionStartCharLimit to permanentShelfSerializedChars + 8_000 so core.md is preserved whole without inline_trim
+    const shelf8k = paragraphs.slice(0, 8000);
+    await writeFile(path.join(vault, "layer1", "core.md"), shelf8k, "utf8");
+    const res8k = await runHook(
+      CLAUDE_HOOK,
+      "SessionStart",
+      { session_id: "sess-budget-enforced-8k", cwd: root },
+      {
+        MINNI_HOME: home,
+        MINNI_CLAUDECODE_VAULT_PATH: vault,
+        MINNI_SOCKET_PATH: sockPath,
+        MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+        MINNI_BYPASS_AUDIT_LIMIT: "true",
+        MINNI_CLAUDECODE_HOOKS: "on",
+      },
+    );
+    assert.equal(res8k.code, 0, `hook exited non-zero: ${res8k.stderr}`);
+    const ctx8k = JSON.parse(res8k.stdout)?.hookSpecificOutput?.additionalContext ?? "";
+    const parsed8k = parseEnvelopeFromContext(ctx8k);
+    assert.equal(parsed8k.body.layer1_shelf.inline_trim, undefined, "8 KB Permanent Shelf must not be crushed to boot form");
+    assert.equal(parsed8k.body.layer1_shelf.content, shelf8k);
+    assert.ok(Number(parsed8k.attrs.tokens) <= Number(parsed8k.attrs.budget));
   },
 );
 

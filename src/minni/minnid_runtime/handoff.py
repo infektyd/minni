@@ -106,7 +106,7 @@ def slugify(text: str) -> str:
 
 def _handoff_wiki_filename(packet: dict, stamp: str) -> str:
     """Date+slug+lease slug still collides when slugify lowercases the PK."""
-    title = packet["task"].strip()
+    title = re.sub(r"[\r\n\t]+", " ", str(packet.get("task") or "")).strip()
     slug = slugify(f"{packet['from_agent']}-to-{packet['to_agent']}-{title}")
     raw = str(packet.get("lease_id") or packet.get("trace_id") or stamp)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
@@ -278,28 +278,45 @@ def validate_handoff_packet(from_agent: str, to_agent: str, packet: Any) -> tupl
     return normalized, None
 
 
+def _yaml_scalar_clean(value: Any) -> str:
+    clean = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    return json.dumps(clean, ensure_ascii=False)
+
+
 def compile_handoff_page(sender_vault: Path, packet: dict, stamp: str) -> Optional[Path]:
     if packet.get("kind") != "handoff":
         return None
-    title = packet["task"].strip()
+    title = re.sub(r"[\r\n\t]+", " ", str(packet.get("task") or "")).strip()
+    yaml_title = json.dumps(title, ensure_ascii=False)
+    from_ag = re.sub(r"[\r\n\t]+", " ", str(packet.get("from_agent") or "")).strip()
+    to_ag = re.sub(r"[\r\n\t]+", " ", str(packet.get("to_agent") or "")).strip()
+    trace_val = re.sub(r"[\r\n\t]+", " ", str(packet.get("trace_id") or "")).strip()
+    created_val = re.sub(r"[\r\n\t]+", " ", str(packet.get("created_at") or "")).strip()
+    envelope_str = str(packet.get("envelope") or "")
+    max_ticks = max((len(m.group(0)) for m in re.finditer(r"`+", envelope_str)), default=0)
+    fence = "`" * max(3, max_ticks + 1)
+
     page_path = sender_vault / "wiki" / "handoffs" / _handoff_wiki_filename(packet, stamp)
-    refs = "\n".join(f"- [[{ref.removesuffix('.md')}]]" for ref in packet.get("wikilink_refs", []))
+    refs = "\n".join(
+        f"- [[{re.sub(r'[\\r\\n\\t]+', ' ', str(ref)).strip().removesuffix('.md')}]]"
+        for ref in packet.get("wikilink_refs", [])
+    )
     page = (
         "---\n"
-        f"title: {title}\n"
+        f"title: {yaml_title}\n"
         "type: handoff\n"
         "status: accepted\n"
         "privacy: safe\n"
-        f"from_agent: {packet['from_agent']}\n"
-        f"to_agent: {packet['to_agent']}\n"
-        f"trace_id: {packet['trace_id']}\n"
-        f"created: {packet['created_at']}\n"
+        f"from_agent: {_yaml_scalar_clean(from_ag)}\n"
+        f"to_agent: {_yaml_scalar_clean(to_ag)}\n"
+        f"trace_id: {_yaml_scalar_clean(trace_val)}\n"
+        f"created: {_yaml_scalar_clean(created_val)}\n"
         "---\n\n"
         f"# {title}\n\n"
-        f"From: `{packet['from_agent']}`\n\n"
-        f"To: `{packet['to_agent']}`\n\n"
+        f"From: `{from_ag}`\n\n"
+        f"To: `{to_ag}`\n\n"
         "## Envelope\n\n"
-        f"```xml\n{packet['envelope']}\n```\n\n"
+        f"{fence}xml\n{envelope_str}\n{fence}\n\n"
         "## Wikilink References\n\n"
         f"{refs or '- None'}\n"
     )
@@ -598,6 +615,7 @@ def store_handoff_lease(packet: dict, inbox_path: Path, outbox_path: Path, conte
                      -- BOTH channels once _known_lease_ids_for_agent started
                      -- excluding any lease_id the DB has ever seen.
                      status = excluded.status,
+                     contradicts_id = excluded.contradicts_id,
                      inbox_path = excluded.inbox_path,
                      outbox_path = excluded.outbox_path,
                      created_at = excluded.created_at,
@@ -930,10 +948,67 @@ def handle_list_pending_handoffs(params: dict, request_id: Any, context: Handoff
     return context.make_response({"agent_id": agent_id, "handoffs": handoffs}, request_id)
 
 
+def _principal_allows_cross_handoff(principal: Any) -> bool:
+    if principal is None:
+        return False
+    agent_id = str(getattr(principal, "agent_id", "") or "").strip()
+    if agent_id in ("main", "operator"):
+        return True
+    caps = {str(c) for c in (getattr(principal, "capabilities", None) or [])}
+    return bool(caps & {"*", "cross_agent", "govern"})
+
+
+def _lease_participants(
+    lease_id: str, *, context: HandoffContext
+) -> tuple[Optional[tuple[str, str]], bool]:
+    """Return ``((from_agent, to_agent), db_ok)`` for ``lease_id`` across SQLite + file channel."""
+    db_ok = True
+    try:
+        db = context.lazy_writeback().db
+        with db.cursor() as c:
+            row = c.execute(
+                "SELECT from_agent, to_agent FROM handoff_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+        if row is not None:
+            return (str(row["from_agent"] or ""), str(row["to_agent"] or "")), True
+    except Exception:
+        db_ok = False
+    for _vault, _path, packet in iter_handoff_files(context=context):
+        if packet.get("lease_id") == lease_id:
+            return (
+                str(packet.get("from_agent") or ""),
+                str(packet.get("to_agent") or ""),
+            ), db_ok
+    return None, db_ok
+
+
 async def handle_await_handoff(params: dict, request_id: Any, context: HandoffContext) -> dict:
     lease_id = str(params.get("lease_id", "")).strip()
     if not lease_id:
         return context.make_error(-32602, "lease_id is required", request_id)
+    principal, err = context.handler_principal(params, request_id)
+    if err:
+        return err
+    cross_allowed = _principal_allows_cross_handoff(principal)
+    if not cross_allowed:
+        participants, db_ok = _lease_participants(lease_id, context=context)
+        if participants is not None:
+            if principal.agent_id not in set(participants):
+                return context.make_error(
+                    -32003,
+                    f"access_denied: caller principal {principal.agent_id!r} is not "
+                    f"authorized to await handoff lease {lease_id!r}",
+                    request_id,
+                )
+        elif db_ok:
+            return context.make_error(
+                -32003,
+                f"access_denied: caller principal {principal.agent_id!r} is not "
+                f"authorized to await handoff lease {lease_id!r}",
+                request_id,
+            )
+
     timeout_ms = max(0, min(int(params.get("timeout_ms", 30000)), 300000))
     deadline = time.time() + (timeout_ms / 1000.0)
     # Dual-channel: a broken SQLite read must not abort file-channel waiting.
@@ -961,12 +1036,30 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
             store_error = exc
             lease = None
         if lease is not None and lease.get("status") not in {None, "pending"}:
+            if not cross_allowed:
+                participants, _ = _lease_participants(lease_id, context=context)
+                if participants is None or principal.agent_id not in set(participants):
+                    return context.make_error(
+                        -32003,
+                        f"access_denied: caller principal {principal.agent_id!r} is not "
+                        f"authorized to await handoff lease {lease_id!r}",
+                        request_id,
+                    )
             return context.make_response({
                 "lease_id": lease_id,
                 "status": lease.get("status"),
             }, request_id)
         file_ack = _file_channel_terminal_ack(lease_id, context=context)
         if file_ack is not None:
+            if not cross_allowed:
+                participants, _ = _lease_participants(lease_id, context=context)
+                if participants is None or principal.agent_id not in set(participants):
+                    return context.make_error(
+                        -32003,
+                        f"access_denied: caller principal {principal.agent_id!r} is not "
+                        f"authorized to await handoff lease {lease_id!r}",
+                        request_id,
+                    )
             return context.make_response(file_ack, request_id)
         if time.time() >= deadline:
             if store_error is not None:

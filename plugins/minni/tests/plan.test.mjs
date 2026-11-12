@@ -663,7 +663,7 @@ test("resolvePlanIdOrActive returns a clear error when nothing is active", async
     const result = await resolvePlanIdOrActive(root, undefined);
     assert.ok("error" in result);
     assert.match(result.error, /no active plan/);
-    assert.match(result.error, /minni_thread_activate/);
+    assert.match(result.error, /minni_thread_update/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -816,7 +816,7 @@ test("every id-less plan tool returns the no-active-plan error end-to-end throug
       const body = JSON.parse(reply.result.content[0].text);
       assert.ok(body.error, `${name}: ${JSON.stringify(body)}`);
       assert.match(body.error, /no plan_id provided and no active plan/, name);
-      assert.match(body.error, /minni_thread_activate/, name);
+      assert.match(body.error, /minni_thread_update/, name);
       id += 1;
     }
   } finally {

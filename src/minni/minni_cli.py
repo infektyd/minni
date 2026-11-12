@@ -649,6 +649,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Fail doctor on daemon deploy lag and on audit_host_propagation_health drift.
     try:
         from minni.minnid_runtime.deploy_honesty import deploy_status
+        from minni.wire.gc import format_restart_host_apps_notice
         from minni.wire.health import audit_host_propagation_health
 
         local_deploy = deploy_status()
@@ -682,14 +683,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         health_failed = bool(
             health.drifted_surfaces
             or health.uncatalogued_refs
-            or health.running_stale_servers
             or (has_current and not health.current_valid)
         )
         deploy_stale = (
             deploy.get("stale") is True
             or plugin.get("stale") is True
-            or bool(deploy.get("running_stale_servers"))
         )
+        stale_servers: list[dict[str, object]] = []
+        seen_stale_keys: set[tuple[object, object, object]] = set()
+        for srv in list(health.running_stale_servers or []) + list(deploy.get("running_stale_servers") or []):
+            if not isinstance(srv, dict):
+                continue
+            skey = (srv.get("pid"), srv.get("host"), srv.get("path"))
+            if skey not in seen_stale_keys:
+                seen_stale_keys.add(skey)
+                stale_servers.append(srv)
+
         if deploy_stale or health_failed:
             failures += 1
             reason = deploy.get("reason") or plugin.get("reason") or "host propagation drift or deploy lag"
@@ -704,13 +713,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 )
             for ref in health.uncatalogued_refs:
                 print(f"         uncatalogued ref: {ref.get('path')} ({ref.get('reason')})")
-            for srv in health.running_stale_servers:
+            for srv in stale_servers:
                 print(
                     f"         stale MCP server: pid={srv.get('pid')} "
                     f"version={srv.get('version')} sha={srv.get('git_sha')}"
                 )
             print("         Fix: minni sync          # redeploy plugin to all wired hosts")
             print("              minni sync --full   # editable checkout: also git pull + rebuild")
+        elif stale_servers:
+            # H36 sibling parity: running MCP servers spawned before sync only need a host-app restart.
+            warns += 1
+            notice = (
+                format_restart_host_apps_notice(stale_servers)
+                or "restart host apps holding pre-sync MCP server PIDs"
+            )
+            print(f"  [WARN] fleet: {notice}")
+            for srv in stale_servers:
+                host_lbl = srv.get("host") or "unknown"
+                print(
+                    f"         stale MCP server: host={host_lbl} pid={srv.get('pid')} "
+                    f"version={srv.get('version')} sha={srv.get('git_sha')}"
+                )
         else:
             print("  [PASS] fleet: plugin/daemon and host surfaces healthy")
     except Exception as exc:
@@ -775,7 +798,7 @@ def _normalize_cli_workspace(raw: str | None) -> str:
     base = os.path.basename(stripped).lower()
     if base.startswith("workspace-"):
         base = base[len("workspace-") :]
-    sanitized = re.sub(r"[^a-z0-9_-]", "-", base)
+    sanitized = re.sub(r"[^a-z0-9._-]+", "-", base)
     sanitized = re.sub(r"-+", "-", sanitized).strip("-")
     if not sanitized or sanitized == "unknown":
         return "workspace-unknown" if lowered == "unknown" else "default"

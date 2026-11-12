@@ -22,7 +22,7 @@ test("c1: the lifecycle line is one compact line naming all four surfaces", () =
   // one line — persistent visibility must not be a wall of text
   assert.ok(!MINNI_LIFECYCLE_LINE.includes("\n"), "must be a single line");
   assert.ok(MINNI_LIFECYCLE_LINE.length < 280, "must stay compact");
-  for (const surface of ["prepare_task", "prepare_outcome", "thread", "learn"]) {
+  for (const surface of ["recall", "drill", "thread", "learn"]) {
     assert.ok(MINNI_LIFECYCLE_LINE.includes(surface), `names ${surface}`);
   }
 });
@@ -30,8 +30,16 @@ test("c1: the lifecycle line is one compact line naming all four surfaces", () =
 test("c1: thread names only its two thread-adjacent options, not all of Minni", () => {
   assert.ok(MINNI_LIFECYCLE_LINE.includes("minni_thread_"), "names minni_thread_*");
   assert.ok(MINNI_LIFECYCLE_LINE.includes("handoff"), "names handoff");
-  // representation-only: must NOT enumerate the long tail
-  for (const noise of ["team", "ping", "drill", "vault_write", "negotiate", "compile"]) {
+  // representation-only: must NOT enumerate retired or long-tail tools
+  for (const noise of [
+    "team",
+    "ping",
+    "prepare_task",
+    "prepare_outcome",
+    "vault_write",
+    "negotiate",
+    "compile",
+  ]) {
     assert.ok(!MINNI_LIFECYCLE_LINE.includes(noise), `does not enumerate ${noise}`);
   }
 });
@@ -41,7 +49,7 @@ test("c1: intent -> surface mapping matches the classifyIntent labels", () => {
   // frozen; the minni:threads rename moved only the lifecycle SURFACE name.
   assert.equal(lifecycleSurfaceForIntent("plan"), "thread");
   for (const ambitious of ["implement", "debug", "review", "verify"]) {
-    assert.equal(lifecycleSurfaceForIntent(ambitious), "prepare_task", ambitious);
+    assert.equal(lifecycleSurfaceForIntent(ambitious), "recall", ambitious);
   }
   // the generic fallback and chatter get no emphasis (would fire every turn)
   assert.equal(lifecycleSurfaceForIntent("work"), null);
@@ -58,7 +66,7 @@ test("c1: classifyIntent labels are exactly the ones the mapping handles", () =>
   // every non-work label the classifier can emit must resolve in the mapping
   for (const label of ["review", "debug", "verify", "plan", "implement"]) {
     const surface = lifecycleSurfaceForIntent(label);
-    assert.ok(surface === "thread" || surface === "prepare_task", `${label} maps`);
+    assert.ok(surface === "thread" || surface === "recall", `${label} maps`);
   }
 });
 
@@ -89,7 +97,7 @@ test("classifyIntent does not treat concurrency work as planning (threads-rename
 });
 
 test("c1: emphasis is a soft one-line signpost per surface", () => {
-  for (const surface of ["prepare_task", "prepare_outcome", "thread", "learn"]) {
+  for (const surface of ["recall", "drill", "thread", "learn"]) {
     const line = buildLifecycleEmphasis(surface);
     assert.ok(line.length > 0 && !line.includes("\n"), `${surface} one line`);
   }
@@ -97,8 +105,8 @@ test("c1: emphasis is a soft one-line signpost per surface", () => {
   const threadEmphasis = buildLifecycleEmphasis("thread");
   assert.ok(threadEmphasis.includes("minni_thread_"));
   assert.ok(threadEmphasis.includes("handoff"));
-  // each leaf emphasis names its own verb
-  assert.ok(buildLifecycleEmphasis("prepare_task").includes("minni_prepare_task"));
-  assert.ok(buildLifecycleEmphasis("prepare_outcome").includes("minni_prepare_outcome"));
+  // each leaf emphasis names its own shipped v1 tool
+  assert.ok(buildLifecycleEmphasis("recall").includes("minni_recall"));
+  assert.ok(buildLifecycleEmphasis("drill").includes("minni_drill"));
   assert.ok(buildLifecycleEmphasis("learn").includes("minni_learn"));
 });

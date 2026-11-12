@@ -843,13 +843,14 @@ class VaultIndexer:
                                 """UPDATE documents
                                    SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
                                        page_status=?, privacy_level=?, page_type=?, layer=?,
-                                       workspace_id=?
+                                       workspace_id = CASE WHEN ? != '' THEN ? ELSE documents.workspace_id END
                                    WHERE doc_id=?""",
                                 (path, meta["agent"], meta["sigil"], mtime, now,
                                  meta.get("page_status", "candidate"),
                                  meta.get("privacy_level", "safe"),
                                  meta.get("page_type"),
                                  layer,
+                                 doc_ws,
                                  doc_ws,
                                  doc_id),
                             )
@@ -1089,7 +1090,8 @@ class VaultIndexer:
                     c.execute(
                         """UPDATE documents
                            SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
-                               page_status=?, privacy_level=?, page_type=?, layer=?, workspace_id=?
+                               page_status=?, privacy_level=?, page_type=?, layer=?,
+                               workspace_id = CASE WHEN ? != '' THEN ? ELSE documents.workspace_id END
                            WHERE doc_id=?""",
                         (
                             path_str,
@@ -1101,6 +1103,7 @@ class VaultIndexer:
                             meta.get("privacy_level", "safe"),
                             meta.get("page_type"),
                             layer,
+                            doc_ws,
                             doc_ws,
                             doc_id,
                         ),

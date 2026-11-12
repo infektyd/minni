@@ -4222,6 +4222,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             "chunk_id": row["chunk_id"],
             "path": row["path"],
             "source": row["path"],
+            "wikilink": _path_to_wikilink(row["path"]),
             "filename": os.path.basename(row["path"]),
             "agent": row["agent"],
             "sigil": row["sigil"],

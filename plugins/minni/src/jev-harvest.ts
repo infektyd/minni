@@ -121,8 +121,24 @@ const WRAPPER_TAG_BLOCKS_RE =
 const UNCLOSED_WRAPPER_TAG_LINE_RE =
   /(?:^|\n)[ \t]*<\/?(?:SYSTEM_MESSAGE|MINNI_ENVELOPE|background-task|task-notification)\b[^\n]*(?=\n|$)/gi;
 const AGENT_MESSAGE_LINE_RE = /(?:^|\n)[ \t]*\[Message\]\s+timestamp=[^\n]*(?=\n|$)/gi;
+const AGY_TRUNCATION_PREAMBLE_RE =
+  /(?:^|\n)[ \t]*The tool's output was truncated due to being too long\.[^\n]*(?:\n[ \t]*Here is a preview with the middle of the output truncated:[ \t]*)?(?=\n|$)/gi;
+const AGY_TRUNCATION_MARKER_RE =
+  /(?:^|\n)[ \t]*<truncated \d+ of \d+ bytes from the middle of the output>[ \t]*(?=\n|$)/gi;
+const READ_ONLY_VIEWER_TOOL_RE =
+  /^(?:read_file|view_file|Read|Grep|Glob|find_by_name|grep_search|list_dir|XcodeRead|XcodeGrep|XcodeGlob|XcodeLS)$/i;
+const READ_FILE_OUTPUT_HEADER_RE = /^\s*Showing lines \d+-\d+ of \d+\b/i;
+const SYNTHETIC_VIEWER_TRIGGER_RE =
+  /^\s*(?:Test failure recovered after edit:|Tool error resolved by recovery command:)\s*(?:Showing lines \d+-\d+ of \d+\b|The tool's output was truncated\b)/i;
 const BARE_HARVEST_CHATTER_RE =
   /^\s*(?:fix(?:ed)?|done|lgtm|ok(?:ay)?|wip|ack|thanks|yes|no|pass(?:ed)?|green)\W*$/i;
+
+function isReadOnlyViewerEntry(entry: TranscriptEntry, cleanedText: string): boolean {
+  const toolName = String(entry.tool_name ?? "").trim();
+  if (toolName && READ_ONLY_VIEWER_TOOL_RE.test(toolName)) return true;
+  if (READ_FILE_OUTPUT_HEADER_RE.test(cleanedText)) return true;
+  return false;
+}
 
 /**
  * Strip runtime/tool wrapper headers and system/task envelopes before screening
@@ -136,6 +152,8 @@ export function stripHarvestWrappers(text: string): string {
     .replace(SYSTEM_MESSAGE_PREAMBLE_RE, "")
     .replace(AGY_GENERIC_HEADER_RE, "")
     .replace(COMPLETED_AT_LINE_RE, "")
+    .replace(AGY_TRUNCATION_PREAMBLE_RE, "")
+    .replace(AGY_TRUNCATION_MARKER_RE, "")
     .replace(AGENT_MESSAGE_LINE_RE, "");
   // Multi-pass unwrap for nested <SYSTEM_MESSAGE> / <MINNI_ENVELOPE> / task blocks
   for (let pass = 0; pass < 3; pass++) {
@@ -147,6 +165,8 @@ export function stripHarvestWrappers(text: string): string {
     .replace(SYSTEM_MESSAGE_PREAMBLE_RE, "")
     .replace(AGY_GENERIC_HEADER_RE, "")
     .replace(COMPLETED_AT_LINE_RE, "")
+    .replace(AGY_TRUNCATION_PREAMBLE_RE, "")
+    .replace(AGY_TRUNCATION_MARKER_RE, "")
     .replace(AGENT_MESSAGE_LINE_RE, "")
     .replace(UNCLOSED_WRAPPER_TAG_LINE_RE, "")
     .trim();
@@ -595,6 +615,7 @@ export function screenTranscriptChunk(
 
     // 2. Test Insight (test red -> edit -> test green)
     if (
+      !isReadOnlyViewerEntry(entry, entryText) &&
       TEST_FAIL_PATTERN.test(entryText) &&
       (TEST_COMMAND_PATTERN.test(entryText) || entry.tool_name === "run_command" || entry.type === "TOOL_RESULT")
     ) {
@@ -615,7 +636,11 @@ export function screenTranscriptChunk(
           const passEntry = entries[k];
           const passText = maskTelemetry(extractEntryText(passEntry));
           const editText = maskTelemetry(extractEntryText(entries[editIndex]));
-          if (passText && TEST_PASS_PATTERN.test(passText)) {
+          if (
+            passText &&
+            !isReadOnlyViewerEntry(passEntry, passText) &&
+            TEST_PASS_PATTERN.test(passText)
+          ) {
             const contextWindow = [
               entryText.slice(0, 300),
               editText.slice(0, 300),
@@ -638,6 +663,7 @@ export function screenTranscriptChunk(
 
     // 3. Scar (tool error -> flag/command recovery)
     if (
+      !isReadOnlyViewerEntry(entry, entryText) &&
       TOOL_ERROR_PATTERN.test(entryText) &&
       (entry.type === "TOOL_RESULT" || entry.source === "TOOL" || entry.is_error === true)
     ) {
@@ -645,6 +671,7 @@ export function screenTranscriptChunk(
         const recoveryEntry = entries[j];
         const recText = maskTelemetry(extractEntryText(recoveryEntry));
         if (
+          !isReadOnlyViewerEntry(recoveryEntry, recText) &&
           (recoveryEntry.type === "TOOL_RESULT" || recoveryEntry.source === "TOOL") &&
           !TOOL_ERROR_PATTERN.test(recText) &&
           recText.length > 0
@@ -742,7 +769,12 @@ export async function extractJevLearning(
     if (!custom) return undefined;
     const cleanedTitle = stripHarvestWrappers(custom.title).replace(/\s+/g, " ").trim();
     const cleanedContent = stripHarvestWrappers(custom.content);
-    if (!hasMinimumHarvestSubstance(cleanedContent) || isSessionStatusChatter(cleanedContent)) {
+    if (
+      !hasMinimumHarvestSubstance(cleanedContent) ||
+      isSessionStatusChatter(cleanedContent) ||
+      SYNTHETIC_VIEWER_TRIGGER_RE.test(cleanedContent) ||
+      READ_FILE_OUTPUT_HEADER_RE.test(cleanedContent)
+    ) {
       return undefined;
     }
     return {
@@ -772,26 +804,32 @@ export async function extractJevLearning(
     });
     const parsed = JSON.parse(stdout);
     if (parsed.status === "ok" && parsed.values) {
-      const rawTitle = String(parsed.values.title?.value || cleanTriggerText.slice(0, 60));
-      const title = stripHarvestWrappers(rawTitle).replace(/\s+/g, " ").trim();
-      const content = stripHarvestWrappers(String(parsed.values.content?.value || cleanTriggerText));
-      if (
-        !hasMinimumHarvestSubstance(content) ||
-        isSessionStatusChatter(content) ||
-        isPromptDispatchBlock(title) ||
-        isPromptDispatchBlock(content)
-      ) {
-        return undefined;
+      const rawExtractedContent =
+        typeof parsed.values.content?.value === "string" ? parsed.values.content.value.trim() : "";
+      if (rawExtractedContent) {
+        const rawTitle = String(parsed.values.title?.value || cleanTriggerText.slice(0, 60));
+        const title = stripHarvestWrappers(rawTitle).replace(/\s+/g, " ").trim();
+        const content = stripHarvestWrappers(rawExtractedContent);
+        if (
+          !hasMinimumHarvestSubstance(content) ||
+          isSessionStatusChatter(content) ||
+          isPromptDispatchBlock(title) ||
+          isPromptDispatchBlock(content) ||
+          SYNTHETIC_VIEWER_TRIGGER_RE.test(content) ||
+          READ_FILE_OUTPUT_HEADER_RE.test(content)
+        ) {
+          return undefined;
+        }
+        const category = normalizeJevCategory(parsed.values.category?.value, trigger.kind);
+        return {
+          title,
+          content,
+          category,
+          source: "jev_harvest",
+          triggerKind: trigger.kind,
+          annotation: `${trigger.kind}: ${title}`,
+        };
       }
-      const category = normalizeJevCategory(parsed.values.category?.value, trigger.kind);
-      return {
-        title,
-        content,
-        category,
-        source: "jev_harvest",
-        triggerKind: trigger.kind,
-        annotation: `${trigger.kind}: ${title}`,
-      };
     }
   } catch {
     // Fall back to deterministic extraction
@@ -821,7 +859,12 @@ export async function extractJevLearning(
   }
 
   content = stripHarvestWrappers(content);
-  if (!hasMinimumHarvestSubstance(content) || isSessionStatusChatter(content)) {
+  if (
+    !hasMinimumHarvestSubstance(content) ||
+    isSessionStatusChatter(content) ||
+    SYNTHETIC_VIEWER_TRIGGER_RE.test(content) ||
+    READ_FILE_OUTPUT_HEADER_RE.test(content)
+  ) {
     return undefined;
   }
 

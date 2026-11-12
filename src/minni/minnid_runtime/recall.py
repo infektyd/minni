@@ -2136,8 +2136,10 @@ def _normalize_wikilink_token(value: Any) -> str:
     s = str(value or "").strip()
     if s.startswith("[[") and s.endswith("]]"):
         s = s[2:-2].strip()
-    if s.endswith(".md"):
-        s = s[:-3]
+    if "|" in s:
+        s = s.split("|", 1)[0].strip()
+    if s.lower().endswith(".md"):
+        s = s[:-3].strip()
     return f"[[{s}]]" if s else ""
 
 
@@ -2155,8 +2157,11 @@ def reference_matches(result: dict, reference: dict) -> bool:
             source_matched = str(result.get("source") or "") == str(ref_source)
     wikilink_matched = False
     if ref_wikilink:
+        from minni.retrieval import _path_to_wikilink  # type: ignore
+
         norm_ref = _normalize_wikilink_token(ref_wikilink)
-        norm_res = _normalize_wikilink_token(result.get("wikilink"))
+        raw_res_wl = result.get("wikilink") or _path_to_wikilink(str(result.get("source") or ""))
+        norm_res = _normalize_wikilink_token(raw_res_wl)
         res_stem = Path(str(result.get("source") or "")).stem
         wikilink_matched = bool(norm_ref) and (
             norm_res == norm_ref or (bool(res_stem) and norm_ref == f"[[{res_stem}]]")
@@ -2863,37 +2868,81 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                     lines.append(row["chunk_text"] or "")
 
         with db.cursor() as c:
-            c.execute("""
+            doc_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            priv_sel = "d.privacy_level" if "privacy_level" in doc_cols else "'safe' AS privacy_level"
+            status_sel = "d.page_status" if "page_status" in doc_cols else "'accepted' AS page_status"
+            sup_sel = "d.superseded_by" if "superseded_by" in doc_cols else "NULL AS superseded_by"
+            ws_sel = "d.workspace_id" if "workspace_id" in doc_cols else "'default' AS workspace_id"
+            ptype_sel = "d.page_type" if "page_type" in doc_cols else "NULL AS page_type"
+
+            where_extra = []
+            if "superseded_by" in doc_cols:
+                where_extra.append("AND d.superseded_by IS NULL")
+            if "page_status" in doc_cols:
+                where_extra.append(
+                    "AND LOWER(TRIM(COALESCE(d.page_status, 'accepted'))) "
+                    "NOT IN ('rejected', 'superseded', 'expired', 'archived', 'retired', 'deleted')"
+                )
+            if "privacy_level" in doc_cols:
+                where_extra.append(
+                    "AND LOWER(TRIM(COALESCE(d.privacy_level, 'safe'))) NOT IN ('blocked', 'secret')"
+                )
+            extra_sql = "\n                  ".join(where_extra)
+            fetch_limit = max(limit * 4, 20)
+            c.execute(f"""
                 SELECT d.doc_id, d.path, d.agent, d.sigil,
-                       d.access_count, d.decay_score
+                       d.access_count, d.decay_score,
+                       {priv_sel}, {status_sel}, {sup_sel}, {ws_sel}, {ptype_sel}
                 FROM documents d
                 WHERE (d.agent = ? OR d.agent = 'unknown'
                        OR d.agent LIKE 'wiki:%')
                   AND d.whole_document = 0
+                  {extra_sql}
                 ORDER BY d.decay_score * d.access_count DESC,
                          d.last_accessed DESC NULLS LAST
                 LIMIT ?
-            """, (agent_id, limit))
+            """, (agent_id, fetch_limit))
             rows = c.fetchall()
-            if rows:
+            gate_ws = _effective_document_gate_workspace(principal)
+            prior_lines: list[str] = []
+            for row in rows:
+                row_priv = str(row["privacy_level"] or "safe").strip().lower() or "safe"
+                if row_priv in ("blocked", "secret"):
+                    continue
+                row_status = str(row["page_status"] or "accepted").strip().lower() or "accepted"
+                if row_status in ("rejected", "superseded", "expired", "archived", "retired", "deleted"):
+                    continue
+                if row["superseded_by"] is not None:
+                    continue
+                row_ptype = row["page_type"] or (
+                    "wiki" if "wiki" in str(row["agent"] or "") else "knowledge"
+                )
+                row_ws = str(row["workspace_id"] or "default").strip() or "default"
+                meta = {
+                    "path": row["path"],
+                    "agent": row["agent"],
+                    "page_type": row_ptype,
+                    "page_status": row_status,
+                    "privacy_level": row_priv,
+                    "workspace_id": row_ws,
+                }
+                if not context.can_read_document(principal, gate_ws, meta):
+                    continue
+                fname = os.path.basename(row["path"])
+                prior_lines.append(
+                    f"  - **{fname}** ({row['sigil']}) "
+                    f"[{row['agent']}] "
+                    f"accessed {row['access_count']}x, "
+                    f"decay={row['decay_score']:.2f}"
+                )
+                if len(prior_lines) >= limit:
+                    break
+            if prior_lines:
                 lines.append(f"## Prior Context ({agent_id})")
-                for row in rows:
-                    meta = {
-                        "path": row["path"],
-                        "agent": row["agent"],
-                        "page_type": "wiki" if "wiki" in str(row["agent"] or "") else "knowledge",
-                        "privacy_level": "safe",
-                    }
-                    if not context.can_read_document(principal, principal.workspace_id, meta):
-                        continue
-                    fname = os.path.basename(row["path"])
-                    line = (
-                        f"  - **{fname}** ({row['sigil']}) "
-                        f"[{row['agent']}] "
-                        f"accessed {row['access_count']}x, "
-                        f"decay={row['decay_score']:.2f}"
-                    )
-                    lines.append(line)
+                lines.extend(prior_lines)
 
         with db.cursor() as c:
             from minni.afm_passes.consolidation import (

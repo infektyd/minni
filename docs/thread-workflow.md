@@ -1,141 +1,134 @@
 # Run a Thread through MCP
 
-A Thread records a plan, dependencies, worker leases, evidence, and mutations in
-the agent vault. The host still starts and supervises workers. Creating a plan
-or preparing context does not dispatch an agent or execute the plan.
+A Thread records a shared multi-slice plan, slice dependencies, verification gates, evidence, and failure scars as plain Markdown in the agent vault (`plan-*.md` + `plan-*.log.md`). The host runtime still runs commands and supervises subagents: creating or updating a Thread tracks shared state across turns, compaction, and sibling sessions without spawning processes.
 
-These are **MCP tool names and argument objects**, not shell commands or daemon
-JSON-RPC methods. Use a wired Minni MCP server with the required capabilities.
-The standalone CLI does not provide a matching Thread claim/update command set.
-Calls below write plan state; use a disposable vault when rehearsing them.
+These are **MCP tool names and JSON argument objects** exposed by the 12-tool Minni MCP server (`plugins/minni/src/server.ts`), not shell commands or raw daemon JSON-RPC methods. All 4 Thread tools (`minni_thread_create`, `minni_thread_status`, `minni_thread_update`, `minni_thread_scar`) enforce compact `< 2 KB` responses (`< 1 KB` for scars) and serialize mutations safely under an on-disk plan lock — there are no worker lease tokens, `claim` steps, or `idempotency_key` fields to manage. Calls below write plan state; use a disposable vault when rehearsing them.
 
-## Prepare and create
+## 1. Orient and create (`minni_recall` → `minni_thread_create`)
 
-Call `minni_prepare_task` to assemble evidence for the coordinator:
+Before opening a multi-slice plan, call `minni_recall` to pull Living Repo Map subsystem cards, prior decisions, and repository scars for the active workspace:
 
 ```json
-{"task":"Verify the parser handles an empty file","profile":"standard","useAfm":false,"limit":4}
+{"query": "empty-file parser behavior"}
 ```
 
-Review the evidence and scope before calling `minni_thread_create`:
+Create the Thread with `minni_thread_create`:
 
 ```json
-{"goal":"Verify empty-file parser behavior","constraints":["Preserve existing valid-file behavior"],"slices":[{"id":"check-empty","title":"Exercise an empty file","gate":"Record the command and observed result"}]}
+{
+  "goal": "Verify empty-file parser behavior",
+  "constraints": ["Preserve existing valid-file behavior"],
+  "slices": [
+    {
+      "id": "repro-empty",
+      "title": "Add empty-file parser regression test",
+      "gate": "pytest tests/test_parser.py -k empty"
+    },
+    {
+      "id": "verify-suite",
+      "title": "Run full parser suite",
+      "depends_on": ["repro-empty"],
+      "gate": "pytest tests/test_parser.py"
+    }
+  ],
+  "seed_scar_from_audit": true,
+  "activate": true
+}
 ```
 
-Save the returned `plan_id`. Creation can displace an existing active plan; read
-the response warning. Use explicit IDs below so another active-plan change does
-not redirect a later call. Replace `<plan_id>` with that returned value and
-`<worker_agent_id>` with the intended worker identity in your authorized setup.
+Save the returned `plan_id`. By default (`activate: true`), `minni_thread_create` binds the new plan to the current session's isolated pointer (`<vault>/.runtime/active-thread.d/<sessionKey>.json`) so concurrent terminal or IDE windows can run independent plans without clobbering one another. If this session already had an in-flight active plan, the `< 2 KB` receipt includes `displaced_active` and a warning showing how to re-activate it. Passing explicit `plan_id` values in subsequent calls prevents ambiguity if active-plan state changes later.
 
-## Find, assign, and claim a slice
+## 2. Inspect compact progress (`minni_thread_status`)
 
-Call `minni_thread_ready`:
+Call `minni_thread_status` (`plan_id` is optional and defaults to the current session's active plan):
 
 ```json
-{"plan_id":"<plan_id>"}
+{"plan_id": "<plan_id>"}
 ```
 
-Check that `check-empty` is ready, then call `minni_thread_assign`:
+The `< 2 KB` response returns `plan_id`, `status`, `rev`, `active`, and `view` (`headline`, `progress` counts, non-terminal slices, `next_action`, and capped `scars` previews). If the plan recorded a `shelf_ref`, passing optional `live_shelf_content` reports whether the shelf hash drifted (`drift`) without auto-pulling content into context.
+
+## 3. Start, gate, and complete slices (`minni_thread_update`)
+
+Mark a slice `in_progress` when starting work:
 
 ```json
-{"plan_id":"<plan_id>","slice_id":"check-empty","worker_agent_id":"<worker_agent_id>"}
+{
+  "plan_id": "<plan_id>",
+  "slice_id": "repro-empty",
+  "status": "in_progress"
+}
 ```
 
-Assignment changes plan state and clears any existing claim on that slice. It
-does not register a principal, grant capabilities, or start a host worker.
-Call `minni_thread_claim` after assignment:
+Run the slice's verification gate in the host, then mark the slice `done` with concrete `evidence`:
 
 ```json
-{"plan_id":"<plan_id>","slice_id":"check-empty","worker_agent_id":"<worker_agent_id>","idempotency_key":"empty-file-claim-1","ttl_seconds":600}
+{
+  "plan_id": "<plan_id>",
+  "slice_id": "repro-empty",
+  "status": "done",
+  "evidence": "pytest tests/test_parser.py -k empty -> 1 passed in 0.12s"
+}
 ```
 
-Keep the returned `token`, `generation`, and `expires_at`. Pass `token` as
-`claim_token` to worker updates. It is a secret lease credential reused for
-multiple actions during that claim. Do not place it in shared evidence, logs,
-or a public handoff.
+Rules enforced by `minni_thread_update`:
 
-The default lease is ten minutes; the maximum requested TTL is seven days.
-Expiry, reassignment, and generation changes can invalidate authority. Retrying
-the same claim request uses its idempotency key; a key is not a lease renewal.
+- **Allowed `status` values:** `"pending"`, `"in_progress"`, `"done"`, `"blocked"`, `"superseded"`.
+- **Evidence gate:** Transitioning a slice to `"done"` requires a non-empty `evidence` string recording what was verified.
+- **Dependency gate (`depends_on`):** A slice cannot transition to `"done"` while any slice in its `depends_on` list is neither `"done"` nor `"superseded"`. Overriding an unmet dependency requires both `"force": true` and a non-empty `"force_reason"`, which appends an audited `depends_on_override` entry to `plan-*.log.md`.
+- **Compact `< 2 KB` response by default:** Responses omit full slice arrays and unbounded `scar_tissue` so routine status updates never bloat the context window (`compact` defaults to `true`; pass `"include_full_plan": true` or `"compact": false` only when inspecting the full plan body).
+- **Per-session activation control:** Toggle or clear this session's active-plan pointer without mutating a slice by calling `{"plan_id": "<plan_id>", "activate": true}` or `{"plan_id": "<plan_id>", "activate": false}`. When all slices reach terminal state, the session's active pointer clears automatically.
 
-## Start, report, and complete
+## 4. Record dead ends and failed commands (`minni_thread_scar`)
 
-Send the actual worker the task, constraints, evidence, and claim credential via
-the host's authorized collaboration mechanism. The source helper
-`buildWorkerPacketAfterClaim` can assemble a worker packet after assign → claim;
-it is a library helper, not an MCP tool or an automatic `minni_team_runtime`
-dispatch step.
-
-Call `minni_thread_worker_update` to start:
+When a command fails, an approach hits a dead end, or a hypothesis is refuted, record it immediately with `minni_thread_scar` (`< 1 KB` receipt):
 
 ```json
-{"plan_id":"<plan_id>","slice_id":"check-empty","worker_agent_id":"<worker_agent_id>","claim_token":"<token>","idempotency_key":"empty-file-start-1","action":"start"}
+{
+  "plan_id": "<plan_id>",
+  "slice_id": "repro-empty",
+  "kind": "failed_command",
+  "signal": "parser.parse('') raised EOFError before empty-input guard",
+  "resolution": "Return empty AST node before tokenizer read"
+}
 ```
 
-Wait for start to be applied before reporting completion. Run the work in the
-host, then report actual evidence through the same tool:
+`kind` must be `"failed_command"`, `"dead_end"`, or `"rejected_hypothesis"`. Scars are appended to the Thread artifact, surfaced in compact status/boot previews so retries are avoided after compaction, and promoted into workspace-scoped scar memory so future sessions on the same repository see them via `minni_recall` and `project_shelf`.
+
+## 5. Hand off across sessions or agents (`minni_handoff_send` & `minni_handoff_inbox`)
+
+To hand the remaining slices to your next session (default when `to_agent` is omitted) or to another wired principal (`"codex"`, `"claude-code"`, `"gemini"`, `"grok-build"`, `"kilocode"`, `"cursor"`), call `minni_handoff_send`:
 
 ```json
-{"plan_id":"<plan_id>","slice_id":"check-empty","worker_agent_id":"<worker_agent_id>","claim_token":"<token>","idempotency_key":"empty-file-progress-1","action":"progress","evidence":"<actual command, result, and relevant artifact path>"}
+{
+  "to_agent": "codex",
+  "task": "Run verify-suite slice on <plan_id>",
+  "summary": "repro-empty slice is done and green",
+  "files": ["src/parser.py", "tests/test_parser.py"],
+  "next_steps": ["Run pytest tests/test_parser.py and mark verify-suite done"]
+}
 ```
 
-After reviewing that evidence against the slice's gate, complete it:
+`minni_handoff_send` packages top recalls and recent scars into an `<EVIDENCE>`-framed handoff envelope and returns a `< 1 KB` lease receipt (`status`, `lease_id`, `from_agent`, `to_agent`, `expires_at`). Cross-agent handoff requires the `handoff` capability on the sending principal.
+
+On the receiving session or agent, preview pending handoffs first with `minni_handoff_inbox`:
 
 ```json
-{"plan_id":"<plan_id>","slice_id":"check-empty","worker_agent_id":"<worker_agent_id>","claim_token":"<token>","idempotency_key":"empty-file-complete-1","action":"complete","evidence":"<verified outcome and remaining limitations>"}
+{}
 ```
 
-Use a new idempotency key for each distinct action. Retry an uncertain action
-with the same key, token, and unchanged payload; do not make a new key merely
-because a response was lost. Worker actions also include `block`, `scar`, and
-`propose_structure`. A structural proposal records a request for coordinator
-review; it does not itself change the plan topology.
-
-## Confirm applied state, not just acceptance
-
-A contended write can return `status: "accepted"`, `applied: false`, and
-`queued: true`. This means the queue accepted the request, **not** that the slice
-changed or a completion gate passed. An applied response contains `slice`,
-`ready_before`, `ready_after`, and `rev`.
-
-Call `minni_thread_events` to follow applied journal events:
+The inbox response previews `task`, `summary`, `files`, `next_steps`, and `open_questions` for waiting handoffs in the active workspace before acknowledgement. Acknowledge one lease (`{"lease_id": "<lease_id>", "status": "accepted"}`) or read-and-clear all waiting handoffs in one step:
 
 ```json
-{"plan_id":"<plan_id>","since_seq":0,"limit":100}
+{
+  "ack": true,
+  "status": "accepted",
+  "note": "Picked up <plan_id> verify-suite"
+}
 ```
 
-Advance the cursor with the returned `next_seq` and require a matching
-`slice.completed` event for the intended plan and `slice_id` before reporting
-that queued completion as applied. Check the corresponding operation and
-revision; another slice's completion is not confirmation of this one.
-`minni_thread_status` is a compact progress view: it omits finished slices and
-its resolved count includes superseded slices, so that count alone cannot prove
-a specific slice completed. Completion clears the live claim; an exact retry
-can still replay its receipt. `minni_prepare_outcome` drafts an outcome
-packet; it does not complete the Thread or approve shared memory.
+## Recovery and implementation boundaries
 
-## Recovery and current limits
-
-- On a busy response or uncertain transport result, retry the same operation
-  with bounded backoff and the same idempotency key. Do not infer success from
-  the absence of an error in a different tool.
-- If a lease expires or assignment changes, re-read status and coordinate a
-  fresh valid claim. Replaying an old token does not regain authority.
-- Queued requests need a drain process. MCP startup and in-process drain kicks
-  help; the daemon's standing worker-write drain normally polls every five
-  seconds and can be disabled with `MINNI_WORKER_WRITE_DRAIN=off`. Missing drain
-  support, process outages, or apply failures can leave work pending. There is
-  no guaranteed completion latency. Inspect status/events and runtime errors;
-  preserve failure tickets instead of deleting them to make the queue look clear.
-- If an event cursor is rejected or has a gap, re-read authoritative Thread
-  status before continuing. A journal is evidence of applied transitions, not
-  proof that an external command or test actually succeeded.
-
-The implementation boundary is in
-[`server.ts`](../plugins/minni/src/server.ts) (MCP schemas),
-[`thread-worker.ts`](../plugins/minni/src/thread-worker.ts) (lease and mutation
-rules), and [`worker_write_drain.py`](../src/minni/worker_write_drain.py)
-(standing drain). Regression coverage includes
-[`thread-worker.test.mjs`](../plugins/minni/tests/thread-worker.test.mjs) and
-[`thread-write-queue.test.mjs`](../plugins/minni/tests/thread-write-queue.test.mjs).
+- **Lock contention:** Concurrent `minni_thread_update` or `minni_thread_scar` calls against the same `plan_id` serialize under `withThreadPlanLock`. If a call returns `THREAD_BUSY`, retry after a brief pause and re-check `minni_thread_status` (`rev` increments monotonically on every applied mutation).
+- **Operator visibility:** Operators can inspect active Threads, pending handoffs, and recent scars from the terminal at any time via `minni activity` and `~/.minni/TODAY.md` without opening an agent session.
+- **Source & tests:** MCP schemas and compact budget serialization live in [`server.ts`](../plugins/minni/src/server.ts), plan state and active pointers in [`plan.ts`](../plugins/minni/src/plan.ts), lock/dependency/journal helpers in [`thread-worker.ts`](../plugins/minni/src/thread-worker.ts), and per-session relay cursors in [`thread-notification-relay.ts`](../plugins/minni/src/thread-notification-relay.ts) and [`thread_relay.py`](../src/minni/thread_relay.py), covered by [`plan.test.mjs`](../plugins/minni/tests/plan.test.mjs) and [`thread-worker.test.mjs`](../plugins/minni/tests/thread-worker.test.mjs).

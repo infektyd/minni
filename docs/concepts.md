@@ -4,19 +4,19 @@
 
 | Verb | What happens | Surface |
 |---|---|---|
-| **Recall** | Cited, provenance-tagged retrieval across the personal and shared legs (`mode="fast"` `< 10 ms` lexical Trie + FTS5 BM25, or full hybrid with FAISS + weighted RRF + Cross-Encoder reranking) | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
-| **Learn** | Normally stages a persistent `candidate_packets` row with status `proposed` and category (`pattern`, `fix`, `decision`, `preference`, `fact`, `procedure`, `architecture`, `codebase`, `general`); the MCP tool also writes a personal vault note and synchronously indexes it (`index_single_file` / `vault_index_doc`). Neither is the same as an accepted shared learning | `minni_learn`, `minni_learning_quality` |
-| **Approve** | A later resolution decision — accept / reject / redact / log-only / merge / supersede / do-not-store. Accepting decisions commit the shared learning (preserving original author `principal` and `category`, with resolver in `resolved_by`) and synchronously index the note; if follow-up indexing fails it reports `indexed=false`. Existing personal notes and staged packets already persist | `minni_list_candidates`, `minni_resolve_candidate` |
-| **Handoff** | Explicit cross-agent transfer under a lease; the receiver acks before the sender releases | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_await_handoff`, `minni_list_pending_handoffs` |
+| **Recall** | Repo-First cited, provenance-tagged retrieval across Living Repo Maps, project docs, learnings, and scars (`mode="fast"` `< 10 ms` lexical Trie + FTS5 BM25, or full hybrid with FAISS + weighted RRF + Cross-Encoder reranking, strict confidence floor across all hits, and typed graph expansion) | MCP: `minni_recall`, `minni_drill` · CLI: `minni recall`, `minni map` |
+| **Learn** | Runs the vault-first quality and secret gate (`assessLearningQuality`, stripping wrapper chatter), stages a workspace-tagged `candidate_packets` row (`proposed`) and writes a personal vault note (`wiki/sessions/`). Neither is the same as an accepted shared learning unless `auto_accept_own` or `--accept` promotes it | MCP: `minni_learn` · CLI: `minni learn` |
+| **Approve** | A resolution decision — `accept` / `learn` / `reject` / `redact` / `log_only` / `merge` / `supersede` / `do_not_store`. Accepting decisions commit the workspace-scoped shared learning (preserving original author `principal` and `category`, with resolver in `resolved_by`), wire typed `memory_links` / `learning_links` with automatic supersession, refresh `~/.minni/TODAY.md`, and synchronously index the durable record | MCP: `minni_list_candidates`, `minni_resolve_candidate` · CLI: `minni learn --accept` |
+| **Handoff** | Explicit 1-step session or cross-agent transfer under a lease (`< 1 KB` receipt); the receiver previews pending handoffs in its workspace and acknowledges by `lease_id` or `ack: true` | MCP: `minni_handoff_send`, `minni_handoff_inbox` |
 
-One explicit operator override is `force=true` on `learn`
+One explicit operator override is `force=true` on `learn` (backing `minni learn --accept`), which
 writes a durable learning directly, **only** for an operator principal, and is
 audit-stamped `FORCE_DURABLE_LEARN`. A non-operator force attempt is denied
 with an `operator_only` error. Operator-configured `auto_accept_own` and the optional consolidation path are separate approval mechanisms described below; they are not implied by ordinary tool access.
 
-Three success states need different follow-up: a **personal note** is synchronously indexed (`index_single_file` / `vault_index_doc`) and recallable immediately by its owner before shared approval; a **staged candidate** awaits a
-governance decision; an **accepted shared learning** is durable and synchronously indexed upon acceptance (even if follow-up
-indexing fails, it remains durable in SQLite). Check the response's indexing result. If `indexed=false`, repair
+Three success states need different follow-up: a **personal note** (`wiki/sessions/`) is written immediately to the caller's vault; a **staged candidate** awaits a
+governance decision; an **accepted shared learning** is durable in SQLite, linked into the typed memory graph, and synchronously indexed upon acceptance (even if follow-up
+indexing fails, it remains durable in SQLite). Check the response's indexing result: if `indexed=false`, repair
 or reindex the accepted record rather than resubmitting it as a new learning.
 
 ## Delegating approval
@@ -35,31 +35,28 @@ hours into a session stages the learning on the spot instead of losing it
 because the human was AFK. Proposal-first is what makes this a reasonable
 grant: nothing enters the shared durable tier without approval. Know exactly
 what you are allowing, though — `minni_learn` does two things per call. It
-stages the `proposed` candidate, and it also writes a Markdown note into the
-agent's **own vault** immediately (audit-logged, and synchronously indexed into
-that agent's personal tier via `vault_index_doc` / `index_single_file`, with
-`vault_ingest` sweeping in the background). The quality gate blocks weak
-content by default (`requireQuality` defaults to `true`; a caller must pass
-`requireQuality: false` to store a weak note deliberately). Allowlisting the tool
-therefore means trusting the agent to write its own vault notes unprompted —
+stage the `proposed` candidate, and it also writes a Markdown note into the
+agent's **own vault** immediately (`wiki/sessions/`, audit-logged, with
+`vault_ingest` sweeping personal wiki pages in the background while accepted
+shared learnings are synchronously indexed by the daemon). The quality gate blocks weak
+content by default (`requireQuality` defaults to `true`, enforcing `>= 15`
+non-whitespace chars and `>= 4` meaningful tokens after stripping runtime
+wrappers; a caller must pass `requireQuality: false` to store a weak note
+deliberately, though credential-shaped values are never opt-outable). Allowlisting
+the tool therefore means trusting the agent to write its own vault notes unprompted —
 the shared tier still waits for a resolution decision.
 
 The initiative grant is intended for the primary agent you are working with,
-not for anything it spawns: temporary team agents (`minni_team_*`) carry
-`learn: "manual-only"` in their memory policy. Note this is an instruction
-serialized into the team packet for host adapters to honor, not a boundary
-the daemon enforces — a spawned helper handed the same host-level
-`minni_learn` tool access can still call it, so scope tool permissions at
-the runtime level if that matters for your setup. A note
-on maturity while we're here: Team projection, the post-claim worker packet,
-and the honesty dispatch are in the tree and covered by unit tests. Host
-start is still the untested frontier. grok has no worker-start, default agy
-cannot run `minni_thread_worker_update`, and Codex dispatch stays UNPROVEN.
-What *is* battle-tested daily is the core multi-agent loop — several approved
-principals (e.g. `claude-code` and `codex`) sharing one daemon, staging and
-resolving each other's candidates — because Minni is developed using Minni.
-At that scale it holds up. Automatic spawning and immediate wake are not
-the untested frontier; they are not implemented.
+not necessarily for short-lived helper subagents it spawns: a spawned helper
+handed the same host-level `minni_learn` tool access can call it under that
+runtime's stamped principal, so scope MCP tool allowlists per subagent at the
+runtime host level when you want helpers restricted to read-only recall/drill
+or compact Thread updates. What is battle-tested daily is the core multi-agent
+loop — several approved principals (e.g. `claude-code`, `codex`, `gemini`, and
+`grok-build`) sharing one daemon, orienting via Living Repo Maps, staging and
+resolving candidates, and handing off slices — because Minni is developed using
+Minni. Automatic worker process spawning and immediate cross-host wake are
+deliberately out of scope; hosts start and supervise their own workers.
 
 **Approval.** Who gets to resolve candidates is decided per principal, and the
 operator can delegate it. Four resolution paths exist, all landing in the
@@ -181,21 +178,23 @@ itself runs with `MINNI_LOCAL_OPERATOR` set. Named agents (`claude-code`,
 `codex`, …) always need their own `principals/<agent>.json` — see
 [Provision agent identities](install.md#provision-agent-identities-principals).
 
-Alongside the four verbs, sessions carry a lifecycle spine —
-`prepare_task → prepare_outcome → thread → learn` — injected via the
-`<minni:context>` envelope so agents orient before ambitious work and distill
-before context is flushed.
+Alongside the four verbs, sessions boot with the **Two-Part Permanent Boot Shelf**
+(`layer1/core.md` up to `24 KB` un-truncated + `project_shelf` `<= 2,500` chars with
+Living Repo Map subsystem cards, git-diff staleness notices, top repo scars, and
+active plan summary, recovered automatically after `PostCompact`) and carry the
+v1 lifecycle spine — `recall → drill → thread → learn` — in `<minni:context>` so
+agents orient before editing and record durable findings before context is flushed.
 
-Follow the [Thread workflow](thread-workflow.md) for copyable MCP arguments, lease handling, queued completion, and recovery.
+Follow the [Thread workflow](thread-workflow.md) for copyable MCP arguments across the 4 compact Thread tools and 1-step Handoffs.
 
-Durable, evidence-gated threads (`minni_thread_*`) survive sessions and
-compaction, backing multi-step orchestration through Markdown graph artifacts
-(`plan-*.md`) and ordered event journals (`plan-*.log.md`).
+Durable, evidence-gated Threads (`minni_thread_create`, `minni_thread_status`,
+`minni_thread_update`, `minni_thread_scar`) survive sessions and compaction,
+backing multi-slice work through Markdown plan artifacts (`plan-*.md`) and
+ordered event journals (`plan-*.log.md`):
 
-- **Team projection**: `minni_team_runtime` projects one vault Thread. `plan_id` present reads that Thread and fails if it is missing. `plan_id` absent creates one Thread (`goal = task.trim()`, independent pending slices). Ready is the expiry sweep plus `readySlices`. `ledgerFor` and the compat invented-ready chain are gone. A leftover `taskLedger` name is a view of `ready`, not a second graph. The coordinator id is stamped server-side (G11); the model-facing schema does not take `coordinatorAgentId`.
-- **Orchestrator tools vs worker tools**: The orchestrator manages graph topology (`minni_thread_create`, `minni_thread_replan`), inspects ready slices (`minni_thread_ready`), assigns workers (`minni_thread_assign`, which accepts `worker_agent_id` and sets durable slice field `assigned_to`), and monitors progress via ordered event streams (`minni_thread_events`). Workers claim an assigned slice via `minni_thread_claim` to obtain a lease `token`. After assign → claim, the library adapter `buildWorkerPacketAfterClaim` builds one worker packet from that `ThreadClaimResponse` (`token` is labeled `claim_token`) plus the claimed slice, thread goal/constraints, completed-dep evidence refs, and bounded `prepare_task` recall. It is not built inside `minni_team_runtime` and is not a new MCP tool. Workers mutate slice execution state via `minni_thread_worker_update` only. Action `start` transitions any claimed non-terminal worker-updatable slice (`pending`, `in_progress`, or `blocked`) to `in_progress` (slice statuses are `pending`, `in_progress`, `done`, `blocked`, `superseded`; there is no `assigned` status). Workers cannot directly alter topology; they propose structural expansions or contractions via `propose_structure` for orchestrator replan.
-- **Ordered event cursors**: The thread journal records monotonic events readable via `minni_thread_events(plan_id?, since_seq?, limit?)`. Cursors enable state catch-up, deterministic replay, and crash recovery without daemon-canonical state divergence or out-of-order delivery. A dropped prefix or a cursor-path tail bound is a `journal_truncated` / `cursor_gap` event (`last_dropped_seq` + `first_kept_seq`); an unmarked hole is `THREAD_CURSOR_GAP`. Seq is never renumbered. If the tail cannot name those bounds, or bounding would hide a hole, the cursor full-parses.
-- **Authority boundary & honest limits**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction depends on host tool exposure / scoping, while claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is strictly enforced by the Thread engine regardless of caller principal. Wave 3 `dispatchWorkerPacket` is the host-dispatch honesty adapter (library, not MCP): grok worker-start is MISSING, default agy allowlist is CANNOT (`minni_thread_worker_update` is not granted), Codex is UNPROVEN, and `spawned` is always false. Completion is `minni_thread_worker_update`. The named agy worker allowlist exists as `minni_thread_worker_update` only; default dispatch stays CANNOT and `spawned` stays false. G3 is a notification relay, not a second graph: plugin `cursors.json` on journal append, not the unused SQLite 020 table; journal seq rebuilds the queue; failed wake leaves the cursor behind the event. Hooks read pending attention and do not poll `minni_thread_events`. Immediate wake is unsupported (not wet). agy/grok deferred on the existing wire; Codex UNPROVEN; Cursor out. Notifications are concise attributed state deltas for an already-working orchestrator, not raw evidence, not instructions, not a human inbox. Automatic spawning and grok worker-start are not implemented. Do not invent a grok or agy start API. `GROK_WORKER_START` stays null. Default agy cannot write `minni_thread_worker_update`.
+- **4 compact `< 2 KB` tools, zero lease tokens**: `minni_thread_create` opens a plan (activating a per-session pointer `.runtime/active-thread.d/<sessionKey>.json` by default), `minni_thread_status` returns a `< 2 KB` summary of pending/in-progress slices, `next_action`, and capped scars, `minni_thread_update` advances slice statuses (`pending`, `in_progress`, `done`, `blocked`, `superseded`) under `withThreadPlanLock` without worker claim tokens or idempotency keys, and `minni_thread_scar` records `failed_command`, `dead_end`, or `rejected_hypothesis` entries (`< 1 KB` receipt) while promoting workspace scars.
+- **Evidence & dependency enforcement**: Marking a slice `done` requires non-empty `evidence` and satisfied `depends_on` slices (`done` or `superseded`) unless `force: true` and a non-empty `force_reason` are supplied (`depends_on_override` journaled).
+- **Multi-session notification relay**: Concurrent sessions isolate active plans per `sessionKey` and receive concise state deltas through composite `<agent>:<sessionKey>` relay cursors (`.runtime/thread-relay/cursors.json` + Python `thread_relay.py`), while operators inspect active plans, pending handoffs, and scars in plain Markdown via `minni activity` and `~/.minni/TODAY.md`.
 
 ## Recall is evidence, not instruction
 
@@ -212,44 +211,63 @@ nothing recalled speaks with the operator's voice.
 ## Two-tier storage
 
 - **Personal tier** — each agent's vault wiki (`<agent>-vault/wiki/**/*.md`) is
-  indexed synchronously on write (`vault_index_doc` / `index_single_file`) and
-  by the background `vault_ingest` pass into that vault's own
-  `.index/vault.db` + `vault.faiss` + `vault.manifest.json`.
-- **Shared tier** — `~/.minni/minni.db` (SQLite, FTS5, WAL) holds durable
-  learnings, candidates, episodic/contradiction events, handoff leases, and
-  the pooled document layer, with a shared FAISS index for vectors.
+  indexed on write (`vault_index_doc` / `index_single_file`) and by the background
+  `vault_ingest` pass into that vault's own `.index/vault.db` + `vault.faiss` +
+  `vault.manifest.json`.
+- **Shared tier** — `~/.minni/minni.db` (SQLite, FTS5, WAL) holds `workspace_id`-scoped
+  durable `learnings` and `documents`, Living Repo Map `repo_map_cards`
+  (`~/.minni/vault/maps/<workspace>/`), typed `memory_links` / `learning_links`
+  (`updates`, `contradicts`, `extends`, `relates`), `candidate_packets`,
+  `handoff_leases`, and episodic/contradiction events, paired with a shared FAISS
+  index and the auto-maintained `~/.minni/TODAY.md` (`0600`) operator digest.
 
 Recall merges the tiers by `scope`: `personal` (caller's index, falling back
 to shared), `combined` (all per-vault indexes plus shared, pre-filtering foreign
 vaults via `_should_query_foreign_vault`), or `both` (the
-default — personal and combined merged, deduplicating the caller's own hits).
+default — personal and combined merged, deduplicating the caller's own hits),
+while enforcing principal, workspace, and `privacy_level` read authorization across
+`search`, `read`, `minni_drill`, and `project_shelf`.
 Learnings always come from the shared DB. Full provenance — owning agent,
-source vault, score components, `indexed_at` — is available via `minni_drill`.
+source vault, score components, `indexed_at`, and typed graph links — is available
+via `minni_drill` (`m:<8hex>` handles, `d:<src>:<id>` refs, chunk IDs, or wikilinks,
+including repo-map path wikilinks).
 
-Vaults are the human-readable surface: wiki (synthesis pages, handoff notes,
-learning notes), inbox (candidate drafts, hook packets), outbox (outgoing
-handoffs), logs (append-oriented audit trail). Agents use the plugin/daemon
-contracts instead of scraping another agent's private vault directly.
+Vaults and `~/.minni/TODAY.md` are the human-readable surfaces: `layer1/core.md`
+(standing agent identity), `wiki/` (synthesis pages, plan notes, session learning
+notes), `inbox/` (candidate drafts, hook packets), `outbox/` (outgoing handoffs),
+`logs/log.md` (append-oriented audit trail), and CLI views (`minni status`,
+`minni activity`, `minni watch`, `minni doctor`). Agents use the 12 MCP tools and
+daemon contracts instead of scraping another agent's private vault directly.
 
-## Retrieval
+## Retrieval, Living Repo Maps & Typed Graph
 
 The retrieval stack (`src/minni/retrieval.py` + `trie_index.py`, `fts_search.py`,
-`semantic_rerank.py`) is a tiered hybrid pipeline:
+`semantic_rerank.py`, `repo_map.py`, `graph_coordinator.py`) is a workspace-aware
+hybrid pipeline:
 
+- **Living Repo Maps (`minni map [<repo>]`)**: synthesizes Subsystem Map Cards
+  (`~/.minni/vault/maps/<workspace>/` + `repo_map_cards`) from `AGENTS.md`, `docs/`,
+  and source symbols pinned to owning file paths and `git` HEAD SHA (storing maps
+  and scars rather than raw line-by-line source code). On `minni_recall`,
+  `minni_drill`, and `SessionStart`, a bounded `300ms` `git diff --name-only`
+  check stamps cards whose owned files changed since build (`[Note: Map built at <sha7>; changed since then: ...]`) and queues a debounced background refresh.
 - **Tier 1 (in-memory prefix/token Trie, `< 0.5 ms`)**: exact/prefix lexical
   lookup (`TrieIndexMixin` in the daemon and `searchVaultNotes` Trie in
   `plugins/minni/src/vault.ts`), invalidated on `(vault_path, mtime_ns)`.
 - **Tier 2 (SQLite FTS5/BM25, `< 10 ms` `mode="fast"`)**: deterministic lexical
   recall (`FtsSearchMixin`) paired with Tier 1 Trie boosts for sub-10 ms hook
   and fast-mode queries without invoking neural inference.
-- **Tier 3 (hybrid vector + RRF + Cross-Encoder reranking)**: FAISS vector
-  search (`faiss-disk` / `faiss-mem`) fused with FTS5 via weighted Reciprocal
-  Rank Fusion (`0.60` FTS / `0.40` semantic), reserving the top-10 FTS BM25
-  slots prior to Cross-Encoder reranking (`SemanticRerankMixin`) and enforcing a
-  `>= 0.35` post-rerank confidence floor, optional NLI claim-attribution
-  scoring, MMR-diverse token-budgeted packing, and progressive depth tiers
-  (`headline` / `snippet` / `chunk` / `document`) — merged across the personal
-  and shared legs by recall scope.
+- **Tier 3 (Repo-First hybrid vector + RRF + Cross-Encoder reranking + Typed Graph)**:
+  FAISS vector search (`faiss-disk` / `faiss-mem`) fused with FTS5 via weighted
+  Reciprocal Rank Fusion (`0.60` FTS / `0.40` semantic), reserving the top-10 FTS
+  BM25 slots prior to Cross-Encoder reranking (`SemanticRerankMixin`) and enforcing
+  the post-rerank confidence floor across **all** candidates (including single-token
+  FTS overlap and HyDE enrichment, stripping blank `<EVIDENCE>` bodies). Ranking
+  prioritizes **current `workspace_id` + `global`** first (holding foreign workspaces
+  to a high cross-repo bar), expands typed `memory_links` (`expand_typed_graph`),
+  automatically retires superseded durable projections via `GraphCoordinator` +
+  `EdgeClassifier` (with chunked local AFM and deterministic fallback), and packs
+  MMR-diverse results across `headline` / `snippet` / `chunk` / `document` depths.
 
 ## The AFM pass pipeline
 
@@ -382,11 +400,11 @@ candidates still go through the normal propose→approve gate above.
 
 | Invariant | Meaning |
 |---|---|
-| Identity loads whole | Agent identity and standing rules are not chunked |
-| Knowledge loads chunked | Large docs/history are retrieved by need and cited |
-| Recall is evidence | Retrieved content is never automatically instruction |
-| Learning is proposal-first | `learn` stages a candidate; durable memory requires approval or the audited operator escape |
-| Documents are two-tier | Personal `.index` per vault + shared pooled layer, merged by scope |
-| Learnings are shared-DB | Durable learnings, candidates, leases, events live in `~/.minni/minni.db` |
-| Vaults are per-agent | Shared daemon, separate human-readable workspaces, separate personal indexes |
+| Identity & boot shelf load whole | `layer1/core.md` (up to `24 KB`) and `project_shelf` (`<= 2,500` chars) are never chunked or floor-crushed |
+| Maps orient, knowledge cites | Living Repo Maps (`minni map`) track SHA-pinned subsystems and scars; docs/learnings load by need with `<EVIDENCE>` provenance |
+| Recall is evidence | Retrieved content is never automatically instruction, and hooks are strictly non-blocking across all hosts |
+| Learning is proposal-first & graph-linked | `learn` stages a candidate; accepted learnings wire `memory_links`, auto-supersede stale facts, and refresh `~/.minni/TODAY.md` |
+| Documents are two-tier & workspace-scoped | Personal `.index` per vault + shared pooled layer tagged by `workspace_id` (`workspace-<repo>` / `global`) |
+| Learnings are shared-DB | Durable learnings, repo maps, memory links, candidates, leases, and events live in `~/.minni/minni.db` |
+| Vaults are per-agent | Shared daemon, separate human-readable workspaces, separate personal indexes, zero localhost web UI |
 | Local transport first | Unix socket by default; provider calls are explicit and gated |

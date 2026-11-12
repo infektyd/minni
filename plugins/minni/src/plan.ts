@@ -3055,13 +3055,13 @@ export async function activatePlanChecked(
   if (TERMINAL_PLAN_STATUSES.has(scalars.status)) {
     return {
       ok: false,
-      error: `plan ${plan_id} has terminal status '${scalars.status}' and cannot be re-activated; create a new plan (minni_thread_create) or restore a prior revision (minni_thread_restore) instead`,
+      error: `plan ${plan_id} has terminal status '${scalars.status}' and cannot be re-activated; create a new plan (minni_thread_create) instead`,
     };
   }
   if (allSlicesResolved(scalars.slices)) {
     return {
       ok: false,
-      error: `plan ${plan_id} has every slice resolved (done/superseded) and is effectively complete despite its '${scalars.status}' status; it cannot be re-activated — create a new plan (minni_thread_create) or restore a prior revision (minni_thread_restore) instead`,
+      error: `plan ${plan_id} has every slice resolved (done/superseded) and is effectively complete despite its '${scalars.status}' status; it cannot be re-activated — create a new plan (minni_thread_create) instead`,
     };
   }
   await setActivePlan(vaultPath, plan_id, notePath, options);
@@ -3410,13 +3410,13 @@ export async function resolvePlanIdOrActive(
       if (liveOthers.length > 0) {
         const other = liveOthers[0];
         return {
-          error: `no plan_id provided and no active plan is bound to this session (another live session is working on ${other.plan_id}); pass plan_id explicitly or activate one with minni_thread_activate`,
+          error: `no plan_id provided and no active plan is bound to this session (another live session is working on ${other.plan_id}); pass plan_id explicitly or activate one with minni_thread_update ({ plan_id, activate: true })`,
         };
       }
     }
     return {
       error:
-        "no plan_id provided and no active plan is set; pass plan_id explicitly or activate one with minni_thread_activate",
+        "no plan_id provided and no active plan is set; pass plan_id explicitly or activate one with minni_thread_update ({ plan_id, activate: true })",
     };
   }
   return { plan_id: active.plan_id };

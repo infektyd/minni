@@ -481,3 +481,17 @@ def test_root_vs_hidden_gemini_divergence_is_named_and_additive(tmp_path):
     assert proc.returncode == 1, out
     assert "root-vs-hidden divergence" in out
     assert "0.1.0" in out, f"other-manifest drift suppressed by divergence: {out}"
+
+
+def test_check_versions_fails_on_drifted_root_claude_plugin(tmp_path):
+    """BUG-69: root .claude-plugin/plugin.json must be checked at repo layer."""
+    drifted = tmp_path / "root-claude-plugin.json"
+    drifted.write_text(json.dumps({"name": "minni", "version": "0.1.0"}), encoding="utf-8")
+    proc = _run(
+        "--repo-only",
+        env_extra={"MINNI_CHECK_VERSIONS_ROOT_CLAUDE_PLUGIN": str(drifted)},
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "0.1.0" in out
+

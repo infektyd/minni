@@ -908,6 +908,7 @@ export function isSharedGateUnavailable(error: string | undefined): boolean {
   if (message.includes("Method not found: gate.shared")) return true;
   if (message.startsWith("Socket not found:")) return true;
   if (message === "JSON-RPC request timed out") return true;
+  if (message === "No socket attempted" || message === "socket unavailable") return true;
   // Anchor transport error codes to the START of the message (the shape Node
   // surfaces them in: "connect ECONNREFUSED ...", "ENOENT: no such file ...").
   // Matching them anywhere would let an IDENTITY/authz rejection whose reason
@@ -915,6 +916,47 @@ export function isSharedGateUnavailable(error: string | undefined): boolean {
   // as an availability degrade — inverting fail-loud-on-identity into
   // fail-open. Availability degrades; identity must stay loud.
   return /^(?:Error:\s*)?(?:connect\s+)?(?:ECONNREFUSED|ENOENT|EPERM|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTSOCK)\b/.test(message);
+}
+
+function isExplicitDrillAuthzOrIdentityDenial(rpcRes: JsonResult<Record<string, unknown>>): boolean {
+  if (identityDenialFrom(rpcRes.data) !== undefined) return true;
+  if (recoveryRouteFrom(rpcRes.data) !== undefined) return true;
+  const errObj =
+    rpcRes.data &&
+    typeof rpcRes.data === "object" &&
+    rpcRes.data.error !== null &&
+    typeof rpcRes.data.error === "object"
+      ? (rpcRes.data.error as Record<string, unknown>)
+      : undefined;
+  const code = typeof errObj?.code === "number" ? errObj.code : undefined;
+  if (code === -32004 || code === -32003) return true;
+  const errMsg = `${typeof errObj?.message === "string" ? errObj.message : ""} ${rpcRes.error ?? ""}`.toLowerCase();
+  if (
+    errMsg.includes("unknown_identity") ||
+    errMsg.includes("capability_denied") ||
+    errMsg.includes("access_denied") ||
+    errMsg.includes("vault_root_denied") ||
+    errMsg.includes("reserved_agent_id") ||
+    errMsg.includes("identity recovery")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function canDrillFallbackOffline(rpcRes: JsonResult<Record<string, unknown>>): boolean {
+  if (isExplicitDrillAuthzOrIdentityDenial(rpcRes)) return false;
+  if (
+    rpcRes.data &&
+    typeof rpcRes.data === "object" &&
+    rpcRes.data.error !== null &&
+    typeof rpcRes.data.error === "object"
+  ) {
+    return false;
+  }
+  if (isSharedGateUnavailable(rpcRes.error)) return true;
+  const msg = (rpcRes.error ?? "").trim().toLowerCase();
+  return msg === "daemon unreachable" || msg === "daemon down";
 }
 
 export interface DrillMemoryInput {
@@ -968,12 +1010,14 @@ async function resolveSqliteHandleNote(
   hasExplicitVaultPath: boolean,
   normalizedHandle: string,
   sessionEntry?: Awaited<ReturnType<typeof readSessionHandle>>,
+  callerAgentId?: string,
 ): Promise<{ source: string; title: string; content: string } | null> {
   const candidateDbPaths = [
     path.join(path.dirname(effectiveVaultPath), "minni.db"),
     path.join(effectiveVaultPath, "minni.db"),
     ...(!hasExplicitVaultPath ? [path.join(minniHome(), "minni.db")] : []),
   ];
+  const normalizedCallerAgent = (callerAgentId ?? "").trim();
   const matchesHandle = (seed: string | undefined | null): boolean => {
     if (!seed || typeof seed !== "string") return false;
     const s = seed.trim();
@@ -993,20 +1037,95 @@ async function resolveSqliteHandleNote(
         ? Number(docMkeyMatch[1])
         : undefined;
 
-  const isRowUnsafeOrInactive = (row: Record<string, unknown>): boolean => {
-    const status = String(row.status ?? row.page_status ?? "active").trim().toLowerCase();
+  const isExpiredValue = (rawExpires: unknown): boolean => {
+    if (rawExpires === null || rawExpires === undefined) return false;
+    if (typeof rawExpires === "number") {
+      return Number.isFinite(rawExpires) && rawExpires * 1000 <= Date.now();
+    }
+    if (typeof rawExpires === "string") {
+      const trimmed = rawExpires.trim();
+      if (!trimmed) return false;
+      const asNum = Number(trimmed);
+      if (Number.isFinite(asNum)) {
+        return asNum * 1000 <= Date.now();
+      }
+      const parsedMs = Date.parse(trimmed.includes("T") ? trimmed : `${trimmed.replace(" ", "T")}Z`);
+      if (!Number.isNaN(parsedMs)) {
+        return parsedMs <= Date.now();
+      }
+    }
+    return false;
+  };
+
+  const isDocRowDisallowed = (
+    docRow: Record<string, unknown>,
+    fallbackOwnerAgent?: string,
+  ): boolean => {
     if (
-      status === "rejected" ||
-      status === "expired" ||
-      status === "superseded" ||
-      status === "draft" ||
-      status === "complete"
+      docRow.superseded_by !== null &&
+      docRow.superseded_by !== undefined &&
+      String(docRow.superseded_by).trim() !== ""
     ) {
       return true;
     }
-    const privacy = String(row.privacy ?? row.privacy_level ?? "safe").trim().toLowerCase();
-    if (privacy === "private" || privacy === "blocked") {
+    if (isExpiredValue(docRow.expires_at)) return true;
+    const pageStatus = String(docRow.page_status ?? docRow.status ?? "accepted")
+      .trim()
+      .toLowerCase();
+    if (
+      pageStatus === "rejected" ||
+      pageStatus === "superseded" ||
+      pageStatus === "expired" ||
+      pageStatus === "archived" ||
+      pageStatus === "retired" ||
+      pageStatus === "deleted" ||
+      pageStatus === "draft" ||
+      pageStatus === "complete"
+    ) {
       return true;
+    }
+    const privacy = String(docRow.privacy_level ?? docRow.privacy ?? "safe")
+      .trim()
+      .toLowerCase();
+    if (privacy === "blocked" || privacy === "secret" || privacy === "local-only") {
+      return true;
+    }
+    if (privacy === "private") {
+      const ownerAgent = String(docRow.agent ?? docRow.agent_id ?? fallbackOwnerAgent ?? "").trim();
+      if (!normalizedCallerAgent || !ownerAgent || ownerAgent !== normalizedCallerAgent) {
+        return true;
+      }
+    }
+    const durability = String(docRow.durability_of ?? "").trim().toLowerCase();
+    if (durability === "noise") return true;
+    return false;
+  };
+
+  const isLearningRowUnsafeOrInactive = (row: Record<string, unknown>): boolean => {
+    if (
+      row.superseded_by !== null &&
+      row.superseded_by !== undefined &&
+      String(row.superseded_by).trim() !== ""
+    ) {
+      return true;
+    }
+    if (isExpiredValue(row.expires_at)) return true;
+    const rawStatus =
+      row.status !== null && row.status !== undefined && String(row.status).trim() !== ""
+        ? String(row.status).trim().toLowerCase()
+        : "active";
+    if (rawStatus !== "active" && rawStatus !== "accepted") {
+      return true;
+    }
+    const privacy = String(row.privacy ?? row.privacy_level ?? "safe").trim().toLowerCase();
+    if (privacy === "blocked" || privacy === "secret" || privacy === "local-only") {
+      return true;
+    }
+    if (privacy === "private") {
+      const ownerAgent = String(row.agent_id ?? row.agent ?? "").trim();
+      if (!normalizedCallerAgent || !ownerAgent || ownerAgent !== normalizedCallerAgent) {
+        return true;
+      }
     }
     const durability = String(row.durability_of ?? "").trim().toLowerCase();
     if (durability === "noise") {
@@ -1032,6 +1151,42 @@ async function resolveSqliteHandleNote(
             .all()
             .map((r) => String(r.name ?? "")),
         );
+        const docCols = tables.has("documents")
+          ? new Set(
+              db
+                .prepare("PRAGMA table_info(documents)")
+                .all()
+                .map((r) => String(r.name ?? "")),
+            )
+          : new Set<string>();
+        const isLearningBlockedByLinkedDocs = (
+          learningRow: Record<string, unknown>,
+          rowIdStr: string,
+        ): boolean => {
+          if (!tables.has("documents") || !rowIdStr) return false;
+          const fallbackOwner = String(learningRow.agent_id ?? learningRow.agent ?? "").trim();
+          const numId = Number(rowIdStr);
+          if (tables.has("learning_documents") && docCols.has("doc_id")) {
+            const linked = db
+              .prepare(
+                "SELECT d.* FROM learning_documents ld JOIN documents d ON d.doc_id = ld.doc_id WHERE ld.learning_id = ?",
+              )
+              .all(Number.isFinite(numId) ? numId : rowIdStr);
+            if (linked.some((d) => isDocRowDisallowed(d, fallbackOwner))) {
+              return true;
+            }
+          }
+          if (docCols.has("memory_uri")) {
+            const uriLinked = db
+              .prepare("SELECT * FROM documents WHERE memory_uri = ?")
+              .all(`learning://${rowIdStr}`);
+            if (uriLinked.some((d) => isDocRowDisallowed(d, fallbackOwner))) {
+              return true;
+            }
+          }
+          return false;
+        };
+
         if (tables.has("learnings")) {
           const learnCols = new Set(
             db
@@ -1048,21 +1203,24 @@ async function resolveSqliteHandleNote(
             const byId = db
               .prepare(`SELECT * FROM learnings WHERE ${learnIdCol} = ? LIMIT 1`)
               .all(targetLearningId);
-            if (byId.length > 0 && !isRowUnsafeOrInactive(byId[0])) {
+            if (byId.length > 0 && !isLearningRowUnsafeOrInactive(byId[0])) {
               const row = byId[0];
               const rowId = String(row.learning_id ?? row.id ?? targetLearningId);
-              const key = String(row.key ?? row.title ?? `learning:${rowId}`);
-              const source = String(row.source ?? row.category ?? `learning:${rowId}`);
-              const content = String(row.content ?? row.value ?? row.body ?? "");
-              return { source, title: key || source, content: content || key };
+              if (!isLearningBlockedByLinkedDocs(row, rowId)) {
+                const key = String(row.key ?? row.title ?? `learning:${rowId}`);
+                const source = String(row.source ?? row.category ?? `learning:${rowId}`);
+                const content = String(row.content ?? row.value ?? row.body ?? "");
+                return { source, title: key || source, content: content || key };
+              }
             }
           }
           const rows = db
             .prepare(`SELECT * FROM learnings ORDER BY ${learnIdCol} DESC LIMIT 5000`)
             .all();
           for (const row of rows) {
-            if (isRowUnsafeOrInactive(row)) continue;
+            if (isLearningRowUnsafeOrInactive(row)) continue;
             const rowId = String(row.learning_id ?? row.id ?? "");
+            if (isLearningBlockedByLinkedDocs(row, rowId)) continue;
             const key = String(row.key ?? row.title ?? rowId);
             const source = String(row.source ?? row.category ?? (key ? `learnings/${key}` : "learnings"));
             const content = String(row.content ?? row.value ?? row.body ?? "");
@@ -1082,12 +1240,6 @@ async function resolveSqliteHandleNote(
           }
         }
         if (tables.has("documents")) {
-          const docCols = new Set(
-            db
-              .prepare("PRAGMA table_info(documents)")
-              .all()
-              .map((r) => String(r.name ?? "")),
-          );
           const docIdCol = docCols.has("doc_id")
             ? "doc_id"
             : docCols.has("id")
@@ -1114,7 +1266,7 @@ async function resolveSqliteHandleNote(
             const byId = db
               .prepare(`SELECT * FROM documents WHERE ${docIdCol} = ? LIMIT 1`)
               .all(targetDocId);
-            if (byId.length > 0 && !isRowUnsafeOrInactive(byId[0])) {
+            if (byId.length > 0 && !isDocRowDisallowed(byId[0])) {
               const row = byId[0];
               const rowId = String(row.doc_id ?? row.id ?? targetDocId);
               const source = String(row.path ?? row.source ?? row.uri ?? rowId ?? "documents");
@@ -1134,7 +1286,7 @@ async function resolveSqliteHandleNote(
             .prepare(`SELECT * FROM documents ORDER BY ${docIdCol} DESC LIMIT 5000`)
             .all();
           for (const row of rows) {
-            if (isRowUnsafeOrInactive(row)) continue;
+            if (isDocRowDisallowed(row)) continue;
             const rowId = String(row.doc_id ?? row.id ?? "");
             const source = String(row.path ?? row.source ?? row.uri ?? rowId ?? "documents");
             const title = String(row.title ?? source);
@@ -1206,6 +1358,7 @@ export async function drillMemory(
     : baseRequester;
 
   const rawVaultInput = input.vaultPath ?? config?.vaultPath;
+  const effectiveAgentId = input.agentId ?? config?.agentId;
   const isUnconfiguredDefault =
     !rawVaultInput ||
     (path.basename(rawVaultInput) === "unknown-vault" && !existsSync(rawVaultInput));
@@ -1286,28 +1439,16 @@ export async function drillMemory(
               });
               continue;
             }
-            const sqliteResolved = await resolveSqliteHandleNote(
-              effectiveVaultPath,
-              hasExplicitVaultPath,
-              normalizedHandle,
+            // Route uncached m:<8hex> handles through sm_drill first so live daemon
+            // identity/authz checks (-32004 / -32003) cannot be bypassed; offline
+            // SQLite fallback runs at L1555+ ONLY when canDrillFallbackOffline(rpcRes) holds.
+            daemonReferences.push(normalizedHandle);
+            daemonMeta.push({
+              handle: normalizedHandle,
+              source_unverified: sessionEntry === null,
               sessionEntry,
-            );
-            if (sqliteResolved) {
-              const clipped = formatLocalDrillBody(sqliteResolved.content, input.depth);
-              const wrapped = clipped.trim()
-                ? `<EVIDENCE source="${xmlAttrEscapeDrill(sqliteResolved.source)}">\n${clipped}\n</EVIDENCE>`
-                : "";
-              localResults.push({
-                handle: normalizedHandle,
-                status: "resolved",
-                found: true,
-                relativePath: sqliteResolved.source,
-                source: sqliteResolved.source,
-                title: sqliteResolved.title,
-                content: wrapped,
-              });
-              continue;
-            }
+            });
+            continue;
           }
           localResults.push({
             handle: normalizedHandle,
@@ -1411,6 +1552,7 @@ export async function drillMemory(
         ...(input.chunkIds ? { chunk_ids: input.chunkIds } : {}),
         references: daemonReferences,
         depth: input.depth ?? "snippet",
+        ...(effectiveAgentId ? { agent_id: effectiveAgentId } : {}),
       },
       requester,
     )) as JsonResult<Record<string, unknown>>;
@@ -1456,8 +1598,12 @@ export async function drillMemory(
       };
     }
 
-    // If daemon RPC failed and all daemonMeta entries are m:<8hex> handles, try SQLite fallback
-    if (daemonMeta.length > 0 && daemonMeta.every((m) => m.handle?.startsWith("m:"))) {
+    // If daemon RPC failed due to transport/availability (NEVER an explicit daemon authz/identity denial) and all daemonMeta entries are m:<8hex> handles, try SQLite fallback
+    if (
+      canDrillFallbackOffline(rpcRes) &&
+      daemonMeta.length > 0 &&
+      daemonMeta.every((m) => m.handle?.startsWith("m:"))
+    ) {
       let allSqliteResolved = true;
       for (const meta of daemonMeta) {
         const sqlHit = meta.handle
@@ -1466,6 +1612,7 @@ export async function drillMemory(
               hasExplicitVaultPath,
               meta.handle,
               meta.sessionEntry,
+              effectiveAgentId,
             )
           : null;
         if (!sqlHit || !meta.handle) {
@@ -1500,11 +1647,18 @@ export async function drillMemory(
     }
 
     const firstMeta = daemonMeta[0] ?? {};
+    const isOfflineMissingMHandle =
+      canDrillFallbackOffline(rpcRes) &&
+      Boolean(firstMeta.handle?.startsWith("m:")) &&
+      firstMeta.doc_id === undefined;
     return {
       ok: false,
-      error: rpcRes.error ?? `handle_not_found: ${String(firstMeta.handle ?? "")}`,
+      error: isOfflineMissingMHandle
+        ? `handle_not_found: ${String(firstMeta.handle ?? "")}`
+        : (rpcRes.error ?? `handle_not_found: ${String(firstMeta.handle ?? "")}`),
       data: {
         found: false,
+        ...(isOfflineMissingMHandle ? { status: "unresolved", reason: "missing" } : {}),
         ...(firstMeta.handle ? { handle: firstMeta.handle } : {}),
         ...(firstMeta.doc_id !== undefined ? { doc_id: firstMeta.doc_id } : {}),
         ...(firstMeta.src ? { src: firstMeta.src } : {}),
@@ -1523,16 +1677,17 @@ export async function drillMemory(
       chunk_ids: input.chunkIds,
       references: rawRefs.length > 0 ? rawRefs : input.references,
       depth: input.depth ?? "snippet",
-      ...(input.agentId
-        ? { agent_id: input.agentId }
-        : config?.agentId
-          ? { agent_id: config.agentId }
-          : {}),
+      ...(effectiveAgentId ? { agent_id: effectiveAgentId } : {}),
     },
     requester,
   )) as JsonResult<Record<string, unknown>>;
 
-  if (!rpcRes.ok && rawRefs.length > 0 && rawRefs.every((r) => typeof r === "string")) {
+  if (
+    !rpcRes.ok &&
+    canDrillFallbackOffline(rpcRes) &&
+    rawRefs.length > 0 &&
+    rawRefs.every((r) => typeof r === "string")
+  ) {
     const fallbackResults: Array<Record<string, unknown>> = [];
     for (const rawRef of rawRefs) {
       const refStr = String(rawRef).trim();
@@ -2371,20 +2526,6 @@ export async function recallCrossAgentDegrade(
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<string | undefined> {
   if (!denial || !isCrossAgentCapabilityDenial(denial) || crossAgentRequested !== true) {
-    return undefined;
-  }
-  // Review r4 (P2): the personal-scope retry runs through recallMemory, which
-  // does not (and, for an authenticated principal, cannot) rescope the daemon
-  // search to a caller-requested workspace — daemon `search` scopes documents
-  // from the STAMPED principal's workspace (recall.py:880 uses
-  // principal.workspace_id, ignoring any per-request workspace_id), while
-  // recallMemory never even serializes workspaceId onto the wire. So when a
-  // NON-DEFAULT workspace was explicitly requested, the retry would surface
-  // stamped/default-workspace personal hits while the degrade note claims
-  // "personal-scope results", hiding the requested workspace's real denial/
-  // empty answer. Skip the degrade when the workspace cannot be honored; the
-  // caller then falls through to recallResponseText's denial/remedy text.
-  if (input.workspaceId !== undefined && input.workspaceId !== DEFAULT_WORKSPACE_ID) {
     return undefined;
   }
   const personalRetry = await recallMemory(

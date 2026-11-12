@@ -5,8 +5,8 @@ Three layers, because a version can disagree with itself in three places and
 only one of them used to be checked:
 
   repo        pyproject (canonical), package.json, the five plugin manifests,
-              .claude-plugin/marketplace.json, and version literals in
-              propagate.py.
+              .claude-plugin/plugin.json, .claude-plugin/marketplace.json, and
+              version literals in propagate.py.
   installed   the pip metadata for the `minni` distribution on this machine.
   deployed    the plugin manifests inside every deployment under $HOME.
 
@@ -41,6 +41,10 @@ PACKAGE_JSON = REPO_ROOT / "plugins" / "minni" / "package.json"
 MARKETPLACE = Path(
     os.environ.get("MINNI_CHECK_VERSIONS_MARKETPLACE")
     or (REPO_ROOT / ".claude-plugin" / "marketplace.json")
+)
+ROOT_CLAUDE_PLUGIN = Path(
+    os.environ.get("MINNI_CHECK_VERSIONS_ROOT_CLAUDE_PLUGIN")
+    or (REPO_ROOT / ".claude-plugin" / "plugin.json")
 )
 PROPAGATE = Path(
     os.environ.get("MINNI_CHECK_VERSIONS_PROPAGATE")
@@ -113,10 +117,15 @@ def read_pyproject_version() -> str:
 
 
 def read_json_version(path: Path) -> str:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"UNINSPECTABLE — cannot read {path}: {type(exc).__name__}: {exc}"
+        ) from exc
     version = data.get("version")
     if not isinstance(version, str):
-        raise SystemExit(f"Missing version field in {path}")
+        raise SystemExit(f"UNINSPECTABLE — missing version field in {path}")
     return version
 
 
@@ -163,6 +172,20 @@ def check_repo(canonical: str) -> list[str]:
         ver = read_json_version(path)
         if ver != canonical:
             mismatches.append(f"{path.relative_to(REPO_ROOT)} version {ver!r} != {canonical!r}")
+
+    root_claude_plugin = Path(
+        os.environ.get("MINNI_CHECK_VERSIONS_ROOT_CLAUDE_PLUGIN")
+        or ROOT_CLAUDE_PLUGIN
+    )
+    root_claude_ver = read_json_version(root_claude_plugin)
+    if root_claude_ver != canonical:
+        try:
+            root_label = str(root_claude_plugin.relative_to(REPO_ROOT))
+        except ValueError:  # overridden for tests
+            root_label = str(root_claude_plugin)
+        mismatches.append(
+            f"{root_label} version {root_claude_ver!r} != {canonical!r}"
+        )
 
     market_ver = read_marketplace_version(MARKETPLACE)
     if market_ver != canonical:
