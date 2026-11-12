@@ -4488,8 +4488,10 @@ test("final-fix-4: workerUpdate surfaces a real persistPlan history-append failu
 // Regression 3: hardened, descriptor-anchored receipt-generation pruning.
 
 test("final-fix-4: parent swap during receipt-generation pruning deletes the real directory and never redirects outside the vault", async (t) => {
-  const vaultPath = await mkdtemp(path.join(tmpdir(), "minni-receipt-prune-"));
-  t.after(() => rm(vaultPath, { recursive: true, force: true }));
+  const baseDir = await mkdtemp(path.join(tmpdir(), "minni-receipt-prune-"));
+  t.after(() => rm(baseDir, { recursive: true, force: true }));
+  const vaultPath = path.join(baseDir, "vault-g0");
+  await mkdir(vaultPath, { mode: 0o700 });
   const planId = "plan-prune-swap";
   const sliceId = "slice-prune-swap";
   const generation = 0;
@@ -4537,7 +4539,7 @@ test("final-fix-4: parent swap during receipt-generation pruning deletes the rea
   claimFs.open = async (target, flags, ...args) => {
     if (
       !swapped &&
-      String(target).endsWith(`g${generation}`) &&
+      path.basename(String(target)) === `g${generation}` &&
       (Number(flags) & constants.O_DIRECTORY) !== 0
     ) {
       swapped = true;

@@ -21,18 +21,18 @@ export const MEMORY_CONTRACT =
  * onto their single existing flow. (claude-code only; not in the shared factory.)
  */
 export const MINNI_LIFECYCLE_LINE =
-  "🧭 Minni lifecycle (reach for these): prepare_task = orient before ambitious work · prepare_outcome = distill before flush · thread = track & coordinate (minni_thread_*, handoff) · learn = commit a durable finding.";
+  "🧭 Minni lifecycle (reach for these): recall = orient before ambitious work · drill = expand recalled cards/scars · thread = track & coordinate (minni_thread_*, handoff) · learn = commit a durable finding.";
 
-export type LifecycleSurface = "prepare_task" | "prepare_outcome" | "thread" | "learn";
+export type LifecycleSurface = "recall" | "drill" | "thread" | "learn";
 
 /**
  * Map an ambition intent (task.ts `classifyIntent`: plan/implement/debug/review/
  * verify/work) to the lifecycle surface to EMPHASIZE this turn, or null when the
  * turn warrants no emphasis (the persistent line still shows regardless). The
  * generic `work` fallback and `none` get no emphasis — emphasizing on the
- * catch-all would fire every turn. prepare_outcome / learn are event-driven
- * (wind-down / durable finding), not prompt-intent-driven, so they are not
- * mapped here.
+ * catch-all would fire every turn. drill / learn are situational or event-driven
+ * (expanding recalled cards / durable finding), not prompt-intent-driven, so they
+ * are not mapped here.
  */
 export function lifecycleSurfaceForIntent(intent: string): LifecycleSurface | null {
   if (intent === "plan") return "thread";
@@ -42,7 +42,7 @@ export function lifecycleSurfaceForIntent(intent: string): LifecycleSurface | nu
     intent === "review" ||
     intent === "verify"
   ) {
-    return "prepare_task";
+    return "recall";
   }
   return null;
 }
@@ -54,12 +54,12 @@ export function lifecycleSurfaceForIntent(intent: string): LifecycleSurface | nu
  */
 export function buildLifecycleEmphasis(surface: LifecycleSurface): string {
   switch (surface) {
-    case "prepare_task":
-      return "↳ Ambitious task — reach for `minni_prepare_task` to ground in prior decisions before diving in.";
+    case "recall":
+      return "↳ Ambitious task — reach for `minni_recall` to ground in prior decisions before diving in.";
+    case "drill":
+      return "↳ Deeper context — `minni_drill` to expand recalled cards, handles, or scars.";
     case "thread":
       return "↳ Planning/coordination — `minni_thread_*` to track it; `handoff` to coordinate across agents.";
-    case "prepare_outcome":
-      return "↳ Winding down — `minni_prepare_outcome` to dry-run what's worth keeping before a flush.";
     case "learn":
       return "↳ Durable finding — `minni_learn` to commit it (quality-gated).";
   }

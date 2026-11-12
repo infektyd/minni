@@ -1442,7 +1442,7 @@ async function stopCoreOutput(
     systemMessage: `Minni: ${candidates.length} candidate learning${
       candidates.length === 1 ? "" : "s"
     } drafted to inbox (${inbox.filePath}). ${
-      config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
+      config.stopCommitHint ?? "Use minni_learn / minni_list_candidates to review and commit."
     }${receiptLine}`,
   };
 }
@@ -2181,7 +2181,7 @@ export function createHookHandlers(
       envelopeBody.fallback_commands = {
         layer1: `node dist/${config.hookScript} SessionStart < /dev/null`,
         daemon_read: `node dist/cli.js read ${config.runtime}`,
-        recall: "node dist/cli.js prepare '<task>'",
+        recall: "minni recall '<task>'",
       };
       // hooks-PL-2 (deliberate asymmetry with hook.ts/kilocode): NO
       // recent_learnings envelope field here. agent-context boots inject the
@@ -2231,17 +2231,18 @@ export function createHookHandlers(
         : 0;
     const permanentProjectRawChars =
       typeof projectShelf === "string" ? projectShelf.length : 0;
-    const permanentShelfRawChars = permanentLayer1RawChars + permanentProjectRawChars;
     const permanentShelfSerializedChars =
       (permanentLayer1RawChars > 0 ? JSON.stringify(envelopeBody.layer1_shelf).length : 0) +
       (permanentProjectRawChars > 0 ? JSON.stringify(projectShelf).length : 0);
     const rawHostInlineCap = wireCapabilities(wire).hostInlineCapChars;
     const sessionStartCharLimit =
-      rawHostInlineCap !== undefined && permanentShelfRawChars + 1_800 > rawHostInlineCap
+      permanentShelfSerializedChars > 0 &&
+      rawHostInlineCap !== undefined &&
+      permanentShelfSerializedChars + 8_000 > rawHostInlineCap
         ? Math.min(40_000, permanentShelfSerializedChars + 8_000)
         : rawHostInlineCap;
     const sessionStartBudget =
-      permanentShelfRawChars + 2_800 > budget * 4
+      permanentShelfSerializedChars > 0 && permanentShelfSerializedChars + 8_000 > budget * 4
         ? Math.max(budget, Math.ceil((permanentShelfSerializedChars + 8_000) / 4))
         : budget;
 
@@ -2521,6 +2522,7 @@ export function createHookHandlers(
     // <SYSTEM_MESSAGE> / <task-notification> wakeups above) and re-inject the
     // Two-Part Permanent Shelf once on this user turn.
     let postCompactShelfFields: Record<string, unknown> | null = null;
+    let postCompactPermanentSerializedChars = 0;
     if (canInject(wire, "UserPromptSubmit")) {
       const postCompactMarker = await consumePostCompactReinjectMarker(
         config.vaultPath,
@@ -2542,13 +2544,61 @@ export function createHookHandlers(
           cwd: upsCwd,
           activePlan: reinjectPlan,
         });
+        const reinjectLayer1Body = layer1ShelfBody(reinjectLayer1);
+        const reinjectLayer1RawChars =
+          reinjectLayer1.ok &&
+          reinjectLayer1.truncated !== true &&
+          typeof reinjectLayer1.content === "string"
+            ? reinjectLayer1.content.length
+            : 0;
+        const reinjectProjectRawChars =
+          typeof reinjectProjectShelf === "string" ? reinjectProjectShelf.length : 0;
+        postCompactPermanentSerializedChars =
+          (reinjectLayer1RawChars > 0 ? JSON.stringify(reinjectLayer1Body).length : 0) +
+          (reinjectProjectRawChars > 0 ? JSON.stringify(reinjectProjectShelf).length : 0);
         postCompactShelfFields = {
-          layer1_shelf: layer1ShelfBody(reinjectLayer1),
+          layer1_shelf: reinjectLayer1Body,
           ...(reinjectProjectShelf ? { project_shelf: reinjectProjectShelf } : {}),
           ...(reinjectPlan ? { active_thread_ref: compactPlanPointer(reinjectPlan) } : {}),
         };
       }
     }
+
+    const wrapUserPromptEnvelope = (rawBody: Record<string, unknown>): string => {
+      if (postCompactShelfFields === null) {
+        return wrapEnvelope({
+          event: "UserPromptSubmit",
+          agent: config.agentId,
+          body: rawBody,
+        });
+      }
+      const upsBaseBudget = envelopeBudgetFor(config.contextWindow);
+      const rawHostInlineCap = wireCapabilities(wire).hostInlineCapChars;
+      const upsCharLimit =
+        postCompactPermanentSerializedChars > 0 &&
+        rawHostInlineCap !== undefined &&
+        postCompactPermanentSerializedChars + 8_000 > rawHostInlineCap
+          ? Math.min(40_000, postCompactPermanentSerializedChars + 8_000)
+          : rawHostInlineCap;
+      const upsTokenLimit =
+        postCompactPermanentSerializedChars > 0 &&
+        postCompactPermanentSerializedChars + 8_000 > upsBaseBudget * 4
+          ? Math.max(upsBaseBudget, Math.ceil((postCompactPermanentSerializedChars + 8_000) / 4))
+          : upsBaseBudget;
+      const fittedBody = fitEnvelope(rawBody, {
+        tokenLimit: upsTokenLimit,
+        charLimit: upsCharLimit,
+        vaultPath: config.vaultPath,
+        event: "UserPromptSubmit",
+        agent: config.agentId,
+      });
+      return wrapEnvelope({
+        event: "UserPromptSubmit",
+        agent: config.agentId,
+        budget: upsTokenLimit,
+        body: fittedBody,
+      });
+    };
 
     // #283 (config.lifecycleEnabled): compute the lifecycle representation
     // once for this turn, BEFORE the early-return gates, so the persistent
@@ -2591,18 +2641,14 @@ export function createHookHandlers(
       ) {
         return render(noIntent);
       }
-      const envelope = wrapEnvelope({
-        event: "UserPromptSubmit",
-        agent: config.agentId,
-        body: {
-          identity: {
-            agent: config.agentId,
-            workspace: workspaceId,
-            task_signature: signature,
-          },
-          ...lifecycleFields,
-          ...(postCompactShelfFields ?? {}),
+      const envelope = wrapUserPromptEnvelope({
+        identity: {
+          agent: config.agentId,
+          workspace: workspaceId,
+          task_signature: signature,
         },
+        ...lifecycleFields,
+        ...(postCompactShelfFields ?? {}),
       });
       return render(injectIntent("UserPromptSubmit", envelope));
     };
@@ -3022,11 +3068,7 @@ export function createHookHandlers(
       };
     }
 
-    const envelope = wrapEnvelope({
-      event: "UserPromptSubmit",
-      agent: config.agentId,
-      body: envelopeBody,
-    });
+    const envelope = wrapUserPromptEnvelope(envelopeBody);
 
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_user_prompt_submit`,
@@ -3362,6 +3404,7 @@ export function createHookHandlers(
   async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = rawSessionIdFromPayload(payload) || "session";
+    const workspaceId = workspaceFor(payload);
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     // Same provenance stamp as SessionStart harvest — dual delivery paths
@@ -3369,7 +3412,7 @@ export function createHookHandlers(
     await harvestSummaryText(
       {
         vaultPath: config.vaultPath,
-        workspaceId: workspaceFor(payload),
+        workspaceId,
         auditPrefix: config.auditPrefix,
         platform: config.runtime ?? config.agentId,
       },
@@ -3380,6 +3423,7 @@ export function createHookHandlers(
         timestamp: asString(payload.summary_timestamp) || undefined,
       },
     );
+    await writePostCompactReinjectMarker(config.vaultPath, sessionId, workspaceId).catch(() => {});
     return { continue: true };
   }
 
@@ -3454,19 +3498,55 @@ export function createHookHandlers(
         cwd: compactCwd,
         activePlan: compactPlan,
       });
-      const envelope = wrapEnvelope({
-        event: "PostCompact",
-        agent: config.agentId,
-        body: {
+      const compactLayer1Body = layer1ShelfBody(compactLayer1);
+      const compactLayer1RawChars =
+        compactLayer1.ok &&
+        compactLayer1.truncated !== true &&
+        typeof compactLayer1.content === "string"
+          ? compactLayer1.content.length
+          : 0;
+      const compactProjectRawChars =
+        typeof compactProjectShelf === "string" ? compactProjectShelf.length : 0;
+      const compactPermanentSerializedChars =
+        (compactLayer1RawChars > 0 ? JSON.stringify(compactLayer1Body).length : 0) +
+        (compactProjectRawChars > 0 ? JSON.stringify(compactProjectShelf).length : 0);
+      const compactBaseBudget = envelopeBudgetFor(config.contextWindow);
+      const rawHostInlineCap = wireCapabilities(wire).hostInlineCapChars;
+      const compactCharLimit =
+        compactPermanentSerializedChars > 0 &&
+        rawHostInlineCap !== undefined &&
+        compactPermanentSerializedChars + 8_000 > rawHostInlineCap
+          ? Math.min(40_000, compactPermanentSerializedChars + 8_000)
+          : rawHostInlineCap;
+      const compactTokenLimit =
+        compactPermanentSerializedChars > 0 &&
+        compactPermanentSerializedChars + 8_000 > compactBaseBudget * 4
+          ? Math.max(compactBaseBudget, Math.ceil((compactPermanentSerializedChars + 8_000) / 4))
+          : compactBaseBudget;
+      const compactBody = fitEnvelope(
+        {
           identity: {
             agent: config.agentId,
             workspace: workspaceId,
             session_id: sessionId,
           },
-          layer1_shelf: layer1ShelfBody(compactLayer1),
+          layer1_shelf: compactLayer1Body,
           ...(compactProjectShelf ? { project_shelf: compactProjectShelf } : {}),
           ...(compactPlan ? { active_thread_ref: compactPlanPointer(compactPlan) } : {}),
         },
+        {
+          tokenLimit: compactTokenLimit,
+          charLimit: compactCharLimit,
+          vaultPath: config.vaultPath,
+          event: "PostCompact",
+          agent: config.agentId,
+        },
+      );
+      const envelope = wrapEnvelope({
+        event: "PostCompact",
+        agent: config.agentId,
+        budget: compactTokenLimit,
+        body: compactBody,
       });
       return render(injectIntent("PostCompact", envelope));
     }

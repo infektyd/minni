@@ -332,11 +332,21 @@ def normalize_workspace_id(raw: object) -> str:
         return "default"
     if low in ("global", "workspace-global"):
         return "global"
+    if "/" in s or "\\" in s:
+        cleaned = s.replace("\\", "/").rstrip("/")
+        base = Path(cleaned).name.strip().lower() if cleaned else ""
+        if not base or base in (".", ".."):
+            return "default"
+        low = base
     if low.startswith("workspace-"):
-        slug = re.sub(r"[^a-z0-9._-]+", "-", low[len("workspace-") :]).strip("-")
-        return f"workspace-{slug}" if slug else "default"
-    slug = re.sub(r"[^a-z0-9._-]+", "-", low).strip("-")
-    return slug or "default"
+        low = low[len("workspace-") :]
+    slug = re.sub(r"[^a-z0-9._-]+", "-", low)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    if not slug or slug in ("default", "unknown"):
+        return "default"
+    if slug == "global":
+        return "global"
+    return f"workspace-{slug}"
 
 
 def human_project_label(workspace_id: object, fallback_name: str | None = None) -> str:
@@ -344,7 +354,13 @@ def human_project_label(workspace_id: object, fallback_name: str | None = None) 
     norm = normalize_workspace_id(workspace_id)
     if norm in ("default", "global"):
         if fallback_name and fallback_name.strip():
-            raw_base = fallback_name.strip()
+            fb = fallback_name.strip()
+            if "/" in fb or "\\" in fb:
+                cleaned_fb = fb.replace("\\", "/").rstrip("/")
+                fb = Path(cleaned_fb).name.strip() if cleaned_fb else ""
+            if fb.lower().startswith("workspace-"):
+                fb = fb[len("workspace-") :]
+            raw_base = fb
         else:
             return "General / Cross-Project"
     elif norm.startswith("workspace-"):

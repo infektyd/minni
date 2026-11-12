@@ -496,14 +496,20 @@ def test_consolidation_dedup_reject_archives_inbox_source(tmp_path, monkeypatch)
 
     with db_obj.cursor() as c:
         row = c.execute(
-            "SELECT principal, content FROM candidate_packets WHERE candidate_id=?", (cid,)
+            "SELECT principal, content, workspace_id FROM candidate_packets WHERE candidate_id=?",
+            (cid,),
         ).fetchone()
         c.execute(
             """INSERT INTO learnings
-               (agent_id, content, content_hash, created_at, status)
-               VALUES (?, ?, ?, ?, 'active')""",
-            (_canonical_principal(row["principal"]), row["content"],
-             content_hash(row["content"]), 1),
+               (agent_id, content, content_hash, workspace_id, created_at, status)
+               VALUES (?, ?, ?, ?, ?, 'active')""",
+            (
+                _canonical_principal(row["principal"]),
+                row["content"],
+                content_hash(row["content"]),
+                row["workspace_id"],
+                1,
+            ),
         )
     assert minnid._reject_candidate_dedup(cid) is True
     assert not (inbox / "dedup.json").exists(), "file must leave the live inbox"

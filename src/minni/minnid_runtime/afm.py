@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional
 
 import minni.obs as obs
 from minni.afm_review_markers import supersede_afm_review
-from minni.config import DEFAULT_CONFIG
+from minni.config import DEFAULT_CONFIG, normalize_workspace_scope
 from minni.db import MinniDB
 from minni.durable_projection import projection_row_closed
 from minni.today_digest import refresh_today_digest_safe
@@ -398,7 +398,7 @@ def promote_candidate_durable(
     chash = _content_hash(content)
     raw_cat = str(cand.get("category") or "general").strip().lower()
     cand_category = raw_cat if raw_cat in CATEGORIES else "general"
-    cand_ws = str(cand.get("workspace_id") or "default").strip() or "default"
+    cand_ws = normalize_workspace_scope(cand.get("workspace_id"), default="default")
     wb_config = getattr(wb, "config", None) or getattr(wb.db, "config", None)
     vault_path = getattr(wb_config, "vault_path", None)
 
@@ -758,8 +758,13 @@ def reject_candidate_dedup(candidate_id: int, context: AFMContext) -> bool:
     wb = context.lazy_writeback()
     now = time.time()
     with wb.db.transaction() as c:
+        cp_cols = {
+            r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+            for r in c.execute("PRAGMA table_info(candidate_packets)").fetchall()
+        }
+        ws_sel = "workspace_id" if "workspace_id" in cp_cols else "'default' AS workspace_id"
         c.execute(
-            "SELECT status, principal, content FROM candidate_packets WHERE candidate_id=?",
+            f"SELECT status, principal, content, {ws_sel} FROM candidate_packets WHERE candidate_id=?",
             (candidate_id,),
         )
         row = c.fetchone()
@@ -769,7 +774,10 @@ def reject_candidate_dedup(candidate_id: int, context: AFMContext) -> bool:
         # Prove the replacement inside the rejecting transaction; otherwise
         # leave the proposal available for the next pass instead of losing it.
         owner = _canonical_principal(row["principal"] or "afm-loop")
-        if not has_active_learning_hash(c, content_hash(row["content"] or ""), owner):
+        cand_ws = normalize_workspace_scope(row["workspace_id"], default="default")
+        if not has_active_learning_hash(
+            c, content_hash(row["content"] or ""), owner, workspace_id=cand_ws
+        ):
             return False
         c.execute(
             """
@@ -944,8 +952,13 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
                     wb = context.lazy_writeback()
                     wb_cfg = getattr(wb, "config", None) or getattr(wb.db, "config", None)
                     with wb.db.transaction() as c:
+                        l_cols = {
+                            r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                            for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+                        }
+                        ws_sel = "workspace_id" if "workspace_id" in l_cols else "'default' AS workspace_id"
                         l_row = c.execute(
-                            "SELECT agent_id, category, content, embedding FROM learnings WHERE learning_id = ?",
+                            f"SELECT agent_id, category, content, embedding, {ws_sel} FROM learnings WHERE learning_id = ?",
                             (new_lid,),
                         ).fetchone()
                         if l_row is not None:
@@ -956,6 +969,11 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
                                 content=str(l_row["content"] or ""),
                                 exclude_learning_id=int(new_lid),
                                 embedding=l_row["embedding"],
+                                workspace_id=normalize_workspace_scope(
+                                    l_row["workspace_id"], default="default"
+                                )
+                                if "workspace_id" in l_cols
+                                else None,
                             )
                             linked_lids: set[int] = set()
                             try:

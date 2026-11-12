@@ -37,6 +37,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from minni.config import normalize_workspace_scope
 from minni.safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.afm.consolidation")
@@ -191,40 +192,58 @@ def _learning_row_to_dict(r: Any) -> Dict[str, Any]:
     }
 
 
+def _workspace_matches_scope(row_ws: Any, target_ws: Optional[str]) -> bool:
+    """Return True if ``row_ws`` deduplicates ``target_ws`` (same normalized scope or ``'global'``)."""
+    if target_ws is None:
+        return True
+    norm_target = normalize_workspace_scope(target_ws, default="default")
+    norm_row = normalize_workspace_scope(row_ws, default="default")
+    return norm_row == norm_target or norm_row == "global"
+
+
 def find_active_learning_by_hash(
-    cursor, h: str, agent_id: str
+    cursor, h: str, agent_id: str, *, workspace_id: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
-    """Return the newest active un-superseded learning matching (agent_id, h), or None."""
+    """Return the newest active un-superseded learning matching (agent_id, h[, workspace_id]), or None."""
+    if hasattr(cursor, "cursor") and not hasattr(cursor, "execute"):
+        with cursor.cursor() as c:
+            return find_active_learning_by_hash(c, h, agent_id, workspace_id=workspace_id)
     pragma = cursor.execute("PRAGMA table_info(learnings)").fetchall()
     cols = {
         r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
         for r in pragma
     }
     status_col = "status" if "status" in cols else "'active' AS status"
+    ws_col = "workspace_id" if "workspace_id" in cols else "'default' AS workspace_id"
+    has_ws = "workspace_id" in cols
     status_where = (
         "AND COALESCE(status, 'active') = 'active'" if "status" in cols else ""
     )
     sup_where = "AND superseded_by IS NULL" if "superseded_by" in cols else ""
 
+    def _row_ws(r: Any) -> Any:
+        if not has_ws:
+            return None
+        return r["workspace_id"] if isinstance(r, dict) or hasattr(r, "keys") else r[4]
+
     if "content_hash" in cols:
         cursor.execute(
             f"""
-            SELECT learning_id, category, content, {status_col}
+            SELECT learning_id, category, content, {status_col}, {ws_col}
             FROM learnings
             WHERE content_hash = ? AND agent_id = ?
               {status_where}
               {sup_where}
             ORDER BY created_at DESC, learning_id DESC
-            LIMIT 1
             """,
             (h, agent_id),
         )
-        row = cursor.fetchone()
-        if row is not None:
-            return _learning_row_to_dict(row)
+        for row in cursor.fetchall():
+            if not has_ws or _workspace_matches_scope(_row_ws(row), workspace_id):
+                return _learning_row_to_dict(row)
         cursor.execute(
             f"""
-            SELECT learning_id, category, content, {status_col}
+            SELECT learning_id, category, content, {status_col}, {ws_col}
             FROM learnings
             WHERE content_hash IS NULL AND agent_id = ?
               {status_where}
@@ -234,13 +253,15 @@ def find_active_learning_by_hash(
             (agent_id,),
         )
         for r in cursor.fetchall():
+            if has_ws and not _workspace_matches_scope(_row_ws(r), workspace_id):
+                continue
             rd = _learning_row_to_dict(r)
             if content_hash(rd["content"] or "") == h:
                 return rd
     else:
         cursor.execute(
             f"""
-            SELECT learning_id, category, content, {status_col}
+            SELECT learning_id, category, content, {status_col}, {ws_col}
             FROM learnings
             WHERE agent_id = ?
               {status_where}
@@ -250,6 +271,8 @@ def find_active_learning_by_hash(
             (agent_id,),
         )
         for r in cursor.fetchall():
+            if has_ws and not _workspace_matches_scope(_row_ws(r), workspace_id):
+                continue
             rd = _learning_row_to_dict(r)
             if content_hash(rd["content"] or "") == h:
                 return rd
@@ -257,14 +280,19 @@ def find_active_learning_by_hash(
 
 
 def find_active_learning_ids_by_hash(
-    cursor, h: str, agent_id: str
+    cursor, h: str, agent_id: str, *, workspace_id: Optional[str] = None
 ) -> List[int]:
-    """Return all active un-superseded learning IDs matching (agent_id, h) without mutating rows."""
+    """Return all active un-superseded learning IDs matching (agent_id, h[, workspace_id]) without mutating rows."""
+    if hasattr(cursor, "cursor") and not hasattr(cursor, "execute"):
+        with cursor.cursor() as c:
+            return find_active_learning_ids_by_hash(c, h, agent_id, workspace_id=workspace_id)
     pragma = cursor.execute("PRAGMA table_info(learnings)").fetchall()
     cols = {
         r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
         for r in pragma
     }
+    has_ws = "workspace_id" in cols
+    ws_col = "workspace_id" if has_ws else "'default' AS workspace_id"
     status_where = (
         "AND COALESCE(status, 'active') = 'active'" if "status" in cols else ""
     )
@@ -275,7 +303,7 @@ def find_active_learning_ids_by_hash(
     if "content_hash" in cols:
         cursor.execute(
             f"""
-            SELECT learning_id
+            SELECT learning_id, {ws_col}
             FROM learnings
             WHERE content_hash = ? AND agent_id = ?
               {status_where}
@@ -285,13 +313,17 @@ def find_active_learning_ids_by_hash(
             (h, agent_id),
         )
         for r in cursor.fetchall():
-            lid = int(r["learning_id"] if isinstance(r, dict) or hasattr(r, "keys") else r[0])
+            is_dict = isinstance(r, dict) or hasattr(r, "keys")
+            lid = int(r["learning_id"] if is_dict else r[0])
+            r_ws = r["workspace_id"] if is_dict else r[1]
+            if has_ws and not _workspace_matches_scope(r_ws, workspace_id):
+                continue
             if lid not in seen:
                 seen.add(lid)
                 out.append(lid)
         cursor.execute(
             f"""
-            SELECT learning_id, content
+            SELECT learning_id, content, {ws_col}
             FROM learnings
             WHERE content_hash IS NULL AND agent_id = ?
               {status_where}
@@ -302,16 +334,18 @@ def find_active_learning_ids_by_hash(
         )
         for r in cursor.fetchall():
             if isinstance(r, dict) or hasattr(r, "keys"):
-                lid, ctext = int(r["learning_id"]), r["content"]
+                lid, ctext, r_ws = int(r["learning_id"]), r["content"], r["workspace_id"]
             else:
-                lid, ctext = int(r[0]), r[1]
+                lid, ctext, r_ws = int(r[0]), r[1], r[2]
+            if has_ws and not _workspace_matches_scope(r_ws, workspace_id):
+                continue
             if lid not in seen and content_hash(ctext or "") == h:
                 seen.add(lid)
                 out.append(lid)
     else:
         cursor.execute(
             f"""
-            SELECT learning_id, content
+            SELECT learning_id, content, {ws_col}
             FROM learnings
             WHERE agent_id = ?
               {status_where}
@@ -322,23 +356,30 @@ def find_active_learning_ids_by_hash(
         )
         for r in cursor.fetchall():
             if isinstance(r, dict) or hasattr(r, "keys"):
-                lid, ctext = int(r["learning_id"]), r["content"]
+                lid, ctext, r_ws = int(r["learning_id"]), r["content"], r["workspace_id"]
             else:
-                lid, ctext = int(r[0]), r[1]
+                lid, ctext, r_ws = int(r[0]), r[1], r[2]
+            if has_ws and not _workspace_matches_scope(r_ws, workspace_id):
+                continue
             if lid not in seen and content_hash(ctext or "") == h:
                 seen.add(lid)
                 out.append(lid)
     return out
 
 
-def has_active_learning_hash(cursor, h: str, agent_id: str) -> bool:
+def has_active_learning_hash(
+    cursor, h: str, agent_id: str, *, workspace_id: Optional[str] = None
+) -> bool:
     """Duplicate predicate shared by AFM and operator-enabled auto-accept.
 
     A terminal row or another owner's memory cannot replace this owner's
     learning. Accept an existing cursor so auto-accept keeps its check inside
     the write transaction rather than opening a cursor that commits it early.
     """
-    return find_active_learning_by_hash(cursor, h, agent_id) is not None
+    return (
+        find_active_learning_by_hash(cursor, h, agent_id, workspace_id=workspace_id)
+        is not None
+    )
 
 
 def dedup_active_learnings(
@@ -364,10 +405,12 @@ def dedup_active_learnings(
         }
         has_cat = "category" in l_cols
         has_emb = "embedding" in l_cols
+        has_ws = "workspace_id" in l_cols
         cat_sel = "category, " if has_cat else "'general' AS category, "
         emb_sel = "embedding, " if has_emb else "NULL AS embedding, "
+        ws_sel = "workspace_id, " if has_ws else "'default' AS workspace_id, "
         query = (
-            f"SELECT learning_id, agent_id, {cat_sel}{emb_sel}content, content_hash "
+            f"SELECT learning_id, agent_id, {cat_sel}{emb_sel}{ws_sel}content, content_hash "
             "FROM learnings "
             "WHERE COALESCE(status, 'active') = 'active' "
             "  AND superseded_by IS NULL"
@@ -380,8 +423,8 @@ def dedup_active_learnings(
         c.execute(query, params)
         rows = [dict(r) for r in c.fetchall()]
 
-    winners: Dict[tuple[str, str], int] = {}
-    winner_entries_by_group: Dict[tuple[str, str], List[tuple[int, str, Any]]] = {}
+    winners: Dict[tuple[str, str, str], int] = {}
+    winner_entries_by_group: Dict[tuple[str, str, str], List[tuple[int, str, Any]]] = {}
     dup_updates: List[tuple[int, int]] = []
     low_sig_ids: List[int] = []
 
@@ -392,15 +435,16 @@ def dedup_active_learnings(
             low_sig_ids.append(lid)
             continue
         owner = str(row.get("agent_id") or "")
+        norm_ws = normalize_workspace_scope(row.get("workspace_id"), default="default")
         cat = str(row.get("category") or "general").strip().lower()
         emb = row.get("embedding")
         h = str(row.get("content_hash") or "") or content_hash(text)
-        key = (owner, h)
+        key = (owner, norm_ws, h)
         if key in winners:
             dup_updates.append((winners[key], lid))
             continue
 
-        group_key = (owner, cat)
+        group_key = (owner, norm_ws, cat)
         matched_winner: Optional[int] = None
         for w_lid, w_text, w_emb in winner_entries_by_group.get(group_key, []):
             if five_gram_jaccard(text, w_text) >= 0.65:
@@ -467,9 +511,11 @@ def dedup_active_learnings(
     }
 
 
-def _hash_in_learnings(db, h: str, agent_id: str) -> bool:
+def _hash_in_learnings(
+    db, h: str, agent_id: str, *, workspace_id: Optional[str] = None
+) -> bool:
     with db.cursor() as c:
-        return has_active_learning_hash(c, h, agent_id)
+        return has_active_learning_hash(c, h, agent_id, workspace_id=workspace_id)
 
 
 def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
@@ -832,7 +878,7 @@ def run(db, config, vault_path: Optional[str] = None,
     total = _total_proposed(db)
     candidates = _proposed_candidates(db, max_per_run)
 
-    seen_this_run: set[tuple[str, str]] = set()
+    seen_this_run: set[tuple[str, str, str]] = set()
     promote_candidate_ids: List[int] = []
     dedup_candidate_ids: List[int] = []
     review_candidate_ids: List[int] = []
@@ -883,8 +929,13 @@ def run(db, config, vault_path: Optional[str] = None,
         from minni.afm_passes.inbox_ingest import _canonical_principal
 
         agent_id = _canonical_principal(cand.get("principal") or "afm-loop")
-        batch_key = (agent_id, h)
-        if batch_key in seen_this_run or _hash_in_learnings(db, h, agent_id):
+        cand_ws = normalize_workspace_scope(cand.get("workspace_id"), default="default")
+        batch_key = (agent_id, cand_ws, h)
+        if (
+            batch_key in seen_this_run
+            or (agent_id, "global", h) in seen_this_run
+            or _hash_in_learnings(db, h, agent_id, workspace_id=cand_ws)
+        ):
             dedup_candidate_ids.append(cand["candidate_id"])
             continue
 

@@ -39,6 +39,7 @@ import time
 from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from minni.config import normalize_workspace_scope
 from minni.durable_projection import (
     ACTIVE_LEARNING_SQL,
     CLOSED_PROJECTION_STATUSES,
@@ -1570,14 +1571,23 @@ def repair_learning_projection(
         return _fail(abort.code, str(abort))
 
     with db.cursor() as c:
+        l_cols = {
+            r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+            for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+        }
+        cat_sel = "category" if "category" in l_cols else "'general' AS category"
+        ws_sel = "workspace_id" if "workspace_id" in l_cols else "'' AS workspace_id"
         row = c.execute(
-            "SELECT agent_id, content, status, superseded_by FROM learnings"
+            f"SELECT agent_id, content, status, superseded_by, {cat_sel}, {ws_sel} FROM learnings"
             " WHERE learning_id = ?",
             (learning_id,),
         ).fetchone()
     if row is None:
         return _fail("learning_missing", f"learning {learning_id} not found")
     agent_id, content = row["agent_id"], row["content"]
+    category = str(row["category"] or "general")
+    raw_ws = str(row["workspace_id"] or "")
+    norm_ws = normalize_workspace_scope(raw_ws, default="") if raw_ws.strip() else ""
     if (
         row["superseded_by"] is not None
         or str(row["status"] or "") in ("rejected", "expired", "superseded")
@@ -1623,22 +1633,39 @@ def repair_learning_projection(
                 _require_prepared_content(shortlist, content_attempts)
                 if shortlist.pairs:
                     source = {
-                        "store_id": store_id, "agent_id": agent_id,
+                        "store_id": store_id,
+                        "agent_id": agent_id,
+                        "workspace_id": str(norm_ws or workspace or ""),
+                        "category": category,
                         "title": f"learning:{agent_id}",
                         "content_sha256": _sha256_text(content),
                         "excerpt": content.strip()[:2000],
                     }
                     descriptors = {p.pair_id: p for p in shortlist.pairs}
+                    candidates = []
+                    for p in shortlist.pairs:
+                        cand_item: Dict[str, Any] = {
+                            "pair_id": p.pair_id,
+                            "doc_id": p.doc_id,
+                            "store_id": p.store_id,
+                            "title": p.title,
+                            "status": p.status,
+                            "page_type": p.page_type,
+                            "excerpt": p.excerpt,
+                            "content_sha256": p.content_sha256,
+                        }
+                        snap = meta_snapshots.get(p.doc_id)
+                        if isinstance(snap, dict):
+                            if snap.get("agent") is not None:
+                                cand_item["agent"] = snap["agent"]
+                            if "workspace_id" in snap:
+                                cand_item["workspace_id"] = snap["workspace_id"]
+                            if snap.get("category") is not None:
+                                cand_item["category"] = snap["category"]
+                        candidates.append(cand_item)
                     try:
                         validated, classifier_info = _classify_validated(
-                            source, [
-                                {"pair_id": p.pair_id, "doc_id": p.doc_id,
-                                 "store_id": p.store_id, "title": p.title,
-                                 "status": p.status, "page_type": p.page_type,
-                                 "excerpt": p.excerpt,
-                                 "content_sha256": p.content_sha256}
-                                for p in shortlist.pairs
-                            ], classify, descriptors)
+                            source, candidates, classify, descriptors)
                     except _Abort:
                         validated = []
                         edges_deferred = "degraded"
@@ -1658,19 +1685,23 @@ def repair_learning_projection(
             # between the pre-embed read and this commit (e.g. an embed
             # callback superseding it). A drifted source aborts with zero
             # writes — repair never recreates projection for dead content.
-            source = c.execute(
-                "SELECT agent_id, content, status, superseded_by FROM learnings"
+            source_row = c.execute(
+                f"SELECT agent_id, content, status, superseded_by, {cat_sel}, {ws_sel} FROM learnings"
                 " WHERE learning_id = ?",
                 (learning_id,),
             ).fetchone()
-            if source is None:
+            if source_row is None:
                 raise _Abort("stale_source",
                              f"learning {learning_id} gone")
+            tx_raw_ws = str(source_row["workspace_id"] or "")
+            tx_norm_ws = normalize_workspace_scope(tx_raw_ws, default="") if tx_raw_ws.strip() else ""
             if (
-                source["agent_id"] != agent_id
-                or source["content"] != content
-                or source["superseded_by"] is not None
-                or str(source["status"] or "")
+                source_row["agent_id"] != agent_id
+                or source_row["content"] != content
+                or str(source_row["category"] or "general") != category
+                or tx_norm_ws != norm_ws
+                or source_row["superseded_by"] is not None
+                or str(source_row["status"] or "")
                 in ("rejected", "expired", "superseded")
             ):
                 raise _Abort("stale_source",
@@ -1692,6 +1723,7 @@ def repair_learning_projection(
             doc_id = ensure_canonical_learning_node(
                 c, learning_id=learning_id, agent_id=agent_id,
                 content=content, vault_path=vault_path, created_at=now,
+                workspace_id=norm_ws,
             )
             schema_missing = doc_id is None
             if schema_missing:
@@ -1699,15 +1731,30 @@ def repair_learning_projection(
                     "SELECT doc_id FROM documents WHERE path = ?", (path,)
                 ).fetchone()
                 if existing is None:
-                    c.execute(
-                        """INSERT INTO documents
-                           (path, agent, sigil, last_modified, indexed_at,
-                            page_status, privacy_level, page_type, layer)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (path, agent_id, meta["sigil"], now, now,
-                         meta["page_status"], meta["privacy_level"],
-                         meta["page_type"], meta["layer"]),
-                    )
+                    d_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in c.execute("PRAGMA table_info(documents)").fetchall()
+                    }
+                    if "workspace_id" in d_cols:
+                        c.execute(
+                            """INSERT INTO documents
+                               (path, agent, sigil, last_modified, indexed_at,
+                                page_status, privacy_level, page_type, layer, workspace_id)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (path, agent_id, meta["sigil"], now, now,
+                             meta["page_status"], meta["privacy_level"],
+                             meta["page_type"], meta["layer"], norm_ws),
+                        )
+                    else:
+                        c.execute(
+                            """INSERT INTO documents
+                               (path, agent, sigil, last_modified, indexed_at,
+                                page_status, privacy_level, page_type, layer)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (path, agent_id, meta["sigil"], now, now,
+                             meta["page_status"], meta["privacy_level"],
+                             meta["page_type"], meta["layer"]),
+                        )
                     doc_id = int(c.lastrowid)
                 else:
                     doc_id = int(existing["doc_id"])

@@ -1,12 +1,13 @@
 # Minni Agent Contract
 
-**Contract version:** 1.0.0
-**Last updated:** 2026-07-31
+**Contract version:** 2.0.0 (Minni v1 surface — `[IMPLEMENTED: G03]`)
+**Last updated:** 2026-11-12
 
 This document is the canonical contract governing how AI agents interact with
-Minni. Every agent that consumes recall results or writes vault pages
-is bound by this contract. If this document and any code diverge, this document
-defines the intended behavior.
+Minni across the **12-tool MCP surface**, non-blocking host hooks, per-agent
+vaults, and the local `minnid` daemon. Every agent that consumes recall results
+or writes vault/memory state is bound by this contract. Clauses carry explicit
+status markers (`[IMPLEMENTED]` / `[PARTIAL]`, tracked under G03).
 
 ---
 
@@ -43,27 +44,36 @@ and records dropped intents in audit telemetry.
 
 Custom agents use any string that does not begin with `identity:` (reserved).
 
-### workspace_id
+### workspace_id (`[IMPLEMENTED]`)
 
-`workspace_id` identifies project context, but it is not a complete persisted
-isolation boundary for document recall. Search uses the server-stamped
-principal's workspace; the plugin's optional `workspaceId` context label does
-not select a separate database or override that principal. Legacy documents
-without a workspace stamp remain readable to their owner across projects.
-Use distinct principal/vault boundaries when separate recall pools are required.
-First-class persisted document workspace isolation remains planned (G11 / PR-3).
+Both `documents` and `learnings` carry persisted `workspace_id` tags
+(`workspace-<repo>` or `global`), paired with workspace-scoped Living Repo Maps
+(`repo_map_cards` under `<minni_home>/vault/maps/<workspace>/`). Repo-First
+recall prioritizes **current `workspace_id` + `global`** hits first and holds
+other workspaces to a high cross-project confidence bar, while enforcing
+`can_read_document` and `privacy_level` (`private`, `local-only`, `blocked`)
+authorization across `search`, `read`, `minni_drill`, and `project_shelf`.
+Pinned worker principals with explicit workspace restrictions remain fenced to
+their authorized workspaces.
 
-### Reserved identity layer
+### Two-Part Permanent Boot Shelf & reserved identity layer (`[IMPLEMENTED]`)
 
-Documents stored with `agent = 'identity:<agent_id>'` are that agent's identity
-anchor. They are loaded first on session start and never decay.
-The installer (`plugins/minni/skills/minni-install/scripts/propagate.py`)
-writes a hosted agent's identity envelope into the `documents` table with the
-reserved `identity:` prefix, embedding it via `src/minni/seed_identity.py`'s
-`get_embedding`. These documents survive decay passes and are always
-included in the `read()` startup context. The day-to-day identity bootstrap for
-a wired runtime is the principal file at `~/.minni/principals/<agent_id>.json`,
-rendered by `python -m minni.tools.author_principals --apply` from
+`SessionStart` and `SubagentStart` assemble a bounded Two-Part Permanent Boot
+Shelf via `fitEnvelope` (exempt from proportional floor crushing, with one-shot
+`PostCompact` -> `UserPromptSubmit` shelf recovery):
+
+1. **Agent Permanent Shelf (`layer1/core.md`):** runtime identity and standing
+   operator rules, loaded whole up to `24 KB` (`24,576` bytes, sized against
+   JSON-serialized headroom).
+2. **Project Permanent Shelf (`project_shelf`):** compact `<= 2,500` char
+   directory of the current repository's Subsystem Map Cards, git-diff staleness
+   notices, top active scars, and active Thread summary.
+
+Documents stored with `agent = 'identity:<agent_id>'` are that agent's DB
+identity anchor; they never decay and remain available in `read()` startup
+context. The day-to-day identity bootstrap for a wired runtime is the principal
+file at `~/.minni/principals/<agent_id>.json`, rendered by
+`python -m minni.tools.author_principals --apply` from
 `src/minni/principal_templates/`.
 
 ### Agent scoping rules
@@ -77,51 +87,56 @@ rendered by `python -m minni.tools.author_principals --apply` from
 
 ---
 
-## 2. Capabilities
+## 2. Capabilities & 12-Tool MCP Contract
 
-### Standard capabilities (all agents)
+### 12-tool MCP surface & lifecycle spine (`[IMPLEMENTED]`)
 
-Every agent connected to the daemon may call:
+Agents connected through `plugins/minni/src/server.ts` follow the v1 lifecycle
+spine **`recall → drill → thread → learn`** and interact strictly through the
+**12 shipped MCP tools** (see [CAPABILITIES.md](CAPABILITIES.md) for the full
+gate and JSON-RPC mapping):
 
-| Action            | JSON-RPC method | Notes                                               |
-|-------------------|-----------------|-----------------------------------------------------|
-| Recall            | `search`        | Hybrid FTS5 + FAISS + cross-encoder retrieval.      |
-| Startup context   | `read`          | Identity + learnings + recent episodic events.      |
-| Learn             | `learn`         | Write a learning to the DB (and flat-file if dual). |
-| Log event         | `log_event`     | Append an episodic event to the agent's log.        |
-| Write vault page  | (vault API)     | Via plugin, not daemon JSON-RPC directly.           |
-| Request handoff   | `handoff`       | Shipped — package context for a peer agent as a leased handoff (`src/minni/minnid_runtime/handoff.py`). |
-| Query trace       | `trace`         | [PLANNED: PR-9] Retrieve provenance trace.          |
-| Submit feedback   | `feedback`      | [PLANNED: PR-9] Signal quality of a recall result. |
-| Expand result     | `expand`        | Re-fetch a result at a deeper depth tier.           |
-| Health            | `status`        | Daemon + engine health snapshot.                    |
-| Liveness          | `ping`          | Round-trip check.                                   |
+- **Core Memory & Repo Context (6):** `minni_recall`, `minni_drill`, `minni_learn`, `minni_list_candidates`, `minni_resolve_candidate`, `minni_status`
+- **1-Step Handoff (2):** `minni_handoff_send`, `minni_handoff_inbox`
+- **Compact Shared Threads (4):** `minni_thread_create`, `minni_thread_status`, `minni_thread_update`, `minni_thread_scar`
 
-### Governance capabilities
+### Standard daemon JSON-RPC capabilities (`[IMPLEMENTED]`)
 
-Two RPCs write durable learnings and both live in
-`src/minni/minnid_runtime/governance.py`. They serve different callers:
+Every registered agent principal with the corresponding capability may call:
 
 | Action | JSON-RPC method | Notes |
-|--------|-----------------|-------|
-| Approve candidate | `resolve_candidate` | Operator-gated by default (delegable — see [docs/concepts.md#delegating-approval](../concepts.md#delegating-approval)). Accepts, rejects, redacts, merges, or supersedes a staged `learn` candidate. |
-| Auto-accept own candidates | *(none — operator config)* | `auto_accept_own` in `principals/<agent>.json` resolves that agent's OWN `learn` candidates at store time, stamped `resolved_by=auto_accept_own(<agent>)`. Narrower than granting `resolve_candidate`: it confers no authority over anyone else's candidates. Refused if supplied over the wire ([#290](https://github.com/infektyd/minni/issues/290)). |
-| Resolve contradiction | `resolve_contradiction` | Agent-first correction machinery — **no operator gate** for ordinary corrections; any principal may call it for its own learnings. One limit applies: `new_content` that is instruction_like needs the literal `accept_flagged` capability, matching `resolve_candidate` ([#290](https://github.com/infektyd/minni/issues/290)). The auto-promotion QUALITY floor deliberately does **not** apply here — a correction names what it supersedes and lands in the agent's own tier, and gating it refused legitimate short corrections like a changed port number. `new_content` is size-capped and `supersede_ids` is de-duplicated and bounded. |
+|---|---|---|
+| Recall | `search` | Repo-First hybrid Trie + FTS5 + FAISS + Cross-Encoder retrieval with strict confidence floor. |
+| Startup context | `read` | Identity + authorized documents + workspace learnings + recent episodic events. |
+| Expand / drill | `expand`, `sm_drill` | Re-fetch chunks, `m:<8hex>` handles, `d:<src>:<id>` refs, repo-map path wikilinks, and typed `memory_links`. |
+| Learn / stage | `learn`, `stage_candidate`, `list_candidates` | Stage or inspect learning candidates (`workspace_id` preserved). |
+| Living Repo Maps | `repo_map` | Build or refresh SHA-pinned Subsystem Map Cards (`minni map [<repo>]`). |
+| Log event | `log_event` | Append an episodic event to the agent's log. |
+| Request / ack handoff | `handoff`, `minni_list_pending_handoffs`, `minni_ack_handoff` | Internal RPCs backing `minni_handoff_send` and `minni_handoff_inbox`. |
+| Provenance & feedback | `trace`, `feedback` | `[IMPLEMENTED]` Ephemeral retrieval-leg trace lookup and result quality calibration. |
+| Health & liveness | `status`, `ping` | Daemon + engine health snapshot and liveness probe (`RECOVERY_ALLOWED_METHODS`). |
 
-`resolve_contradiction` (`handle_resolve_contradiction`) lets an agent write a
-new learning that atomically supersedes one or more of its prior ones when it
-has detected they conflict with current reality. Supersede semantics, inside
-one transaction: the new learning is inserted; each learning in
-`supersede_ids` has `status` set to `'superseded'` and `superseded_by` pointed
-at the new row; one `contradiction_events` row is journaled per superseded
-learning (`superseded_learning_id`, `new_learning_id`, `originating_agent`,
-`created_at`); after commit, each superseded learning's synthetic durable
-document is purged from the FTS/FAISS search index (best-effort — it never
-undoes the committed supersession). A principal may only supersede learnings
-it owns; superseding another agent's learning requires an explicitly allowed
-operator. Contradiction events are queryable via `subscribe_contradictions`
-(`minni_subscribe_contradictions`), which returns contradiction events for
-learnings a given agent has recently read.
+### Governance & graph supersession capabilities (`[IMPLEMENTED]`)
+
+Durable learnings wire into the typed memory graph (`memory_links` /
+`learning_links` via `GraphCoordinator` + `EdgeClassifier`) and live in
+`src/minni/minnid_runtime/governance.py`:
+
+| Action | JSON-RPC method | Notes |
+|---|---|---|
+| Approve candidate | `resolve_candidate` | Operator-gated by default (delegable — see [docs/concepts.md#delegating-approval](../concepts.md#delegating-approval)). Accepts, rejects, redacts, merges, or supersedes a staged `learn` candidate, wires typed graph edges, and refreshes `~/.minni/TODAY.md`. |
+| Auto-accept own candidates | *(none — operator config)* | `auto_accept_own` in `principals/<agent>.json` resolves that agent's OWN `learn` candidates at store time, stamped `resolved_by=auto_accept_own(<agent>)`. Narrower than granting `resolve_candidate`: it confers no authority over anyone else's candidates. Refused if supplied over the wire ([#290](https://github.com/infektyd/minni/issues/290)). |
+| Resolve contradiction | `resolve_contradiction` | Agent-first correction machinery — **no operator gate** for ordinary corrections; any principal with `learn` may call it for its own learnings (`instruction_like` content additionally requires `accept_flagged`). |
+
+`resolve_contradiction` (`handle_resolve_contradiction`) atomically inserts the
+superseding learning, marks each owned row in `supersede_ids` as `'superseded'`
+(`superseded_by` pointing at the new row), journals `contradiction_events`, and
+purges superseded durable documents from FTS, FAISS, Trie, and rerank caches.
+Automatic graph-driven supersession (`updates` / `contradicts` edges in
+`memory_links`) applies the same projection purge on durable `learn` and
+consolidation commits, while genuine unresolved rule contradictions surface as
+recall sidecars, in `~/.minni/TODAY.md`, and on the internal daemon JSON-RPC
+method (`subscribe_contradictions` handler; not exposed as an MCP tool).
 
 ### Candidate staging and privacy levels
 
@@ -153,16 +168,14 @@ An agent may read from the shared recall pool regardless of which agent indexed
 a document. An agent may never write a vault page into another agent's vault
 directory or impersonate another `agent_id` when calling `learn` or `log_event`.
 
-### Temporary team profiles
+### Shared Threads & 1-step handoffs (`[IMPLEMENTED]`)
 
-The plugin may create temporary team profiles through `minni_team_runtime`
-(with `minni_team_evidence` for helper-report summaries and
-`minni_team_promotion` for post-approval promotion drafts). These profiles are
-coordination packets, not durable identities. They can carry role, focus,
-ownership, permissions, and hydration context, but they do not grant
-cross-agent vault writes, automatic learning, daemon-side execution, or
-identity promotion. Promotion from temporary profile to reusable agent identity
-requires explicit operator approval after evidence review.
+Agents coordinate multi-slice work through the 4 compact `< 2 KB` Thread tools
+(`minni_thread_create`, `minni_thread_status`, `minni_thread_update`,
+`minni_thread_scar`) and transfer work across sessions or principals through the
+2 Handoff tools (`minni_handoff_send`, `minni_handoff_inbox`). Neither surface
+spawns host processes, grants cross-agent vault writes, bypasses proposal-first
+learning, or promotes temporary subagent roles into durable principals.
 
 ---
 
@@ -207,9 +220,9 @@ is unavailable.
 }
 ```
 
-### Phase 1.2 envelope (planned — PR-2)
+### Full provenance envelope (`[IMPLEMENTED]`)
 
-The full envelope schema, per the master upgrade plan:
+The full result envelope schema:
 
 ```json
 {
@@ -382,23 +395,28 @@ storage-backed queue instead. If a reviewer cannot tell whether a file is a
 derived artifact or a communication channel, the feature needs a design note
 before it merges.
 
-## 8. Hook capability parity (per-platform, capability-gated)
+## 8. Hook capability parity — strictly non-blocking across all hosts
 
-The s6 recall **guard** is a `PreToolUse` hook that can **deny** a tool call
-before it runs (deny-to-surface: the agent re-issues the call after consulting
-recall). **Multiple hosts expose deny-capable pre-tool hooks** — Claude is
-deepest (all-tool coverage plus live recall-state), not unique. Full matrix and
-decision enums: `docs/contracts/hook-platforms.md`.
+Across all six wired platforms, Minni hooks **never** deny or block `Read`,
+`Grep`, `Glob`, `Bash`, or edit tool calls (`[IMPLEMENTED]`). `PreToolUse` never
+emits `permissionDecision: "deny"`: when strong recall for the current turn is
+unconsulted (or a failure lesson matches), hosts with `preToolUseContext: true`
+attach bounded `hookSpecificOutput.additionalContext` (`continue: true`) once
+per arming, while other hosts record non-blocking telemetry and return
+`{continue: true}`. `UserPromptSubmit` skips `<task-notification>`,
+`<SYSTEM_MESSAGE>`, `[Message] timestamp=`, and `<background-task>` wakeups, and
+`PostToolUse` restricts failure-lesson checks strictly to file edits and failed
+commands. Full host matrix: `docs/contracts/hook-platforms.md`.
 
-| Surface | Deny-capable pre-tool? | Guard / recall-state reality |
+| Surface | Boot / prompt context injection | Non-blocking `PreToolUse` / `PostToolUse` reality |
 |---|---|---|
-| `claude-code` | Yes — all tools (`allow`/`deny`/`ask`/`defer`) | Fully live: `hooks.json` + `UserPromptSubmit` writes the recall-state the guard acts on. |
-| `kilocode` | Yes — throw from `tool.execute.before` (or permission.ask) | Wired via the bridge plugin; broad coverage. |
-| `cursor` | Yes — `preToolUse` (`allow`/`deny`; `ask` unenforced) | Wired via Cursor adapters; broad coverage. Session injection has known vendor limits (see hook-platforms). |
-| `grok-build` | Yes — host deny-capable (`allow`/`deny`, broad tools; natives `read_file`/`grep`/`list_dir`/…) | **Host deny ≠ Minni guard liveness.** Registration alone does not make s6 live. Grok UPS/SS stdout is ignored (`GROK_INJECTABLE={Stop}`), so dropped UPS does **not** plant `consumed=false`; leftover false is cleared even on daemon timeout. PreToolUse allows immediately when UPS cannot inject, so a leftover file cannot deny. The Grok adapter (`grok-adapter.ts`) still maps camelCase `toolName`/`toolInput` → guard fields and `{decision,reason}` stdout (Claude `permissionDecision` is not parsed). The real Claude gap on Grok is prompt-time **stdout injection** (passive events ignore stdout) — not the host deny mechanism. |
-| `antigravity` / agy | Yes — broad (`allow`/`deny`/`ask`/`force_ask`; rejects `approve`/`block`) | Wired in `hooks-gemini.json` via the agy adapter. Current agy (1.1.7+) dispatches SessionStart, PreInvocation (UPS analogue), PreToolUse, Stop; PreInvocation can write file-backed recall-state when transcript enrichment succeeds. Depth still lags Claude’s full envelope + live pointer path. |
-| `codex` | Yes — **Bash interception only** | Guard gates `Read`/`Grep`/`Glob`, which never fire `PreToolUse` on Codex. Not wireable **for those tools**. |
+| `claude-code` | `[IMPLEMENTED]` Full `<minni:context>` on `SessionStart`, `SubagentStart`, `UserPromptSubmit`, `PostCompact`, and `Stop` | `preToolUseContext: true` — attaches non-blocking `additionalContext` (`continue: true`) once per unconsulted strong recall arming; `PostToolUse` surfaces failure lessons on edits/failed commands. |
+| `kilocode` | `[IMPLEMENTED]` Bridge plugin injects via `system.transform` + `session.compacted` SDK read-back | Non-blocking telemetry + allow (`continue: true`); never throws to block tool execution. |
+| `cursor` | `[PARTIAL]` `sessionStart` declared injectable (subject to vendor composer timing bug); `beforeSubmitPrompt` has no inject channel | Non-blocking allow (`continue: true`); leftover recall-state never blocks tools. |
+| `grok-build` | `[PARTIAL]` Passive events (`SessionStart`, `UserPromptSubmit`) ignore stdout; boot hydration uses `~/.grok/rules` and `Stop` (`GROK_INJECTABLE={Stop}`) | Non-blocking allow (`continue: true`); dropped UPS never leaves blocking state. |
+| `gemini` / `antigravity` | `[IMPLEMENTED]` `hooks-gemini.json` injects via `injectSteps` on `SessionStart` and `PreInvocation` | Non-blocking allow (`continue: true`) across IDE, 2.0 desktop, and `agy` CLI. |
+| `codex` | `[IMPLEMENTED]` `hooks-codex.json` injects `additionalContext` on `SessionStart` and `UserPromptSubmit`, plus `PostCompact` harvest | Non-blocking allow (`continue: true`). |
 
-If another surface later changes deny coverage or event set, update
-`hook-platforms.md` first and keep this section a thin summary. Wire new hosts
-in `propagate.py` / wire adapters (see the note above `platform_spec`).
+If another surface later changes injection channels or event sets, update
+`hook-platforms.md` first and keep this section a concise summary. Wire hosts
+via `minni wire` / `minni sync` (`make sync-root`).

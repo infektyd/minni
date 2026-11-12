@@ -25,8 +25,9 @@ contract first.
   filesystem paths. Nothing syncs anywhere. Same-uid processes can open those
   files directly; daemon authz does not apply on that plane.
 - The localhost React web console (`ui-server` on `127.0.0.1:8765`) was retired
-  in favor of CLI (`minni status`, `minni watch`, `minni doctor`) and
-  plain-markdown status surfaces; no loopback web server ships on `main`.
+  in favor of CLI (`minni status`, `minni activity`, `minni watch`, `minni doctor`),
+  the mode-`0600` symlink-guarded `~/.minni/TODAY.md` digest, and plain-Markdown
+  vault status surfaces; no loopback web server ships on `main`.
 - Optional daemon HTTP (`--port`) is off by default; enabling it is a Critical
   surface (no auth, unbounded body, local-operator stamp) — not mere
   configuration risk. See the threat model.
@@ -43,13 +44,17 @@ owner-or-explicit-operator; the `force=true` durable-learn escape is
 operator-only and audit-stamped (`FORCE_DURABLE_LEARN`).
 
 The gate is **not** universal, and it is honest to say so. Local vault-note
-and audit writes — `writeVaultPage`/`recordAudit` in
-`plugins/minni/src/vault.ts`, which back `minni_vault_write`, the vault-note
-half of `minni_learn`, `minni_recall`'s audit entry, the CLI `write` command,
-and all hook-side vault/audit/inbox writes — are local-first filesystem
+and audit writes — `vaultFirstLearn`/`writeVaultPage`/`recordAudit` in
+`plugins/minni/src/vault.ts`, which back the personal vault-note half of
+governed `minni_learn` (while durable shared storage goes through daemon
+`learn` / `minni_resolve_candidate` vault writeback), `minni_recall`'s audit
+entry, and all hook-side vault/audit/inbox writes — are local-first filesystem
 writes that never reach daemon dispatch and never pass this gate. Their
 safety derives from the schema-pinned write target (the operator-controlled
-agent id and vault path — SEC-003/G11/G12), not from the shared gate. See the
+agent id and vault path — SEC-003/G11/G12), not from the shared gate. On the
+read side, daemon `search`, `read`, `minni_drill` (`sm_drill`/`expand`), and
+`project_shelf` enforce principal, workspace, and `privacy_level` (`private`,
+`local-only`, `blocked`) read authorization. See the
 [provenance-gate findings](implementation/minni-provenance-gate-ground-and-resolve-findings.md)
 for the grounded file-by-file split.
 
@@ -59,9 +64,12 @@ Two consequences worth knowing when auditing the trust boundary:
   `gate.shared` handler resolves the caller principal and returns a stamped
   envelope for provenance; it never performs (or blocks) the vault write
   itself.
-- **Daemon-down behavior is asymmetric.** Gated tools (`plan.*`, `team.*`,
-  handoff, ping) fail closed — they no-op when the gate is unavailable —
-  while the ungated local-write tools above proceed and write the same vault.
+- **Daemon-down behavior is asymmetric.** Gated tools (`candidates.list`,
+  `candidates.resolve`, `audit.status`, `handoff.send`, `handoff.inbox`, and
+  `plan.create`/`status`/`update`/`scar`) fail closed — they return structured
+  `gate-unavailable` / `gate-rejected` payloads when the gate is unavailable —
+  while the ungated local-write paths above proceed and write the caller's own
+  pinned vault.
 
 ## Memory-poisoning defenses
 

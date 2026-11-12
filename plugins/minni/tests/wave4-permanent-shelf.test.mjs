@@ -148,19 +148,53 @@ async function createMappedRepoFixture(prefix) {
           agent_id TEXT NOT NULL,
           category TEXT NOT NULL,
           content TEXT NOT NULL,
+          source_doc_ids TEXT DEFAULT '[]',
+          source_query TEXT DEFAULT '',
           confidence REAL DEFAULT 0.9,
-          workspace_id TEXT NOT NULL DEFAULT '',
+          created_at REAL NOT NULL DEFAULT 0,
+          access_count INTEGER DEFAULT 0,
+          last_accessed REAL,
           superseded_by INTEGER,
-          status TEXT DEFAULT 'accepted',
-          privacy_level TEXT DEFAULT 'safe'
+          workspace_id TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE documents (
+          doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          path TEXT UNIQUE NOT NULL,
+          agent TEXT NOT NULL DEFAULT 'claude-code',
+          page_status TEXT DEFAULT 'accepted',
+          privacy_level TEXT DEFAULT 'safe',
+          page_type TEXT DEFAULT 'wiki',
+          superseded_by INTEGER,
+          expires_at REAL,
+          workspace_id TEXT NOT NULL DEFAULT '',
+          memory_kind TEXT DEFAULT 'learning',
+          memory_uri TEXT
+        );
+        CREATE TABLE learning_documents (
+          learning_id INTEGER NOT NULL,
+          doc_id INTEGER NOT NULL,
+          created_at REAL NOT NULL DEFAULT 0,
+          PRIMARY KEY (learning_id, doc_id)
         );
       `);
       const ins = db.prepare(
         "INSERT INTO learnings (agent_id, category, content, confidence, workspace_id) VALUES (?, ?, ?, ?, ?)",
       );
-      ins.run("claude-code", "scar", "Never name the map table document_metadata; legacy DBs already own it.", 0.98, "workspace-alpha-repo");
-      ins.run("claude-code", "architecture", "Keep CLI top-level imports strictly Python stdlib.", 0.95, "workspace-alpha-repo");
-      ins.run("claude-code", "scar", "Foreign workspace scar that must NEVER leak into alpha-repo.", 0.99, "workspace-other-repo");
+      const insDoc = db.prepare(
+        "INSERT INTO documents (path, agent, page_status, privacy_level, workspace_id, memory_uri) VALUES (?, 'claude-code', 'accepted', 'safe', ?, ?)",
+      );
+      const insLink = db.prepare(
+        "INSERT INTO learning_documents (learning_id, doc_id) VALUES (?, ?)",
+      );
+      const r1 = ins.run("claude-code", "scar", "Never name the map table document_metadata; legacy DBs already own it.", 0.98, "workspace-alpha-repo");
+      const d1 = insDoc.run("/vault/learnings/1.md", "workspace-alpha-repo", `learning://${r1.lastInsertRowid}`);
+      insLink.run(r1.lastInsertRowid, d1.lastInsertRowid);
+      const r2 = ins.run("claude-code", "architecture", "Keep CLI top-level imports strictly Python stdlib.", 0.95, "workspace-alpha-repo");
+      const d2 = insDoc.run("/vault/learnings/2.md", "workspace-alpha-repo", `learning://${r2.lastInsertRowid}`);
+      insLink.run(r2.lastInsertRowid, d2.lastInsertRowid);
+      const r3 = ins.run("claude-code", "scar", "Foreign workspace scar that must NEVER leak into alpha-repo.", 0.99, "workspace-other-repo");
+      const d3 = insDoc.run("/vault/learnings/3.md", "workspace-other-repo", `learning://${r3.lastInsertRowid}`);
+      insLink.run(r3.lastInsertRowid, d3.lastInsertRowid);
     } finally {
       db.close();
     }
@@ -461,30 +495,38 @@ test(
     runGit(fx.repo, ["add", "src/app/auth.py"]);
     runGit(fx.repo, ["commit", "-m", "advance head for bug39 check"]);
 
-    // BUG-43: Insert a local-only scar and a private scar into learnings; neither may leak into Project Shelf
+    // BUG-43 & BUG-65: Insert blocked, private, local-only, rejected, and retired scars using REAL learnings + learning_documents + documents schema (no fake learnings.privacy_level!)
     const sqliteMod = await import("node:sqlite");
     if (sqliteMod.DatabaseSync) {
       const db = new sqliteMod.DatabaseSync(path.join(fx.home, "minni.db"));
       try {
-        const insPriv = db.prepare(
-          "INSERT INTO learnings (agent_id, category, content, confidence, workspace_id, privacy_level) VALUES (?, ?, ?, ?, ?, ?)",
+        const insLearn = db.prepare(
+          "INSERT INTO learnings (agent_id, category, content, confidence, workspace_id) VALUES (?, ?, ?, ?, ?)",
         );
-        insPriv.run(
-          "claude-code",
-          "scar",
-          "LOCAL_ONLY_SCAR_CANARY_774 must not surface in shared project shelf.",
-          0.999,
-          "workspace-alpha-repo",
-          "local-only",
+        const insDoc = db.prepare(
+          "INSERT INTO documents (path, agent, page_status, privacy_level, workspace_id, memory_uri) VALUES (?, 'claude-code', ?, ?, 'workspace-alpha-repo', ?)",
         );
-        insPriv.run(
-          "claude-code",
-          "scar",
-          "PRIVATE_SCAR_CANARY_775 must not surface in shared project shelf.",
-          0.999,
-          "workspace-alpha-repo",
-          "private",
+        const insLink = db.prepare(
+          "INSERT INTO learning_documents (learning_id, doc_id) VALUES (?, ?)",
         );
+        const seedLinked = (canary, pageStatus, privacyLevel, linkViaJoinTable = true) => {
+          const lr = insLearn.run("claude-code", "scar", canary, 0.999, "workspace-alpha-repo");
+          const lid = lr.lastInsertRowid;
+          const dr = insDoc.run(
+            `/vault/learnings/canary-${lid}.md`,
+            pageStatus,
+            privacyLevel,
+            linkViaJoinTable ? null : `learning://${lid}`,
+          );
+          if (linkViaJoinTable) {
+            insLink.run(lid, dr.lastInsertRowid);
+          }
+        };
+        seedLinked("LOCAL_ONLY_SCAR_CANARY_774 must not surface in shared project shelf.", "accepted", "local-only", true);
+        seedLinked("PRIVATE_SCAR_CANARY_775 must not surface in shared project shelf.", "accepted", "private", true);
+        seedLinked("BLOCKED_SCAR_CANARY_776 must not surface in shared project shelf.", "accepted", "blocked", false);
+        seedLinked("REJECTED_SCAR_CANARY_777 must not surface in shared project shelf.", "rejected", "safe", true);
+        seedLinked("RETIRED_SCAR_CANARY_778 must not surface in shared project shelf.", "retired", "safe", false);
       } finally {
         db.close();
       }
@@ -534,6 +576,18 @@ test(
     assert.ok(
       !shelfText.includes("PRIVATE_SCAR_CANARY_775"),
       "private learning leaked into project_shelf",
+    );
+    assert.ok(
+      !shelfText.includes("BLOCKED_SCAR_CANARY_776"),
+      "blocked learning (via memory_uri) leaked into project_shelf",
+    );
+    assert.ok(
+      !shelfText.includes("REJECTED_SCAR_CANARY_777"),
+      "rejected learning leaked into project_shelf",
+    );
+    assert.ok(
+      !shelfText.includes("RETIRED_SCAR_CANARY_778"),
+      "retired learning (via memory_uri) leaked into project_shelf",
     );
     assert.ok(
       !shelfText.includes("--output="),

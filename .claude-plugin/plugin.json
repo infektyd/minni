@@ -1,7 +1,7 @@
 {
   "name": "minni",
-  "version": "0.1.0",
-  "description": "Local-only Minni bridge: hosted-agent envelope, recall, prepare-task, dry-run review, and audit tail for Claude Code.",
+  "version": "0.6.0",
+  "description": "Local-first Minni spine for Claude Code: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across compaction.",
   "author": {
     "name": "Minni"
   },

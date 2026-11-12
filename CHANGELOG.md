@@ -8,7 +8,7 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
-**v0.7.0 / v1.0.0 Waves 1–5 milestone.** This unreleased series lands Waves 1–5 of the 6-wave Minni v1.0 blueprint (`docs/design/DESIGN-minni-v1.md`): consolidating the MCP surface from 43 tools to 12 essentials, retiring dead runtime/UI/ritual surfaces, switching all host hooks to strictly non-blocking context injection, shipping workspace-scoped Repo-First recall and first-class CLI commands, wiring the typed memory graph and supersession engine, introducing Living Repo Maps (`minni map`) and the Two-Part Permanent Boot Shelf, and auto-maintaining the plain-Markdown `~/.minni/TODAY.md` human digest alongside non-clobbering payload staging (`BUG-06`). Package metadata stays at `0.6.0` until `v1.0.0` is tagged after Wave 6 live store scrub and cold-agent verification complete.
+**v0.7.0 / v1.0.0 Waves 1–6 + post-Wave-6 audit hardening milestone.** This unreleased series lands all six waves of the Minni v1.0 blueprint (`docs/design/DESIGN-minni-v1.md`) plus post-Wave-6 audit hardening: consolidating the MCP surface from 43 tools to 12 essentials, retiring dead runtime/UI/ritual surfaces, switching all host hooks to strictly non-blocking context injection, shipping workspace-scoped Repo-First recall and first-class CLI commands, wiring the typed memory graph and supersession engine, introducing Living Repo Maps (`minni map`) and the Two-Part Permanent Boot Shelf, auto-maintaining the plain-Markdown `~/.minni/TODAY.md` human digest alongside non-clobbering payload staging (`BUG-06`), and completing Wave 6 store/suite hardening (`BUG-50`–`BUG-55`) and post-Wave-6 authz, shelf-budget, lifecycle-spine, version-gate, and documentation parity fixes. Package metadata stays at `0.6.0` until `v1.0.0` is tagged.
 
 ### Added
 
@@ -45,6 +45,9 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Changed
 
+- **Post-Wave-6 v1 lifecycle, inbox, scar & active documentation alignment (`BUG-70`):**
+  - Updated the `<minni:context>` lifecycle spine representation from `prepare_task → prepare_outcome → thread → learn` to the shipped v1 spine `recall → drill → thread → learn`, promoted `minni_thread_scar` entries into workspace-scoped repository scar memory, added preview-before-ack metadata (`summary`, `files`, `next_steps`, `open_questions`) and workspace filtering to `minni_handoff_inbox`, and enforced strict `< 2 KB` compact payload budgets across `minni_thread_create`, `minni_thread_status`, and `minni_thread_update`.
+  - Aligned active reference documentation (`docs/architecture.md`, `docs/concepts.md`, `docs/thread-workflow.md`, `docs/contracts/CAPABILITIES.md`, `docs/contracts/AGENT.md`, `docs/runtime-integration.md`, `docs/runtimes/claude-code.md`, `docs/security.md`) with the shipped 12-tool MCP contract, non-blocking hooks, Living Repo Maps, and `~/.minni/TODAY.md`.
 - **Wave 1 v1.0 surface consolidation (43 → 12 MCP tools):**
   - Consolidated `plugins/minni/src/server.ts` from 43 MCP tools to the 12-tool v1 surface: core memory (`minni_recall`, `minni_drill`, `minni_learn`, `minni_list_candidates`, `minni_resolve_candidate`, `minni_status`), 1-step cross-session/cross-agent handoff (`minni_handoff_send`, `minni_handoff_inbox`), and 4 compact `< 2 KB` Thread tools (`minni_thread_create`, `minni_thread_status`, `minni_thread_update`, `minni_thread_scar`), updating host propagation allowlists, worker grants, cutover probes, slash commands, and skills in lockstep.
   - Enforced strictly non-blocking `PreToolUse` hooks across Claude Code, Gemini/Antigravity, Codex, Cursor, Grok Build, and KiloCode (attaching non-blocking `additionalContext` where supported and never denying tool calls), immediate early-return skip handling on `<task-notification>`, `<SYSTEM_MESSAGE>`, `[Message] timestamp=`, and `<background-task>` wakeups with paired TS/Python envelope rules, and restricted `PostToolUse` failure-lesson checks strictly to file-edit tools and failed commands.
@@ -53,6 +56,9 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Fixed
 
+- **Wave 6 & post-Wave-6 engine, shelf, drill & version-gate hardening (`BUG-50`–`BUG-55`, `BUG-69`):**
+  - Resolved full-suite retrieval, nested SQLite savepoint, and read-gate edge cases (`BUG-50`–`BUG-54`), and sized Permanent Boot Shelf headroom from JSON-serialized character budgets across `SessionStart`, `PostCompact`, and `CompactSummary` envelopes (`BUG-55` and post-Wave-6 parity).
+  - Resolved repo-map path wikilinks in `minni_drill` (`sm_drill`), preserved `workspace_id` across consolidation deduplication and graph-repair backfill paths, surfaced `H36` stale-server host restart warnings consistently in `minni doctor`, filtered read-only file-viewer and truncated-output dumps out of Jev inline harvest, and synced root `.claude-plugin/plugin.json` to `0.6.0` with repo-layer enforcement in `scripts/check_versions.py` (`BUG-69`).
 - Non-clobbering `bundle_server.mjs --outfile <path>` payload staging across `scripts/stage_payload.py`, `src/minni/wire/from_repo.py`, and `Makefile` (`stage-payload`) so staging bundled `dist/server.js` into wheel or `--from-repo` directories no longer overwrites `tsc`'s modular `plugins/minni/dist/server.js` in place or breaks process-path Node unit tests (`BUG-06`).
 - Prevented AFM content-level `context_overflow`, `guardrail`, and `refusal` responses from tripping the global 300s `CircuitBreaker`, added proactive/reactive candidate chunking and a deterministic quality fallback evaluator in `afm_passes/judge.py`, added recursive batch splitting in `EdgeClassifier`, and removed `"Compaction summary — ..."` wrapper prefixes from `compact_distillation` deterministic fallbacks (`BUG-10`).
 - Stripped runtime/system wrapper blocks (`Created At:` / `Completed At:`, `<SYSTEM_MESSAGE>`, `<MINNI_ENVELOPE>`, `[Message] timestamp=`, `<background-task>`, `<task-notification>`) before Jev inline harvest, enforced a hard stripped-content floor (`>= 15` non-whitespace chars and `>= 4` meaningful tokens) in `assessLearningQuality` before metadata bonuses apply, rejected 1-word chatter and wrapper leaks at candidate/inbox intake, and auto-rejected short/wrapper/sprint-chatter rows in consolidation (`BUG-11`).
@@ -62,6 +68,8 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Security
 
+- Enforced principal, workspace, and `privacy_level` (`private`, `local-only`, `blocked`) read authorization consistently across `project_shelf`, daemon `handle_read`, and `minni_drill` (`sm_drill` / `expand`), closing cross-principal and private-note disclosure gaps.
+- Applied transitive dependency overrides in `plugins/minni/package-lock.json` so `npm audit` reports zero vulnerabilities.
 - Explicit legacy alias capability resolution against the caller's own principal (`H7`).
 - Enforced `supersede_ids` ownership and existence checks inside `resolve_candidate` (`H8`).
 - Enforced pending and non-expired compare-and-swap (CAS) checks on handoff lease acknowledgements, with idempotent handling for `not_required` leases (`H9`).

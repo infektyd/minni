@@ -69,7 +69,7 @@ test("c3: nothing-salient turn STILL emits the lifecycle line (~297 early-return
     ctx.includes(MINNI_LIFECYCLE_LINE),
     "the 4-surface line must ride a weak-recall / no-active-plan turn",
   );
-  for (const surface of ["prepare_task", "prepare_outcome", "thread", "learn"]) {
+  for (const surface of ["recall", "drill", "thread", "learn"]) {
     assert.ok(ctx.includes(surface), `names ${surface}`);
   }
 });
@@ -99,9 +99,9 @@ test("c4: planning intent adds the Plan focus, at most once per session", async 
   assert.ok(!ctx2.includes('"lifecycle_focus"'), "focus suppressed the 2nd time (once/session)");
 });
 
-test("c4: ambitious task intent emphasizes prepare_task", async () => {
+test("c4: ambitious task intent emphasizes recall", async () => {
   const ctx = additionalContext(await runUserPrompt("implement the new feature end to end"));
-  assert.ok(ctx.includes(buildLifecycleEmphasis("prepare_task")), "prepare_task focus present");
+  assert.ok(ctx.includes(buildLifecycleEmphasis("recall")), "recall focus present");
 });
 
 test("c5: MINNI_LIFECYCLE_NUDGE_MODE=off makes the feature fully silent", async () => {

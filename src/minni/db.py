@@ -701,6 +701,20 @@ class MinniDB:
                     try:
                         from minni.migrations import run_migrations
                         run_migrations(conn)
+                        # 010_standardize_threads_pk.sql drops trg_thread_msg_count when
+                        # rebuilding threads; recreate it after migrations so fresh DBs
+                        # retain episodic -> thread message_count maintenance immediately.
+                        conn.execute("""
+                            CREATE TRIGGER IF NOT EXISTS trg_thread_msg_count
+                            AFTER INSERT ON episodic_events
+                            WHEN NEW.thread_id IS NOT NULL
+                            BEGIN
+                                UPDATE threads
+                                SET message_count = message_count + 1,
+                                    updated_at = NEW.created_at
+                                WHERE thread_id = NEW.thread_id;
+                            END
+                        """)
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_layer ON documents(layer)")
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_layer ON chunk_embeddings(layer)")
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_workspace ON documents(workspace_id)")

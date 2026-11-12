@@ -11,6 +11,7 @@ import {
   DEFAULT_AGENT_ID,
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
+  normalizeWorkspaceId,
   resolveMcpSessionIdentity,
   resolveSessionWorkspaceId,
 } from "./config.js";
@@ -410,6 +411,7 @@ server.registerTool(
       depth,
       vaultPath: DEFAULT_VAULT_PATH,
       sessionId: mcpSession.sessionId ?? mcpSession.sessionKey ?? MCP_PROCESS_SESSION_ID,
+      agentId: DEFAULT_AGENT_ID,
     });
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -687,12 +689,14 @@ server.registerTool(
     const handoffPacket: Record<string, unknown> = {
       from_agent: packet.agentOrigin,
       to_agent: targetAgent,
+      workspace_id: packet.workspace,
       kind: "handoff",
       task: packet.task,
       ...(summary ? { summary } : {}),
       ...(files?.length ? { files } : {}),
       ...(next_steps?.length ? { next_steps } : {}),
       ...(open_questions?.length ? { open_questions } : {}),
+      ...(packet.scarTissue.length ? { scar_tissue: packet.scarTissue } : {}),
       envelope,
       wikilink_refs: packet.topRecalls.map((source) =>
         source.relativePath.replace(/\.md$/, ""),
@@ -766,10 +770,13 @@ server.registerTool(
 // 8. minni_handoff_inbox
 // ---------------------------------------------------------------------------
 async function readHandoffPacketPreview(packetPath: unknown): Promise<{
+  workspace_id?: string;
   summary?: string;
   files?: string[];
   next_steps?: string[];
   open_questions?: string[];
+  scar_tissue?: unknown[];
+  wikilink_refs?: string[];
 }> {
   if (typeof packetPath !== "string" || !packetPath.trim()) return {};
   try {
@@ -777,9 +784,39 @@ async function readHandoffPacketPreview(packetPath: unknown): Promise<{
     if (raw.length > 256 * 1024) return {};
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (!parsed || typeof parsed !== "object") return {};
+    let envelopeBodyObj: Record<string, unknown> | undefined;
+    if (typeof parsed.envelope === "string" && parsed.envelope.includes("<minni:context")) {
+      const firstNl = parsed.envelope.indexOf("\n");
+      const closeTag = parsed.envelope.lastIndexOf("\n</minni:context>");
+      if (firstNl > 0 && closeTag > firstNl) {
+        try {
+          const inner = JSON.parse(parsed.envelope.slice(firstNl + 1, closeTag)) as unknown;
+          if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+            envelopeBodyObj = inner as Record<string, unknown>;
+          }
+        } catch {
+          // Ignore malformed envelope body fallback
+        }
+      }
+    }
+    const rawWs =
+      typeof parsed.workspace_id === "string" && parsed.workspace_id.trim()
+        ? parsed.workspace_id.trim()
+        : envelopeBodyObj?.identity &&
+            typeof envelopeBodyObj.identity === "object" &&
+            typeof (envelopeBodyObj.identity as Record<string, unknown>).workspace === "string"
+          ? String((envelopeBodyObj.identity as Record<string, unknown>).workspace).trim()
+          : "";
+    const normalizedWs = rawWs ? normalizeWorkspaceId(rawWs) || rawWs : "";
+    const rawScars = Array.isArray(parsed.scar_tissue)
+      ? parsed.scar_tissue
+      : Array.isArray(envelopeBodyObj?.scar_tissue)
+        ? (envelopeBodyObj.scar_tissue as unknown[])
+        : undefined;
     return {
+      ...(normalizedWs ? { workspace_id: normalizedWs } : {}),
       ...(typeof parsed.summary === "string" && parsed.summary
-        ? { summary: parsed.summary.slice(0, 400) }
+        ? { summary: parsed.summary.slice(0, 1500) }
         : {}),
       ...(Array.isArray(parsed.files)
         ? { files: parsed.files.filter((x): x is string => typeof x === "string").slice(0, 20) }
@@ -789,6 +826,10 @@ async function readHandoffPacketPreview(packetPath: unknown): Promise<{
         : {}),
       ...(Array.isArray(parsed.open_questions)
         ? { open_questions: parsed.open_questions.filter((x): x is string => typeof x === "string").slice(0, 10) }
+        : {}),
+      ...(rawScars ? { scar_tissue: rawScars.slice(0, 10) } : {}),
+      ...(Array.isArray(parsed.wikilink_refs)
+        ? { wikilink_refs: parsed.wikilink_refs.filter((x): x is string => typeof x === "string").slice(0, 20) }
         : {}),
     };
   } catch {
@@ -814,9 +855,10 @@ server.registerTool(
         ])
         .optional(),
       note: z.string().optional(),
+      workspace_id: z.string().optional(),
     },
   },
-  async ({ ack, lease_id, status, note }) => {
+  async ({ ack, lease_id, status, note, workspace_id }) => {
     const gated = await requireSharedGate("handoff.inbox", {
       ack: ack ?? Boolean(lease_id),
       ...(lease_id ? { lease_id } : {}),
@@ -825,7 +867,66 @@ server.registerTool(
     if (gated) return gated;
 
     const ackStatus = status ?? "accepted";
+    const targetWs =
+      typeof workspace_id === "string" && workspace_id.trim()
+        ? normalizeWorkspaceId(workspace_id)
+        : "";
+    const matchesTargetWorkspace = (
+      item: Record<string, unknown>,
+      preview: { workspace_id?: string },
+    ): boolean => {
+      if (!targetWs) return true;
+      const rawItemWs =
+        typeof item.workspace_id === "string" && item.workspace_id.trim()
+          ? item.workspace_id
+          : (preview.workspace_id ?? "");
+      return normalizeWorkspaceId(rawItemWs) === targetWs;
+    };
+
     if (lease_id && ack !== false) {
+      let handoffBody: Record<string, unknown> | undefined;
+      try {
+        const pendingBeforeAck = await listPendingHandoffs({ agentId: DEFAULT_AGENT_ID });
+        if (pendingBeforeAck.ok && pendingBeforeAck.data && typeof pendingBeforeAck.data === "object") {
+          const pendingList = Array.isArray((pendingBeforeAck.data as Record<string, unknown>).handoffs)
+            ? ((pendingBeforeAck.data as Record<string, unknown>).handoffs as Array<Record<string, unknown>>)
+            : [];
+          const matchedItem = pendingList.find((it) => it.lease_id === lease_id);
+          if (matchedItem) {
+            const preview = await readHandoffPacketPreview(matchedItem.path);
+            if (!matchesTargetWorkspace(matchedItem, preview)) {
+              return textResult(
+                JSON.stringify(
+                  redactLocalValue({
+                    status: "error",
+                    lease_id,
+                    error: `workspace mismatch: lease does not belong to ${targetWs}`,
+                  }),
+                  null,
+                  2,
+                ),
+              );
+            }
+            handoffBody = {
+              lease_id: matchedItem.lease_id ?? lease_id,
+              from_agent: matchedItem.from_agent ?? null,
+              to_agent: matchedItem.to_agent ?? DEFAULT_AGENT_ID,
+              task: matchedItem.task ?? "",
+              expires_at: matchedItem.expires_at ?? null,
+              ...(typeof matchedItem.workspace_id === "string" && matchedItem.workspace_id.trim()
+                ? {
+                    workspace_id:
+                      normalizeWorkspaceId(matchedItem.workspace_id) || matchedItem.workspace_id,
+                  }
+                : {}),
+              ...preview,
+            };
+          }
+        }
+      } catch {
+        // Best-effort pre-ack preview hydration
+      }
+
       const ackRes = await ackHandoff({
         leaseId: lease_id,
         status: ackStatus,
@@ -858,6 +959,7 @@ server.registerTool(
             lease_id,
             agent_id: DEFAULT_AGENT_ID,
             acked: true,
+            ...(handoffBody ? { handoff: handoffBody } : {}),
             ...(note?.trim() ? { note: note.trim().slice(0, 500) } : {}),
           },
           null,
@@ -897,6 +999,9 @@ server.registerTool(
     for (const item of filteredItems) {
       const itemLeaseId = typeof item.lease_id === "string" ? item.lease_id : "";
       const preview = await readHandoffPacketPreview(item.path);
+      if (!matchesTargetWorkspace(item, preview)) {
+        continue;
+      }
       let itemAckStatus: string | undefined;
       if (ack === true && itemLeaseId) {
         const ackRes = await ackHandoff({
@@ -917,6 +1022,9 @@ server.registerTool(
         to_agent: item.to_agent ?? DEFAULT_AGENT_ID,
         task: item.task ?? "",
         expires_at: item.expires_at ?? null,
+        ...(typeof item.workspace_id === "string" && item.workspace_id.trim()
+          ? { workspace_id: normalizeWorkspaceId(item.workspace_id) || item.workspace_id }
+          : {}),
         ...preview,
         ...(itemAckStatus ? { ack_status: itemAckStatus } : {}),
       });
@@ -1015,46 +1123,191 @@ async function ensureRelayCursorsForActiveSession(
   }
 }
 
+function clipStringUtf8(str: string, maxChars: number): string {
+  if (str.length <= maxChars) return str;
+  if (maxChars <= 3) return str.slice(0, Math.max(0, maxChars));
+  return `${str.slice(0, maxChars - 3)}...`;
+}
+
+function deepClipStrings(
+  value: unknown,
+  maxChars: number,
+  preserveKeys = new Set<string>(["plan_id", "status", "id"]),
+): unknown {
+  if (typeof value === "string") {
+    return clipStringUtf8(value, maxChars);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => deepClipStrings(item, maxChars, preserveKeys));
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (preserveKeys.has(k) && typeof v === "string") {
+        out[k] = clipStringUtf8(v, Math.max(maxChars, 96));
+      } else {
+        out[k] = deepClipStrings(v, maxChars, preserveKeys);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
 function serializeCompactBudget(
   payload: Record<string, unknown>,
-  maxBytes = 2000,
+  maxBytes = 1950,
 ): string {
-  const pretty = JSON.stringify(payload, null, 2);
-  if (Buffer.byteLength(pretty, "utf8") < maxBytes) return pretty;
-  const dense = JSON.stringify(payload);
-  if (Buffer.byteLength(dense, "utf8") < maxBytes) return dense;
+  const hardCapBytes = Math.min(2000, Math.max(maxBytes, 256));
+  const targetBytes = Math.min(maxBytes, hardCapBytes);
+  const fits = (obj: unknown): string | null => {
+    const s = JSON.stringify(obj);
+    return Buffer.byteLength(s, "utf8") <= targetBytes ? s : null;
+  };
 
-  if (Array.isArray(payload.slices)) {
-    const allSlices = payload.slices;
-    for (let keep = Math.min(allSlices.length, 16); keep >= 1; keep--) {
-      const candidate = JSON.stringify({
-        ...payload,
+  const pretty = JSON.stringify(payload, null, 2);
+  if (Buffer.byteLength(pretty, "utf8") <= targetBytes) return pretty;
+  const dense = JSON.stringify(payload);
+  if (Buffer.byteLength(dense, "utf8") <= targetBytes) return dense;
+
+  let working: Record<string, unknown> = { ...payload };
+
+  // 1. Progressive slice array shrink down to 0 with truncated_count
+  if (Array.isArray(working.slices)) {
+    const allSlices = working.slices as unknown[];
+    for (let keep = Math.min(allSlices.length, 16); keep >= 0; keep--) {
+      const nextWork: Record<string, unknown> = {
+        ...working,
         slice_count: allSlices.length,
         slices_omitted: allSlices.length - keep,
+        ...(keep < allSlices.length ? { truncated_count: allSlices.length - keep } : {}),
         slices: allSlices.slice(0, keep),
-      });
-      if (Buffer.byteLength(candidate, "utf8") < maxBytes) return candidate;
+      };
+      const ok = fits(nextWork);
+      if (ok !== null) return ok;
+      if (keep === 0) working = nextWork;
     }
   }
-  if (
-    payload.view &&
-    typeof payload.view === "object" &&
-    Array.isArray((payload.view as Record<string, unknown>).pending)
-  ) {
-    const viewObj = payload.view as Record<string, unknown>;
-    const allPending = viewObj.pending as unknown[];
-    for (let keep = Math.min(allPending.length, 8); keep >= 1; keep--) {
-      const candidate = JSON.stringify({
-        ...payload,
-        view: {
-          ...viewObj,
+
+  // 2. Progressive view.{open_questions, scars, pending} shrink down to 0
+  if (working.view && typeof working.view === "object" && !Array.isArray(working.view)) {
+    let viewWork: Record<string, unknown> = { ...(working.view as Record<string, unknown>) };
+
+    if (Array.isArray(viewWork.open_questions)) {
+      const allQs = viewWork.open_questions as unknown[];
+      for (let keep = Math.min(allQs.length, 6); keep >= 0; keep--) {
+        const nextView: Record<string, unknown> = {
+          ...viewWork,
+          open_questions: allQs.slice(0, keep),
+          ...(keep < allQs.length ? { open_questions_truncated_count: allQs.length - keep } : {}),
+        };
+        const candidate = { ...working, view: nextView };
+        const ok = fits(candidate);
+        if (ok !== null) return ok;
+        if (keep === 0) {
+          viewWork = nextView;
+          working = candidate;
+        }
+      }
+    }
+
+    if (Array.isArray(viewWork.scars)) {
+      const allScars = viewWork.scars as unknown[];
+      for (let keep = Math.min(allScars.length, 5); keep >= 0; keep--) {
+        const nextView: Record<string, unknown> = {
+          ...viewWork,
+          scars: allScars.slice(0, keep),
+          ...(keep < allScars.length ? { scars_truncated_count: allScars.length - keep } : {}),
+        };
+        const candidate = { ...working, view: nextView };
+        const ok = fits(candidate);
+        if (ok !== null) return ok;
+        if (keep === 0) {
+          viewWork = nextView;
+          working = candidate;
+        }
+      }
+    }
+
+    if (Array.isArray(viewWork.pending)) {
+      const allPending = viewWork.pending as unknown[];
+      for (let keep = Math.min(allPending.length, 8); keep >= 0; keep--) {
+        const nextView: Record<string, unknown> = {
+          ...viewWork,
           pending: allPending.slice(0, keep),
-        },
-      });
-      if (Buffer.byteLength(candidate, "utf8") < maxBytes) return candidate;
+          ...(keep < allPending.length ? { truncated_count: allPending.length - keep } : {}),
+        };
+        const candidate = { ...working, view: nextView };
+        const ok = fits(candidate);
+        if (ok !== null) return ok;
+        if (keep === 0) {
+          viewWork = nextView;
+          working = candidate;
+        }
+      }
     }
   }
-  return dense;
+
+  // 3. Top-level scars array shrink down to 0 (minni_thread_update)
+  if (Array.isArray(working.scars)) {
+    const allScars = working.scars as unknown[];
+    for (let keep = Math.min(allScars.length, 5); keep >= 0; keep--) {
+      const candidate: Record<string, unknown> = {
+        ...working,
+        scars: allScars.slice(0, keep),
+        ...(keep < allScars.length ? { scars_truncated_count: allScars.length - keep } : {}),
+      };
+      const ok = fits(candidate);
+      if (ok !== null) return ok;
+      if (keep === 0) working = candidate;
+    }
+  }
+
+  // 4. Trim updated_slice.{gate, title, evidence} and next_action / headline
+  if (
+    working.updated_slice &&
+    typeof working.updated_slice === "object" &&
+    !Array.isArray(working.updated_slice)
+  ) {
+    const us = working.updated_slice as Record<string, unknown>;
+    const trimmedUs: Record<string, unknown> = { ...us };
+    for (const k of ["gate", "title", "evidence"] as const) {
+      if (typeof trimmedUs[k] === "string") {
+        trimmedUs[k] = clipStringUtf8(trimmedUs[k] as string, 120);
+      }
+    }
+    working = { ...working, updated_slice: trimmedUs };
+    const ok = fits(working);
+    if (ok !== null) return ok;
+  }
+
+  for (const field of ["next_action", "headline", "goal", "title", "warning", "note"] as const) {
+    if (typeof working[field] === "string") {
+      working = { ...working, [field]: clipStringUtf8(working[field] as string, 140) };
+      const ok = fits(working);
+      if (ok !== null) return ok;
+    }
+  }
+
+  // 5. Progressive deep string clipping until strictly <= hardCapBytes (<= 2000 UTF-8 bytes)
+  for (const cap of [200, 120, 64, 32, 16]) {
+    const clipped = deepClipStrings(working, cap) as Record<string, unknown>;
+    const s = JSON.stringify(clipped);
+    if (Buffer.byteLength(s, "utf8") <= hardCapBytes) return s;
+    working = clipped;
+  }
+
+  // Final deterministic emergency floor guaranteed <= 2000 bytes
+  const minimal: Record<string, unknown> = {
+    ...(working.plan_id !== undefined
+      ? { plan_id: typeof working.plan_id === "string" ? clipStringUtf8(working.plan_id, 120) : working.plan_id }
+      : {}),
+    ...(working.rev !== undefined ? { rev: working.rev } : {}),
+    ...(working.status !== undefined ? { status: working.status } : {}),
+    ...(working.active !== undefined ? { active: working.active } : {}),
+    truncated: true,
+  };
+  return JSON.stringify(minimal);
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,25 +1498,21 @@ server.registerTool(
             const plan = await rehydratePlan(preTarget.notePath);
             const view = compactPlanView(plan);
             return textResult(
-              JSON.stringify(
-                {
-                  plan_id: plan.plan_id,
-                  rev: plan.rev,
-                  status: plan.status,
-                  active: false,
-                  headline: view.headline,
-                  progress: view.progress,
-                  next_action: plan.next_action,
-                  updated_slice: null,
-                  scars: view.scars,
-                },
-                null,
-                2,
-              ),
+              serializeCompactBudget({
+                plan_id: plan.plan_id,
+                rev: plan.rev,
+                status: plan.status,
+                active: false,
+                headline: view.headline,
+                progress: view.progress,
+                next_action: plan.next_action,
+                updated_slice: null,
+                scars: view.scars,
+              }),
             );
           }
           return textResult(
-            JSON.stringify({ plan_id: planIdInput ?? null, active: false }, null, 2),
+            serializeCompactBudget({ plan_id: planIdInput ?? null, active: false }),
           );
         }
 
@@ -1290,21 +1539,17 @@ server.registerTool(
         const plan = await rehydratePlan(target.notePath);
         const view = compactPlanView(plan);
         return textResult(
-          JSON.stringify(
-            {
-              plan_id: plan.plan_id,
-              rev: plan.rev,
-              status: plan.status,
-              active: true,
-              headline: view.headline,
-              progress: view.progress,
-              next_action: plan.next_action,
-              updated_slice: null,
-              scars: view.scars,
-            },
-            null,
-            2,
-          ),
+          serializeCompactBudget({
+            plan_id: plan.plan_id,
+            rev: plan.rev,
+            status: plan.status,
+            active: true,
+            headline: view.headline,
+            progress: view.progress,
+            next_action: plan.next_action,
+            updated_slice: null,
+            scars: view.scars,
+          }),
         );
       }
 
@@ -1585,16 +1830,18 @@ server.registerTool(
   {
     title: "Minni Thread Scar",
     description:
-      "Record a dead-end, failed command, or rejected hypothesis during plan execution to prevent retries, returning a compact <1 KB receipt. plan_id defaults to the active plan.",
+      "Record a dead-end, failed command, or rejected hypothesis during plan execution to prevent retries (and promote durable resolved scars to repo memory), returning a compact <1 KB receipt. plan_id defaults to the active plan.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       slice_id: z.string().min(1).optional(),
       kind: z.enum(["failed_command", "dead_end", "rejected_hypothesis"]),
       signal: z.string().min(1),
       resolution: z.string().optional(),
+      promote: z.boolean().optional(),
+      workspace_id: z.string().optional(),
     },
   },
-  async ({ plan_id: planIdInput, slice_id, kind, signal, resolution }) => {
+  async ({ plan_id: planIdInput, slice_id, kind, signal, resolution, promote, workspace_id }) => {
     const gated = await requireSharedGate("plan.scar", {
       plan_id: planIdInput,
       ...(slice_id ? { slice_id } : {}),
@@ -1662,13 +1909,64 @@ server.registerTool(
           return updated;
         },
       );
+
+      let promoted = false;
+      const shouldPromote =
+        promote === true ||
+        (promote !== false && typeof resolution === "string" && resolution.trim().length > 0);
+      if (shouldPromote) {
+        try {
+          const cleanSignal = signal.replace(/\s+/g, " ").trim();
+          const cleanResolution =
+            typeof resolution === "string" ? resolution.replace(/\s+/g, " ").trim() : "";
+          const scarTitle = `Scar (${kind}): ${cleanSignal.slice(0, 64)}`;
+          const scarText = [
+            `Scar (${kind}) in plan ${next.plan_id}${slice_id ? ` (${slice_id})` : ""}: ${cleanSignal.slice(0, 600)}`,
+            ...(cleanResolution ? [`Resolution: ${cleanResolution.slice(0, 600)}`] : []),
+          ].join("\n");
+          const quality = await assessLearningQualityAsync({
+            title: scarTitle,
+            content: scarText,
+            category: "scar",
+            source: next.plan_id,
+          });
+          if (!flagsSensitiveMaterial(quality) && quality.passed) {
+            const effectiveWs = resolveSessionWorkspaceId(effectiveVaultPath, workspace_id);
+            const store = await learnMemory({
+              content: scarText,
+              category: "scar",
+              agentId: DEFAULT_AGENT_ID,
+              workspaceId: effectiveWs,
+              source: next.plan_id,
+            }).catch((err: unknown) => ({
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+              data: undefined,
+            }));
+            await vaultFirstLearn({
+              vaultPath: effectiveVaultPath,
+              title: scarTitle,
+              content: scarText,
+              category: "scar",
+              source: next.plan_id,
+              agentId: DEFAULT_AGENT_ID,
+              storeResult: { ok: store.ok, data: store.data, error: store.error },
+              quality,
+            });
+            promoted = true;
+          }
+        } catch {
+          promoted = false;
+        }
+      }
+
       const matchedIdx = next.scar_tissue.findIndex(
         (s) => s.kind === kind && s.signal === signal,
       );
       const scarIdx = matchedIdx >= 0 ? matchedIdx : Math.max(0, next.scar_tissue.length - 1);
       const signalPreview = signal.length <= 200 ? signal : `${signal.slice(0, 197)}...`;
       return textResult(
-        JSON.stringify(
+        serializeCompactBudget(
           {
             plan_id: next.plan_id,
             rev: next.rev,
@@ -1679,9 +1977,9 @@ server.registerTool(
               signal: signalPreview,
             },
             scar_count: next.scar_tissue.length,
+            promoted,
           },
-          null,
-          2,
+          980,
         ),
       );
     } catch (error) {

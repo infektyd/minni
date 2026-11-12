@@ -30,10 +30,12 @@ import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from minni.config import normalize_workspace_scope
 
 from minni.graph_candidates import REQUIRED_MEMORY_KIND, REQUIRED_PAGE_TYPE
 from minni.graph_coordinator import (
@@ -691,6 +693,15 @@ def _prepare_sql_lexical_edges(
     except Exception:
         return None
 
+    norm_ws = normalize_workspace_scope(workspace_id, default="default")
+    gate_ws = (
+        "*"
+        if (
+            str(getattr(graph_principal, "workspace_id", "") or "") == "*"
+            and norm_ws in ("default", "global", "*")
+        )
+        else str(getattr(graph_principal, "workspace_id", "") or norm_ws)
+    )
     for row in rows:
         doc_id = int(row["doc_id"])
         if doc_id in seen_docs:
@@ -698,7 +709,7 @@ def _prepare_sql_lexical_edges(
         if src_path and str(row["path"] or "") == src_path:
             continue
         meta = _doc_metadata(row)
-        if not _authorized(graph_principal, workspace_id, meta):
+        if not _authorized(graph_principal, gate_ws, meta):
             continue
         if not _eligible(meta):
             continue
@@ -733,7 +744,7 @@ def _prepare_sql_lexical_edges(
             "path": src_path or f"/virtual/{graph_principal.agent_id}",
             "title": src_path or f"learning:{graph_principal.agent_id}",
             "content_sha256": _sha256_text(content),
-            "workspace_id": workspace_id,
+            "workspace_id": norm_ws,
             "category": category,
         },
     }
@@ -816,12 +827,34 @@ def prepare_governed_promotion(
     allow_adapter: bool = True,
 ) -> PreparedGovernedPromotion:
     """Phase A helper for governed learning promotion (must run outside write txn)."""
-    norm_ws = str(workspace_id or "default").strip() or "default"
+    norm_ws = (
+        "*"
+        if str(workspace_id or "").strip() == "*"
+        else normalize_workspace_scope(workspace_id, default="default")
+    )
+    caller_raw_ws = str(getattr(caller_principal, "workspace_id", None) or "default").strip() or "default"
+    caller_ws = (
+        "*"
+        if caller_raw_ws == "*"
+        else normalize_workspace_scope(caller_raw_ws, default="default")
+    )
+    if caller_principal is not None and caller_ws not in ("*", "default", "global"):
+        graph_ws = caller_ws
+    elif norm_ws in ("*", "default", "global"):
+        graph_ws = "*"
+    else:
+        graph_ws = norm_ws
+
+    if learning_fields is not None and learning_fields.workspace_id is not None:
+        lf_ws = normalize_workspace_scope(learning_fields.workspace_id, default="default")
+        if lf_ws != learning_fields.workspace_id:
+            learning_fields = replace(learning_fields, workspace_id=lf_ws)
+
     caps = list(getattr(caller_principal, "capabilities", None) or ["read", "learn"])
     roots = list(getattr(caller_principal, "allowed_vault_roots", None) or [])
     graph_principal = EffectivePrincipal(
         agent_id=author_agent,
-        workspace_id=norm_ws,
+        workspace_id=graph_ws,
         transport=str(getattr(caller_principal, "transport", "uds") or "uds"),
         capabilities=caps,
         allowed_vault_roots=roots,
@@ -910,6 +943,19 @@ def apply_fallback_graph_edges(
 
     has_ws = _documents_has_workspace_col(c)
     ws_col = ", workspace_id" if has_ws else ""
+    norm_ws = (
+        "*"
+        if str(workspace_id or "").strip() == "*"
+        else normalize_workspace_scope(workspace_id, default="default")
+    )
+    gate_ws = (
+        "*"
+        if (
+            str(getattr(graph_principal, "workspace_id", "") or "") == "*"
+            and norm_ws in ("default", "global", "*")
+        )
+        else str(getattr(graph_principal, "workspace_id", "") or norm_ws)
+    )
     still_valid = []
     for desc, label, direction, confidence in validated:
         if int(desc.doc_id) == int(new_doc_id):
@@ -925,7 +971,7 @@ def apply_fallback_graph_edges(
         if row is None:
             continue
         meta = _doc_metadata(row)
-        if not _authorized(graph_principal, workspace_id, meta) or not _eligible(meta):
+        if not _authorized(graph_principal, gate_ws, meta) or not _eligible(meta):
             continue
         if str(meta.get("page_status") or "") in CLOSED_PROJECTION_STATUSES:
             continue

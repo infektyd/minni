@@ -564,10 +564,12 @@ def find_near_duplicate_active_learning(
     content: str,
     exclude_learning_id: int | None = None,
     embedding: bytes | None = None,
+    workspace_id: str | None = None,
     jaccard_threshold: float = 0.65,
     cosine_threshold: float = 0.88,
 ) -> list[int]:
-    """Return active learning IDs in the same (agent_id, category) with 5-gram Jaccard >= 0.65 or cosine >= 0.88."""
+    """Return active learning IDs in the same (agent_id, category[, workspace_id]) with 5-gram Jaccard >= 0.65 or cosine >= 0.88."""
+    from minni.config import normalize_workspace_scope
 
     def _op(c: Any) -> list[int]:
         if not _table_exists(c, "learnings"):
@@ -577,10 +579,18 @@ def find_near_duplicate_active_learning(
         has_status = "status" in l_cols
         has_superseded = "superseded_by" in l_cols
         has_embedding = "embedding" in l_cols
+        has_workspace = "workspace_id" in l_cols
+        target_ws = (
+            normalize_workspace_scope(workspace_id, default="default")
+            if workspace_id is not None and has_workspace
+            else None
+        )
 
         select_cols = [pk_col, "content"]
         if has_embedding:
             select_cols.append("embedding")
+        if has_workspace:
+            select_cols.append("workspace_id")
         where_parts = ["agent_id = ?", "COALESCE(category, 'general') = ?"]
         params: list[Any] = [agent_id, category or "general"]
         if has_status:
@@ -604,15 +614,21 @@ def find_near_duplicate_active_learning(
                 target_emb = erow["embedding"] if hasattr(erow, "keys") else erow[0]
 
         matches: list[int] = []
+        ws_idx = 3 if has_embedding else 2
         for r in rows:
-            rid = int(r[pk_col] if hasattr(r, "keys") else r[0])
-            rcontent = str((r["content"] if hasattr(r, "keys") else r[1]) or "")
+            is_dict = hasattr(r, "keys")
+            if target_ws is not None:
+                raw_rws = r["workspace_id"] if is_dict else r[ws_idx]
+                if normalize_workspace_scope(raw_rws, default="default") != target_ws:
+                    continue
+            rid = int(r[pk_col] if is_dict else r[0])
+            rcontent = str((r["content"] if is_dict else r[1]) or "")
             jacc = five_gram_jaccard(content, rcontent)
             if jacc >= jaccard_threshold:
                 matches.append(rid)
                 continue
             if has_embedding and target_emb is not None:
-                remb = r["embedding"] if hasattr(r, "keys") else r[2]
+                remb = r["embedding"] if is_dict else r[2]
                 if _cosine_similarity_blobs(target_emb, remb) >= cosine_threshold:
                     matches.append(rid)
         return matches
