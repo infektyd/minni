@@ -149,9 +149,9 @@ class FaissDiskBackend:
                     score = score_map[cid]
                     if did not in seen_docs or score > seen_docs[did]:
                         seen_docs[did] = score
-                        # replace or add
-                    hits = [h for h in hits if h.doc_id != did]
-                    if did in seen_docs:
+                        # replace or add — only when this chunk is the doc's
+                        # new best; a weaker sibling must not evict it.
+                        hits = [h for h in hits if h.doc_id != did]
                         hits.append(VectorHit(
                             chunk_id=cid,
                             doc_id=did,

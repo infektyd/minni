@@ -145,6 +145,14 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
         )
     if version == 26:
         return _table_exists(conn, "repo_map_cards")
+    if version == 27:
+        return (
+            _table_exists(conn, "vector_backends")
+            and _column_exists(conn, "vector_backends", "dirty_seq")
+            and _column_exists(conn, "vector_backends", "synced_dirty_seq")
+            and _trigger_exists(conn, "trg_chunk_embeddings_ad_vector_dirty")
+            and _trigger_exists(conn, "trg_chunk_embeddings_au_vector_dirty")
+        )
     return True
 
 
@@ -262,6 +270,22 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                         "Migration %03d: documents/learnings tables incomplete — skipping "
                         "statements (non-destructive); migration stays pending and "
                         "will retry once the base schema is supplied",
+                        version,
+                    )
+                    continue
+                if version == 27 and not _table_exists(conn, "chunk_embeddings"):
+                    if _table_exists(conn, "vector_backends"):
+                        _execute_tolerant(
+                            conn,
+                            "ALTER TABLE vector_backends ADD COLUMN dirty_seq INTEGER NOT NULL DEFAULT 0",
+                        )
+                        _execute_tolerant(
+                            conn,
+                            "ALTER TABLE vector_backends ADD COLUMN synced_dirty_seq INTEGER NOT NULL DEFAULT 0",
+                        )
+                    logger.warning(
+                        "Migration %03d: chunk_embeddings table absent — ensured vector_backends "
+                        "sequence columns and skipping trigger creation until base schema is supplied",
                         version,
                     )
                     continue

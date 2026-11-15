@@ -4260,15 +4260,6 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         if not effective_body.strip():
             return None
 
-        if update_access:
-            with self.db.cursor() as c:
-                c.execute(
-                    """UPDATE documents
-                       SET access_count = access_count + 1, last_accessed = ?
-                       WHERE doc_id = ?""",
-                    (time.time(), row["doc_id"]),
-                )
-
         p_ws = (
             str(getattr(principal, "workspace_id", "") or "default").strip() or "default"
             if principal is not None
@@ -4288,10 +4279,22 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             if ws_effective in ("default", "") and p_ws in ("*", "default", "global")
             else ws_effective
         )
+        # Seam 6 (reality-bench): authorize BEFORE touching access stats — an
+        # expand the caller may not read must not bump access_count /
+        # last_accessed (which feed decay and ranking).
+        if principal is not None and not can_read_document(principal, ws_gate, raw):
+            return None
+
+        if update_access:
+            with self.db.cursor() as c:
+                c.execute(
+                    """UPDATE documents
+                       SET access_count = access_count + 1, last_accessed = ?
+                       WHERE doc_id = ?""",
+                    (time.time(), row["doc_id"]),
+                )
+
         if principal is not None:
-            ws = ws_gate
-            if not can_read_document(principal, ws, raw):
-                return None
             txt = effective_body
             raw["instruction_like"] = bool(is_instruction_like(txt))
             attribution = self._score_attribution(claim, txt)

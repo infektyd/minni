@@ -828,6 +828,23 @@ class TestHandleResolveContradiction:
         assert post_chunks["n"] == 0, "superseded learning's chunks must be purged"
         assert post_fts["n"] == 0, "superseded learning's FTS row must be purged"
 
+        # Reality-bench seam 5: the REPLACEMENT learning must be indexed too.
+        # Purging the old doc without indexing the new one made a resolved
+        # contradiction vanish from document search entirely.
+        new_id = resp["result"]["new_learning_id"]
+        new_path = minnid._durable_doc_path(
+            "test",
+            f"learning:{new_id}",
+            vault_path=cfg.vault_path,
+            content="New fact: auth uses session cookies since April 2026",
+        )
+        with db_obj.cursor() as c:
+            new_doc = c.execute(
+                "SELECT doc_id FROM documents WHERE path = ?", (new_path,)
+            ).fetchone()
+        assert new_doc is not None, "replacement learning must get a durable doc"
+        assert resp["result"].get("indexed", True) is not False
+
     def test_subscribe_contradictions_returns_events_for_read_learnings(self, tmp_path, monkeypatch):
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
 

@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { readProcessStartMarker as readPortableProcessStartMarker } from "./config.js";
 import { appendFileWithFsync } from "./vault.js";
 
 export const DEFAULT_WAIT_MS = 5_000;
@@ -77,12 +78,23 @@ function processAlive(pid: number): boolean {
 }
 
 /**
- * Linux process-start marker from /proc/<pid>/stat field 22 (starttime).
- * Returns undefined when /proc is unavailable or unreadable — callers then
- * fall back to PID-only liveness (never steal a live PID on age alone).
+ * Process-start marker: Linux /proc/<pid>/stat field 22 (starttime) when /proc
+ * exists, else the portable `ps -o lstart=` reading (config.ts) — macOS has no
+ * /proc, and without this fallback PID-reuse detection was silently off there
+ * (reality-bench seam 3). A host only ever produces one of the two formats for
+ * all its processes, so markers stay comparable. Returns undefined when neither
+ * source answers — callers then fall back to PID-only liveness (never steal a
+ * live PID on age alone).
  */
 export function readProcessStartMarker(pid: number): string | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const fromProc = readProcStartMarker(pid);
+  if (fromProc !== undefined) return fromProc;
+  if (existsSync("/proc/self/stat")) return undefined;
+  return readPortableProcessStartMarker(pid);
+}
+
+function readProcStartMarker(pid: number): string | undefined {
   try {
     const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
     // comm may contain spaces/parens — starttime is field 22, which is index

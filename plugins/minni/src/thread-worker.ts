@@ -282,28 +282,68 @@ async function hasAcceptedStartStamp(
     receipt?.kind === START_ACCEPTED_RECEIPT_KIND &&
     receipt.status === "pending" &&
     receipt.generation === generation &&
-    receipt.response.slice.status !== "in_progress" &&
     receipt.response.slice.status !== "done"
+  );
+}
+
+async function hasCommittedStartStamp(
+  vaultPath: string,
+  planId: string,
+  sliceId: string,
+  workerAgentId: string,
+  slice: PlanSlice,
+): Promise<boolean> {
+  const claimId = slice.claim?.claim_id;
+  if (!claimId) return false;
+  const generation = requireGeneration(slice);
+  const receipt = await readWorkerUpdateReceipt({
+    vaultPath,
+    planId,
+    sliceId,
+    workerAgentId,
+    generation,
+    idempotencyKey: startAcceptedReceiptKey(
+      planId,
+      sliceId,
+      generation,
+      claimId,
+    ),
+    claimId,
+  });
+  return (
+    receipt?.kind === START_ACCEPTED_RECEIPT_KIND &&
+    receipt.status === "committed" &&
+    receipt.generation === generation
   );
 }
 
 function hasJournaledStartForCurrentGeneration(
   events: OrderedThreadEvent[],
   sliceId: string,
+  workerAgentId?: string,
 ): boolean {
   let started = false;
   for (const event of events) {
+    if (event.kind === "restored") {
+      started = false;
+      continue;
+    }
     if (event.slice_id !== sliceId) continue;
     if (
+      event.kind === "slice.claimed" ||
       event.kind === "slice.assigned" ||
-      event.kind === "slice.lease_expired"
+      event.kind === "slice.lease_expired" ||
+      event.kind === "slice.claim_revoked" ||
+      event.kind === "status_changed"
     ) {
       started = false;
     } else if (
       event.kind === "slice.started" ||
       event.kind === "slice.progressed"
     ) {
-      started = true;
+      if (!workerAgentId || !event.actor || event.actor === workerAgentId) {
+        started = true;
+      }
     }
   }
   return started;
@@ -319,7 +359,24 @@ async function requireJournaledStartBeforeComplete(options: {
   orderedSnapshot?: OrderedThreadEvent[];
 }): Promise<void> {
   const { vaultPath, notePath, planId, sliceId, workerAgentId, slice } = options;
-  if (slice.status === "in_progress") return;
+  if (slice.status === "done") return;
+  if (slice.status !== "pending") {
+    const ordered =
+      options.orderedSnapshot ??
+      (await readOrderedThreadEvents(journalPathFor(notePath, planId)));
+    if (
+      hasJournaledStartForCurrentGeneration(ordered, sliceId, workerAgentId) ||
+      (await hasCommittedStartStamp(
+        vaultPath,
+        planId,
+        sliceId,
+        workerAgentId,
+        slice,
+      ))
+    ) {
+      return;
+    }
+  }
   const queuedNow = await listQueuedWorkerWrites(vaultPath, planId);
   const startTicket = queuedNow.some(
     (item) =>
@@ -337,15 +394,7 @@ async function requireJournaledStartBeforeComplete(options: {
   if (startTicket || startStamp) {
     throw new Error("start must apply before complete");
   }
-  if (slice.status === "pending") {
-    throw new Error("complete cannot persist done without start");
-  }
-  const ordered =
-    options.orderedSnapshot ??
-    (await readOrderedThreadEvents(journalPathFor(notePath, planId)));
-  if (!hasJournaledStartForCurrentGeneration(ordered, sliceId)) {
-    throw new Error("complete cannot persist done without start");
-  }
+  throw new Error("complete cannot persist done without start");
 }
 
 /**
@@ -2823,6 +2872,32 @@ async function applyClaimedSliceWithClaimFs(
             rev: existingReceipt.rev,
             response: existingReceipt.response,
           });
+          if (
+            input.action.action === "start" ||
+            input.action.action === "progress"
+          ) {
+            const startReceiptKey = startAcceptedReceiptKey(
+              planId,
+              sliceId,
+              existingReceipt.generation,
+              existingReceipt.claim_id,
+            );
+            if (idempotencyKey !== startReceiptKey) {
+              await commitWorkerUpdateReceipt({
+                vaultPath: input.vaultPath,
+                planId,
+                sliceId,
+                workerAgentId,
+                claimId: existingReceipt.claim_id,
+                generation: existingReceipt.generation,
+                idempotencyKey: startReceiptKey,
+                kind: START_ACCEPTED_RECEIPT_KIND,
+                tokenDigest: existingReceipt.token_digest,
+                rev: existingReceipt.rev,
+                response: existingReceipt.response,
+              }).catch(() => {});
+            }
+          }
           return receiptMutationResult(plan, committed);
         }
       }
@@ -2938,6 +3013,32 @@ async function applyClaimedSliceWithClaimFs(
             rev: intendedRev,
             response: publicResponse,
           }).catch(() => {});
+          if (
+            input.action.action === "start" ||
+            input.action.action === "progress"
+          ) {
+            const startReceiptKey = startAcceptedReceiptKey(
+              planId,
+              sliceId,
+              generation,
+              claim.claim_id,
+            );
+            if (idempotencyKey !== startReceiptKey) {
+              await commitWorkerUpdateReceipt({
+                vaultPath: input.vaultPath,
+                planId,
+                sliceId,
+                workerAgentId,
+                claimId: claim.claim_id,
+                generation,
+                idempotencyKey: startReceiptKey,
+                kind: START_ACCEPTED_RECEIPT_KIND,
+                tokenDigest,
+                rev: intendedRev,
+                response: publicResponse,
+              }).catch(() => {});
+            }
+          }
           // Complete is the opposite of claim: the durable note already has
           // no live claim, so the mode-0600 envelope is an orphan and must
           // go even when history append failed after the note write.
@@ -2974,6 +3075,32 @@ async function applyClaimedSliceWithClaimFs(
         rev: intendedRev,
         response: publicResponse,
       });
+      if (
+        input.action.action === "start" ||
+        input.action.action === "progress"
+      ) {
+        const startReceiptKey = startAcceptedReceiptKey(
+          planId,
+          sliceId,
+          generation,
+          claim.claim_id,
+        );
+        if (idempotencyKey !== startReceiptKey) {
+          await commitWorkerUpdateReceipt({
+            vaultPath: input.vaultPath,
+            planId,
+            sliceId,
+            workerAgentId,
+            claimId: claim.claim_id,
+            generation,
+            idempotencyKey: startReceiptKey,
+            kind: START_ACCEPTED_RECEIPT_KIND,
+            tokenDigest,
+            rev: intendedRev,
+            response: publicResponse,
+          });
+        }
+      }
       const result = mutationResult(next, sliceId, readyBefore, now);
       const supplemental: Array<{
         idempotencyKey: string;

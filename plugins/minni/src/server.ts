@@ -735,12 +735,21 @@ server.registerTool(
         : fallbackExpiresAt
       : null;
 
+    const effectiveFromAgent =
+      typeof deliveryData?.from_agent === "string" && deliveryData.from_agent.trim()
+        ? deliveryData.from_agent.trim()
+        : packet.agentOrigin;
+    const effectiveToAgent =
+      typeof deliveryData?.to_agent === "string" && deliveryData.to_agent.trim()
+        ? deliveryData.to_agent.trim()
+        : targetAgent;
+
     await recordAudit(effectiveVaultPath, {
       tool: "minni_handoff_send",
       summary: task.slice(0, 120),
       details: {
-        agent: packet.agentOrigin,
-        to_agent: targetAgent,
+        agent: effectiveFromAgent,
+        to_agent: effectiveToAgent,
         workspace: packet.workspace,
         lease_id: leaseId,
         recalls: packet.topRecalls.length,
@@ -753,8 +762,8 @@ server.registerTool(
     const receipt: Record<string, unknown> = {
       status,
       lease_id: leaseId,
-      from_agent: packet.agentOrigin,
-      to_agent: targetAgent,
+      from_agent: effectiveFromAgent,
+      to_agent: effectiveToAgent,
       expires_at: expiresAt,
       ...(!delivery.ok && delivery.error
         ? { error: delivery.error.slice(0, 240) }

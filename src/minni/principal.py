@@ -460,7 +460,45 @@ def _add_valid_agent(scope: list[str], seen: set[str], agent_id: str) -> None:
         seen.add(agent_id)
 
 
-@lru_cache(maxsize=128)
+_STATIC_AGENT_ID_ALIASES: dict[str, str] = {
+    "claudecode": "claude-code",
+    "antigravity": "gemini",
+    "agy": "gemini",
+}
+
+
+def _iter_principal_files(d: Path, *, strict: bool):
+    """Yield ``(stem, raw_dict)`` across canonical operator files then sorted per-agent files."""
+    seen: set[str] = set()
+    for name in CANONICAL_PRINCIPAL_NAMES:
+        seen.add(name)
+        p = d / f"{name}.json"
+        if p.is_symlink() or not p.is_file():
+            continue
+        raw = _load_raw_principal_file(name, d, strict=strict)
+        if raw:
+            yield name, raw
+    if not d.is_dir():
+        return
+    for p in sorted(d.glob("*.json")):
+        stem = p.stem
+        if stem in seen or p.is_symlink() or not p.is_file():
+            continue
+        try:
+            validate_agent_id(stem)
+        except ValueError:
+            continue
+        seen.add(stem)
+        raw = _load_raw_principal_file(stem, d, strict=strict)
+        if not raw:
+            continue
+        raw_id = str(raw.get("agent_id") or raw.get("id") or "").strip()
+        if raw_id and raw_id != stem:
+            continue
+        yield stem, raw
+
+
+@lru_cache(maxsize=256)
 def _agent_scope_for_cached(agent_id: str, principals_dir: str) -> tuple[str, ...]:
     scope: list[str] = []
     seen: set[str] = set()
@@ -468,18 +506,20 @@ def _agent_scope_for_cached(agent_id: str, principals_dir: str) -> tuple[str, ..
 
     d = Path(principals_dir)
     _ensure_principals_dir(d)
-    for name in CANONICAL_PRINCIPAL_NAMES:
-        raw = _load_raw_principal_file(name, d, strict=False)
-        if not raw:
-            continue
-        canonical = str(raw.get("agent_id") or raw.get("id") or "main").strip()
+    for name, raw in _iter_principal_files(d, strict=False):
+        default_id = "main" if name in CANONICAL_PRINCIPAL_NAMES else name
+        canonical = str(raw.get("agent_id") or raw.get("id") or default_id).strip()
         aliases = _principal_aliases(raw)
         platform_ids = _string_list(raw.get("platform_agent_ids"))
 
         if agent_id == canonical or agent_id in platform_ids:
             for alias in aliases:
                 _add_valid_agent(scope, seen, alias)
-        elif agent_id in aliases:
+        elif (
+            agent_id in aliases
+            and name not in CANONICAL_PRINCIPAL_NAMES
+            and canonical not in {"local", "default", "main", "operator"}
+        ):
             _add_valid_agent(scope, seen, canonical)
             for alias in aliases:
                 _add_valid_agent(scope, seen, alias)
@@ -499,7 +539,76 @@ def agent_scope_for(agent_id: str, principals_dir: Optional[Path] = None) -> lis
     return list(_agent_scope_for_cached(agent_id, str(d)))
 
 
-agent_scope_for.cache_clear = _agent_scope_for_cached.cache_clear  # type: ignore[attr-defined]
+@lru_cache(maxsize=256)
+def _canonicalize_agent_id_cached(supplied: str, principals_dir: str) -> str:
+    d = Path(principals_dir)
+    if d.is_dir():
+        files = list(_iter_principal_files(d, strict=False))
+        for _stem, raw in files:
+            raw_id = str(raw.get("agent_id") or raw.get("id") or "").strip()
+            if raw_id == supplied and supplied not in ("local", "default"):
+                return supplied
+        for stem, raw in files:
+            if stem in CANONICAL_PRINCIPAL_NAMES:
+                continue
+            raw_agent = str(raw.get("agent_id") or raw.get("id") or stem).strip()
+            if not raw_agent or raw_agent in {"local", "default", "main", "operator"}:
+                continue
+            try:
+                validate_agent_id(raw_agent)
+            except ValueError:
+                continue
+            if supplied in _principal_aliases(raw):
+                return raw_agent
+    return _STATIC_AGENT_ID_ALIASES.get(supplied, supplied)
+
+
+def canonicalize_agent_id(agent_id: str, principals_dir: Optional[Path] = None) -> str:
+    """Resolve legacy/platform host aliases to their canonical agent_id."""
+    supplied = validate_agent_id(agent_id)
+    d = principals_dir or PRINCIPALS_DIR
+    return _canonicalize_agent_id_cached(supplied, str(d))
+
+
+@lru_cache(maxsize=256)
+def _handoff_aliases_for_cached(supplied: str, principals_dir: str) -> tuple[str, ...]:
+    scope: list[str] = []
+    seen: set[str] = set()
+    _add_valid_agent(scope, seen, supplied)
+    canonical = _canonicalize_agent_id_cached(supplied, principals_dir)
+    _add_valid_agent(scope, seen, canonical)
+    for alias_key, target_id in _STATIC_AGENT_ID_ALIASES.items():
+        if target_id == canonical:
+            _add_valid_agent(scope, seen, alias_key)
+    d = Path(principals_dir)
+    if d.is_dir():
+        for stem, raw in _iter_principal_files(d, strict=False):
+            if stem in CANONICAL_PRINCIPAL_NAMES:
+                continue
+            raw_agent = str(raw.get("agent_id") or raw.get("id") or stem).strip()
+            if raw_agent == canonical:
+                for alias in _principal_aliases(raw):
+                    _add_valid_agent(scope, seen, alias)
+    return tuple(scope)
+
+
+def handoff_aliases_for(agent_id: str, principals_dir: Optional[Path] = None) -> list[str]:
+    """Return strict 1:1 per-agent identity synonyms for handoff routing/inbox scope."""
+    supplied = validate_agent_id(str(agent_id))
+    d = principals_dir or PRINCIPALS_DIR
+    return list(_handoff_aliases_for_cached(supplied, str(d)))
+
+
+def clear_principal_caches() -> None:
+    """Clear memoized principal scope and alias canonicalization caches."""
+    _agent_scope_for_cached.cache_clear()
+    _canonicalize_agent_id_cached.cache_clear()
+    _handoff_aliases_for_cached.cache_clear()
+
+
+agent_scope_for.cache_clear = clear_principal_caches  # type: ignore[attr-defined]
+canonicalize_agent_id.cache_clear = clear_principal_caches  # type: ignore[attr-defined]
+handoff_aliases_for.cache_clear = clear_principal_caches  # type: ignore[attr-defined]
 
 
 def resolve_effective_principal(
@@ -714,10 +823,7 @@ def _stamp_effective_principal(
     # principal so reads/writes are attributed to the actual surface (e.g. codex)
     # while the operator-controlled local principal file remains the trust root.
     if strict:
-        for name in CANONICAL_PRINCIPAL_NAMES:
-            raw = _load_raw_principal_file(name, d, strict=True)
-            if not raw:
-                continue
+        for _name, raw in _iter_principal_files(d, strict=True):
             raw_ids = raw.get("platform_agent_ids")
             platform_ids = [str(a) for a in raw_ids] if isinstance(raw_ids, list) else []
             if supplied not in platform_ids:
@@ -736,10 +842,7 @@ def _stamp_effective_principal(
     # H7 (NamedAgentNeverOperator): alias callers resolve to their OWN principal
     # with capabilities from an explicit map, never the operator stamp.
     if strict:
-        for name in CANONICAL_PRINCIPAL_NAMES:
-            raw = _load_raw_principal_file(name, d, strict=True)
-            if not raw:
-                continue
+        for _name, raw in _iter_principal_files(d, strict=True):
             aliases = _principal_aliases(raw)
             if supplied not in aliases:
                 continue
@@ -1113,9 +1216,10 @@ def can_read_document(
     if (
         page_type in {"wiki", "handoff", "synthesis", "decision"}
         or agent_l.startswith(("wiki:", "handoff"))
-        or "wiki" in agent_l
-        or "handoff" in agent_l
     ):
+        # Seam 6 (reality-bench): no bare substring match — an author id that
+        # merely CONTAINS "wiki"/"handoff" (e.g. "kiwiki", "nohandoff-bot") is
+        # an ordinary agent and stays default-deny cross-agent.
         return True
 
     # Default-deny any other cross-agent case

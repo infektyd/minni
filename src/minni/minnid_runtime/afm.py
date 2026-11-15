@@ -1106,12 +1106,16 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
         "promoted": promoted,
         "deduped": deduped,
         "reviewed": reviewed,
+        "rejected": rejected,
+        "redacted": redacted,
         "errors": errors,
         "remaining_proposed": remaining_proposed,
         "requested": {
             "promote": len(promote_ids),
             "dedup": len(dedup_ids),
             "review": len(review_ids),
+            "reject": len(reject_ids),
+            "redact": len(redact_ids),
         },
     }
 
@@ -1259,6 +1263,15 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
                 "review_candidate_ids": list(
                     result.get("review_candidate_ids") or []
                 ),
+                # Seam 4: rejects/redacts are terminal decisions too; a
+                # deferred (write_timeout) apply must carry them or those
+                # candidates stay `proposed` and get re-judged every run.
+                "reject_candidate_ids": list(
+                    result.get("reject_candidate_ids") or []
+                ),
+                "redact_candidate_ids": list(
+                    result.get("redact_candidate_ids") or []
+                ),
             }
             write_result = submit_drafts({
                 "pass_name": pass_name,
@@ -1305,6 +1318,8 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             result.get("promote_candidate_ids")
             or result.get("dedup_candidate_ids")
             or result.get("review_candidate_ids")
+            or result.get("reject_candidate_ids")
+            or result.get("redact_candidate_ids")
         ):
             if write_refused:
                 if write_status == "write_timeout":

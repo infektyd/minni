@@ -1647,7 +1647,15 @@ export function createHookHandlers(
       // The payload never went on the wire, so nothing it was carrying may be
       // consumed — see markOutputDropped. The write below still SUCCEEDS (it is
       // a noop), which is exactly why the flush alone cannot be trusted.
-      markOutputDropped();
+      //
+      // A NOTE is the exception: by contract it is human-facing bookkeeping,
+      // never a memory carrier, so there is nothing to keep re-deliverable, and
+      // a wire with no note channel (agy, Cursor) can never carry it on a
+      // retry either. Marking it dropped discarded every post-delivery commit
+      // on that Stop — and since the receipt note rides EVERY Stop, agy's use
+      // detector and DF recount never ran at all (reality-bench seam 2). The
+      // noop the host receives is a real delivery; the drop is still audited.
+      if (intent.kind !== "note") markOutputDropped();
       try {
         await recordAudit(config.vaultPath, {
           tool: `${config.auditPrefix}_intent_dropped`,
