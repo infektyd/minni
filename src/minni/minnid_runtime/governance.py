@@ -1118,17 +1118,40 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                 new_lid, agent_id, category, new_content, now, workspace_id=resolved_ws
             )
 
+        # Seam 5 (reality-bench): parity with handle_learn — the replacement
+        # learning gets its synthetic durable doc, or a resolved contradiction
+        # drops out of document search (the old doc was just purged above).
+        # Post-commit and best-effort: never undoes the committed resolve.
+        indexed: Any = None
+        try:
+            indexed = _call_index_durable_learning(
+                context,
+                agent_id,
+                new_content,
+                key=f"learning:{new_lid}",
+                db=wb.db,
+                workspace_id=resolved_ws,
+            )
+        except Exception as exc:
+            indexed = False
+            context.logger.warning(
+                "resolve_contradiction: indexing learning #%d failed: %s", new_lid, exc
+            )
+
         refresh_today_digest_safe(
             daemon_running=True,
             db_path=getattr(wb.config, "db_path", None)
             or getattr(getattr(wb.db, "config", None), "db_path", None),
         )
 
-        return context.make_response({
+        resolve_result: dict = {
             "status": "ok",
             "new_learning_id": new_lid,
             "superseded": supersede_ids,
-        }, request_id)
+        }
+        if indexed is False:
+            resolve_result["indexed"] = False
+        return context.make_response(resolve_result, request_id)
     except ResolveRejected as exc:
         return exc.response
     except Exception as exc:

@@ -1216,9 +1216,10 @@ def can_read_document(
     if (
         page_type in {"wiki", "handoff", "synthesis", "decision"}
         or agent_l.startswith(("wiki:", "handoff"))
-        or "wiki" in agent_l
-        or "handoff" in agent_l
     ):
+        # Seam 6 (reality-bench): no bare substring match — an author id that
+        # merely CONTAINS "wiki"/"handoff" (e.g. "kiwiki", "nohandoff-bot") is
+        # an ordinary agent and stays default-deny cross-agent.
         return True
 
     # Default-deny any other cross-agent case

@@ -432,8 +432,13 @@ def test_governed_contradiction_preserves_shared_node_until_last_learning(store,
         assert rows(db, "learning_documents") == joins
         doc = next(row for row in rows(db, "documents") if row["doc_id"] == doc_id)
         assert doc["page_status"] == ("accepted" if index == 0 else "superseded")
-        assert bool(rows(db, "chunk_embeddings")) is (index == 0)
-    assert not engine._semantic_search("specimen", 5)
+        # The SHARED node keeps its chunks until its last learning is
+        # superseded. Scoped to doc_id: since reality-bench seam 5 the
+        # replacement learnings are (correctly) indexed under their own docs.
+        shared_chunks = [r for r in rows(db, "chunk_embeddings") if r["doc_id"] == doc_id]
+        assert bool(shared_chunks) is (index == 0)
+    hits = engine._semantic_search("specimen", 5)
+    assert doc_id not in {h.get("doc_id") for h in hits}, "superseded shared node must not surface"
 
 
 @pytest.mark.parametrize("statuses,expected", [

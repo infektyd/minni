@@ -1487,7 +1487,8 @@ def _lifecycle_apply_complete(
     remaining = applied.get("remaining_proposed")
     errors = int(applied.get("errors") or 0)
     terminalized = sum(
-        int(applied.get(k) or 0) for k in ("promoted", "deduped", "reviewed")
+        int(applied.get(k) or 0)
+        for k in ("promoted", "deduped", "reviewed", "rejected", "redacted")
     )
     did_work = terminalized > 0
     if remaining is not None:
@@ -1495,7 +1496,10 @@ def _lifecycle_apply_complete(
     # Legacy applied shape without remaining_proposed.
     req = applied.get("requested")
     if isinstance(req, dict):
-        requested = sum(int(req.get(k) or 0) for k in ("promote", "dedup", "review"))
+        requested = sum(
+            int(req.get(k) or 0)
+            for k in ("promote", "dedup", "review", "reject", "redact")
+        )
     else:
         requested = sum(
             len(lifecycle.get(k) or [])
@@ -1503,6 +1507,8 @@ def _lifecycle_apply_complete(
                 "promote_candidate_ids",
                 "dedup_candidate_ids",
                 "review_candidate_ids",
+                "reject_candidate_ids",
+                "redact_candidate_ids",
             )
         )
     if errors > 0:
@@ -1529,6 +1535,8 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
         lifecycle.get("promote_candidate_ids")
         or lifecycle.get("dedup_candidate_ids")
         or lifecycle.get("review_candidate_ids")
+        or lifecycle.get("reject_candidate_ids")
+        or lifecycle.get("redact_candidate_ids")
     )
     if not has_ops:
         return True

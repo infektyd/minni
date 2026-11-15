@@ -692,3 +692,34 @@ test("withThreadLock does not let a second contender steal a newly acquired lock
   assert.deepEqual([r1, r2, r3], ["c1", "c2", "c3"]);
   assert.equal(maxConcurrent, 1, "contenders must serialize and never steal a newly acquired lock");
 });
+
+// Reality-bench seam 3: the start-marker reader only knew /proc, so on macOS it
+// always returned undefined and PID-reuse detection was silently OFF (the test
+// above injects the reader, which is why it never caught this). Exercise the
+// REAL reader on whatever host runs the suite.
+test("readProcessStartMarker answers for a live PID on this host (macOS has no /proc)", async () => {
+  const { readProcessStartMarker } = await import("../dist/thread-lock.js");
+  const marker = readProcessStartMarker(process.pid);
+  assert.equal(typeof marker, "string");
+  assert.ok(marker.length > 0);
+  assert.equal(readProcessStartMarker(process.pid), marker, "stable for one incarnation");
+});
+
+test("withThreadLock detects PID reuse with the real marker reader", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-thread-lock-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await seedOwner(root, "plan-real-reuse", {
+    pid: process.pid,
+    operationId: "previous-incarnation",
+    acquiredAt: "2026-01-01T00:00:00.000Z",
+    processStartMarker: "an-incarnation-that-no-longer-exists",
+  });
+  let entered = false;
+  await withThreadLock(root, "plan-real-reuse", "after-real-reuse", async () => {
+    entered = true;
+  }, { waitMs: 200, staleMs: 1, pollMs: 5 });
+  assert.equal(entered, true);
+  const { readThreadLockRecoveryAudit } = await import("../dist/thread-lock.js");
+  const last = (await readThreadLockRecoveryAudit(root)).at(-1);
+  assert.equal(last?.reason, "stale_pid_reuse");
+});
