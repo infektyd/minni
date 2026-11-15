@@ -40,3 +40,24 @@ if (!process.env.MINNI_SOCKET_PATH) {
     "minnid.sock",
   );
 }
+
+// Host agent session identity must not leak into tests. When the suite runs
+// from inside an agent (Claude Code, Codex, agy, ...), that host's session id
+// env var is inherited and resolveMcpSessionIdentity treats it as an explicit
+// session ("explicit_or_env"), so multi-session tests that resolve by hostPid
+// failed only when run from an agent shell. Mirror of AGENT_SESSION_ENV_VARS
+// in src/config.ts, plus the generic MINNI_SESSION_ID. Tests that exercise env
+// precedence set these explicitly.
+for (const name of [
+  "CLAUDE_CODE_SESSION_ID",
+  "CODEX_SESSION_ID",
+  "GEMINI_SESSION_ID",
+  "ANTIGRAVITY_SESSION_ID",
+  "GROK_SESSION_ID",
+  "CURSOR_SESSION_ID",
+  "KILOCODE_SESSION_ID",
+  "DEVIN_SESSION_ID",
+  "MINNI_SESSION_ID",
+]) {
+  delete process.env[name];
+}
